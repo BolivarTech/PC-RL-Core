@@ -24,7 +24,8 @@
     {
       "id": "F-002",
       "title": "Activation Functions",
-      "passes": false,
+      "passes": true,
+      "completed_at": "2026-03-25",
       "priority": "high",
       "acceptance_criteria": [
         "test_tanh_apply_zero",

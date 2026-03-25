@@ -33,3 +33,14 @@ Workspace structure was already in place from prior setup:
 - `cargo build --workspace`, `cargo nextest run --workspace`, and `cargo clippy --workspace -- -D warnings` all pass clean
 
 ---
+
+## Iteration 2 — F-002: Activation Functions (2026-03-25)
+
+**Status:** PASSED
+
+- Implemented `Activation` enum (Tanh, Relu, Sigmoid, Linear) with `apply`, `derivative`, `apply_vec`
+- 24 tests all passing: apply tests, derivative tests, apply_vec tests, robustness, serde roundtrip
+- Note: sigmoid(100.0) rounds to exactly 1.0 in f64 due to precision limits; test uses x=30.0 instead
+- Added `pub mod activation;` to lib.rs
+
+---
