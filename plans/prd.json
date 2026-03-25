@@ -304,7 +304,8 @@
     {
       "id": "F-011",
       "title": "TicTacToe Environment",
-      "passes": false,
+      "passes": true,
+      "completed_at": "2026-03-25",
       "priority": "high",
       "acceptance_criteria": [
         "test_new_game_has_9_valid_actions",

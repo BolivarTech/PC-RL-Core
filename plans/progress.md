@@ -166,3 +166,18 @@ Workspace structure was already in place from prior setup:
 - Key: clippy requires `#[derive(Default)]` instead of manual impl when all fields have Default
 
 ---
+
+## Iteration 11 — F-011: TicTacToe Environment (2026-03-25)
+
+**Status:** PASSED
+
+- Implemented `TicTacToe` struct with bitboard representation (`board_x`, `board_o` as `u16`)
+- Implemented `Player` enum (One, Two) and `GameResult` enum (Win, Draw, InProgress)
+- Methods: `new`, `reset`, `current_player`, `valid_actions`, `step`, `is_terminal`, `result`, `board_as_f64`, `reward`, `win_masks`
+- Win detection via 8 precomputed `WIN_MASKS` constants, extracted to `has_winning_line` helper to avoid clippy `manual_contains` false positive
+- `board_as_f64(perspective)`: +1.0 for self, -1.0 for opponent, 0.0 for empty
+- 15 tests passing (185 total workspace)
+- Key: spec draw sequence `0,4,8,2,6,3,5,1,7` actually produces P1 win (row 2: cells 6,7,8); used verified draw sequence `0,1,2,4,3,5,8,6,7` instead
+- Clippy required: `Default` impl for `TicTacToe`, `iter_mut().enumerate()` instead of range loop, slice iteration for test assertions
+
+---
