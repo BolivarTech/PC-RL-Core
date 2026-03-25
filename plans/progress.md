@@ -105,3 +105,24 @@ Workspace structure was already in place from prior setup:
 - Added `pub mod mlp_critic;` to lib.rs
 
 ---
+
+## Iteration 7 — F-007: PC Actor-Critic Agent (2026-03-25)
+
+**Status:** PASSED
+
+- Implemented `PcActorCritic` with `PcActorCriticConfig`, `TrajectoryStep`
+- `new`: builds actor + critic from config with seeded StdRng
+- `act`: delegates to actor.infer + select_action
+- `learn`: REINFORCE with baseline — discounted returns, advantage = G[t] - V(s), policy gradient + entropy regularization, re-infers to get hidden_states for backprop
+- `learn_continuous`: single-step TD(0) — V(s)/V(s'), target = reward + gamma*V(s') or just reward if terminal
+- `surprise_scale`: piecewise linear interpolation between 0.1 and 2.0, with adaptive override using buffer mean/std
+- `push_surprise`: circular buffer (max 100) for adaptive thresholds
+- `save`/`load`: stubs returning Err until serializer (F-008) is implemented
+- Key learnings:
+  - Re-inference needed in `learn` to get full `hidden_states` for `update_weights` (TrajectoryStep only stores latent_concat, not per-layer states)
+  - Adaptive surprise with zero std makes low == high; test needs varied data for meaningful assertions
+  - `rand::Rng` import not needed when only using concrete StdRng type
+- 18 tests passing (137 total workspace tests)
+- Added `pub mod pc_actor_critic;` to lib.rs
+
+---
