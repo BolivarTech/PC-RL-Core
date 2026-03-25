@@ -44,3 +44,17 @@ Workspace structure was already in place from prior setup:
 - Added `pub mod activation;` to lib.rs
 
 ---
+
+## Iteration 3 — F-003: Matrix Operations (2026-03-25)
+
+**Status:** PASSED
+
+- Implemented `Matrix` struct with `zeros`, `xavier`, `get/set`, `transpose`, `mul_vec`, `outer`, `scale_add`
+- Implemented free functions: `softmax_masked`, `argmax_masked`, `rms_error`, `sample_from_probs`, `clip_vec`, `vec_sub`, `vec_add`, `vec_scale`
+- Constants: `WEIGHT_CLIP=5.0`, `GRAD_CLIP=1.0`
+- 45 matrix tests all passing (69 total workspace tests)
+- Note: `SmallRng` requires `small_rng` feature; used `StdRng` instead
+- Clippy required iterator-based `mul_vec` instead of range loop indexing
+- Added `pub mod matrix;` to lib.rs
+
+---

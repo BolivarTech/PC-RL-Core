@@ -60,7 +60,8 @@
     {
       "id": "F-003",
       "title": "Matrix Operations",
-      "passes": false,
+      "passes": true,
+      "completed_at": "2026-03-25",
       "priority": "high",
       "acceptance_criteria": [
         "test_zeros_all_zero_correct_dims",
