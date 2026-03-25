@@ -147,7 +147,8 @@
     {
       "id": "F-005",
       "title": "PC Actor",
-      "passes": false,
+      "passes": true,
+      "completed_at": "2026-03-25",
       "priority": "high",
       "acceptance_criteria": [
         "test_infer_converges_on_zero_board",

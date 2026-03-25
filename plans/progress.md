@@ -72,3 +72,22 @@ Workspace structure was already in place from prior setup:
 - Added `pub mod layer;` to lib.rs
 
 ---
+
+## Iteration 5 — F-005: PC Actor (2026-03-25)
+
+**Status:** PASSED
+
+- Implemented `PcActor` with `PcActorConfig`, `InferResult`, `SelectionMode`
+- `new`: builds hidden layers + output layer from config
+- `latent_size`: sum of hidden layer sizes
+- `infer`: PC inference loop with synchronous (snapshot) and in-place modes; top-down predictions via `transpose_forward`, error-driven state updates, convergence check
+- `select_action`: temperature-scaled softmax, argmax (Play) or sample (Training)
+- `update_weights`: backprop through all layers from output to input
+- Key learnings:
+  - alpha=0 needs explicit guard to prevent false convergence (RMS error can be below tol with zero updates)
+  - Synchronous vs in-place difference shows in lower hidden layers' latent_concat, not in y_conv (output is computed from top hidden layer which gets identical treatment)
+  - Zero input produces zero gradients for first layer — tests need non-zero input for weight change assertions
+- 22 tests passing (109 total workspace tests)
+- Added `pub mod pc_actor;` to lib.rs
+
+---
