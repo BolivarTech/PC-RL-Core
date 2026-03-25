@@ -194,3 +194,19 @@ Workspace structure was already in place from prior setup:
 - Key: `step()` doesn't switch `current_player()` on terminal states — critical for correct negamax scoring
 
 ---
+
+## Iteration 13 — F-013: Training (Episodic + Continuous) (2026-03-25)
+
+**Status:** PASSED
+
+- Implemented `Trainer` struct with episode-based training, curriculum learning (depth 1→9), side alternation, trajectory collection
+- Implemented `ContinuousTrainer` struct with surprise-based immediate TD(0) updates, stop flag, max_episodes
+- `Trainer::train()`: runs episodes, collects trajectory, calls `agent.learn()`, records outcomes, advances curriculum when win_rate > threshold
+- `ContinuousTrainer::train()`: runs until stop_flag or max_episodes, per-step surprise check triggers `learn_continuous()` mid-episode
+- Updated `training/mod.rs` with `pub mod trainer; pub mod continuous;`
+- Key: `actor`/`critic` fields are `pub(crate)` — cannot access from pc_tictactoe tests; used `save_agent` serialization to compare weights instead
+- Key: Clippy requires `.is_multiple_of(2)` instead of `% 2 == 0`
+- Key: `MinimaxPlayer` has no `set_depth` — create new instance when curriculum advances
+- 11 new training tests (205 total workspace), clippy clean
+
+---

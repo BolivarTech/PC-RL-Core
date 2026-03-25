@@ -352,7 +352,8 @@
     {
       "id": "F-013",
       "title": "Training (Episodic + Continuous)",
-      "passes": false,
+      "passes": true,
+      "completed_at": "2026-03-25",
       "priority": "high",
       "acceptance_criteria": [
         "test_training_one_episode_completes_without_panic",
