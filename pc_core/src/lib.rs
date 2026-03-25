@@ -5,4 +5,5 @@
 //! Predictive Coding Actor-Critic framework.
 
 pub mod activation;
+pub mod layer;
 pub mod matrix;

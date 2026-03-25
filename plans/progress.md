@@ -58,3 +58,17 @@ Workspace structure was already in place from prior setup:
 - Added `pub mod matrix;` to lib.rs
 
 ---
+
+## Iteration 4 — F-004: Dense Layer (2026-03-25)
+
+**Status:** PASSED
+
+- Implemented `Layer` struct with `new`, `forward`, `transpose_forward`, `backward` methods
+- Implemented `LayerDef` struct for topology configuration
+- `forward`: W*input + bias → activation
+- `transpose_forward`: W^T*input → custom activation (no bias, used for PC top-down)
+- `backward`: gradient clipping (GRAD_CLIP), weight update via scale_add (WEIGHT_CLIP clamping), bias update with clamping
+- 18 layer tests all passing (87 total workspace tests)
+- Added `pub mod layer;` to lib.rs
+
+---
