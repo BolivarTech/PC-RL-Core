@@ -142,3 +142,14 @@ Workspace structure was already in place from prior setup:
 - Added `pub mod serializer;` to lib.rs
 
 ---
+
+## Iteration 9 — F-009: Library Exports (2026-03-25)
+
+**Status:** PASSED (CHECKPOINT 1)
+
+- Added crate-level `//!` documentation describing the PC-Actor-Critic framework
+- Added `pub use` re-exports for all public types, constants, and functions
+- Fixed broken intra-doc links in `layer.rs` (`PcActor`/`MlpCritic` → `crate::PcActor`/`crate::MlpCritic`)
+- All 3 acceptance criteria met: 147 tests pass, `cargo doc --no-deps` clean, clippy clean
+
+---

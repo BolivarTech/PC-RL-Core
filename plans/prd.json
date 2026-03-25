@@ -255,7 +255,8 @@
     {
       "id": "F-009",
       "title": "Library Exports",
-      "passes": false,
+      "passes": true,
+      "completed_at": "2026-03-25",
       "priority": "high",
       "acceptance_criteria": [
         "cargo test -p pc_core passes (all tests green)",

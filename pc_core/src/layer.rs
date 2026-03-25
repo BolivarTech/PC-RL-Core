@@ -6,7 +6,7 @@
 //!
 //! Provides forward propagation, transpose forward (PC top-down pass),
 //! and backward propagation with gradient/weight clipping. Building
-//! block for both [`PcActor`] and [`MlpCritic`].
+//! block for both [`crate::PcActor`] and [`crate::MlpCritic`].
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
