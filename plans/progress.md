@@ -181,3 +181,16 @@ Workspace structure was already in place from prior setup:
 - Clippy required: `Default` impl for `TicTacToe`, `iter_mut().enumerate()` instead of range loop, slice iteration for test assertions
 
 ---
+
+## Iteration 12 — F-012: Minimax Player (2026-03-25)
+
+**Status:** PASSED (CHECKPOINT 3: env/ complete)
+
+- Implemented `MinimaxPlayer` with alpha-beta pruning, move ordering (center > corners > edges), depth-aware scoring, and transposition table
+- Added `bitboards()` public getter on `TicTacToe` for transposition table key computation
+- Negamax convention: `alpha_beta` returns score from logical next-to-move player's POV; after `step()` wins, `current_player()` is the winner (turn doesn't switch on terminal), so terminal_score returns negative for winner==current
+- Used `-120`/`120` as alpha-beta bounds instead of `i8::MIN`/`i8::MAX` to avoid negation overflow
+- 9 minimax tests + 185 prior = 194 total workspace tests passing
+- Key: `step()` doesn't switch `current_player()` on terminal states — critical for correct negamax scoring
+
+---

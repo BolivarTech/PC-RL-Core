@@ -248,6 +248,14 @@ impl TicTacToe {
         false
     }
 
+    /// Returns the raw bitboards `(board_x, board_o)`.
+    ///
+    /// Used by [`crate::env::minimax::MinimaxPlayer`] for transposition
+    /// table hashing.
+    pub fn bitboards(&self) -> (u16, u16) {
+        (self.board_x, self.board_o)
+    }
+
     /// Returns the win masks used for win detection.
     pub fn win_masks() -> &'static [u16; 8] {
         &WIN_MASKS

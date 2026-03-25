@@ -4,6 +4,7 @@
 
 //! Game environment modules for Tic-Tac-Toe.
 
+pub mod minimax;
 pub mod tictactoe;
 
 pub use tictactoe::{GameResult, Player, TicTacToe};
