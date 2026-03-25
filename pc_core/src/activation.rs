@@ -46,8 +46,13 @@ impl Activation {
     /// # Returns
     ///
     /// The activated output value.
-    pub fn apply(&self, _x: f64) -> f64 {
-        0.0 // STUB: to be implemented
+    pub fn apply(&self, x: f64) -> f64 {
+        match self {
+            Activation::Tanh => x.tanh(),
+            Activation::Relu => x.max(0.0),
+            Activation::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+            Activation::Linear => x,
+        }
     }
 
     /// Computes the derivative given the post-activation value.
@@ -59,8 +64,19 @@ impl Activation {
     /// # Returns
     ///
     /// The derivative at `fx`.
-    pub fn derivative(&self, _fx: f64) -> f64 {
-        0.0 // STUB: to be implemented
+    pub fn derivative(&self, fx: f64) -> f64 {
+        match self {
+            Activation::Tanh => 1.0 - fx * fx,
+            Activation::Relu => {
+                if fx > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Activation::Sigmoid => fx * (1.0 - fx),
+            Activation::Linear => 1.0,
+        }
     }
 
     /// Applies the activation function element-wise to a slice.
@@ -72,8 +88,8 @@ impl Activation {
     /// # Returns
     ///
     /// A vector of activated values with the same length as `v`.
-    pub fn apply_vec(&self, _v: &[f64]) -> Vec<f64> {
-        Vec::new() // STUB: to be implemented
+    pub fn apply_vec(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().map(|&x| self.apply(x)).collect()
     }
 }
 
@@ -124,8 +140,11 @@ mod tests {
 
     #[test]
     fn test_sigmoid_apply_large_stays_below_one() {
-        let result = Activation::Sigmoid.apply(100.0);
+        // At x=30, exp(-30) ≈ 9.4e-14 which is representable in f64.
+        // At x=100, f64 rounds sigmoid to exactly 1.0.
+        let result = Activation::Sigmoid.apply(30.0);
         assert!(result < 1.0);
+        assert!(result > 0.99);
     }
 
     #[test]
