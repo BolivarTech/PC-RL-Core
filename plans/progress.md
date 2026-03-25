@@ -91,3 +91,17 @@ Workspace structure was already in place from prior setup:
 - Added `pub mod pc_actor;` to lib.rs
 
 ---
+
+## Iteration 6 — F-006: MLP Critic (2026-03-25)
+
+**Status:** PASSED
+
+- Implemented `MlpCritic` with `MlpCriticConfig`, `MlpCriticWeights`
+- `new`: builds hidden layers + output layer (1 neuron) from config
+- `forward`: sequential forward through all layers, returns scalar `output[0]`
+- `update`: forward pass storing intermediates, MSE loss, output gradient `-2*(target-predicted)`, backprop through layers in reverse with `surprise_scale=1.0`
+- `to_weights`/`from_weights`: serialization support without RNG
+- 10 tests passing (119 total workspace tests)
+- Added `pub mod mlp_critic;` to lib.rs
+
+---
