@@ -153,3 +153,16 @@ Workspace structure was already in place from prior setup:
 - All 3 acceptance criteria met: 147 tests pass, `cargo doc --no-deps` clean, clippy clean
 
 ---
+
+## Iteration 10 — F-010: Utilities (Logger, Config, Metrics) (2026-03-25)
+
+**Status:** PASSED (CHECKPOINT 2)
+
+- Implemented `config.rs`: `AppConfig` with TOML deserialization, `validate()` checking critic_input == actor_input + latent_sum, `to_agent_config()` converting to pc_core types, `apply_cli_overrides()`, `load()` with default fallback
+- Implemented `logger.rs`: `Logger` with level filtering, file + CSV output, log rotation with max_backups, `SharedLogger` for thread safety, progress bar
+- Implemented `metrics.rs`: `Metrics` sliding window with `GameOutcome` enum, win/loss/draw rates, surprise average
+- Updated `main.rs` to declare `pub mod env; pub mod training; pub mod ui; pub mod utils;`
+- 23 new tests (170 total workspace), clippy clean
+- Key: clippy requires `#[derive(Default)]` instead of manual impl when all fields have Default
+
+---
