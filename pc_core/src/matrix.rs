@@ -90,11 +90,13 @@ impl Matrix {
     /// * `row` - Row index.
     /// * `col` - Column index.
     pub fn get(&self, row: usize, col: usize) -> f64 {
-        if row < self.rows && col < self.cols {
-            self.data[row * self.cols + col]
-        } else {
-            0.0
-        }
+        assert!(
+            row < self.rows && col < self.cols,
+            "Matrix::get out of bounds: ({row}, {col}) for ({}, {})",
+            self.rows,
+            self.cols
+        );
+        self.data[row * self.cols + col]
     }
 
     /// Sets the element at `(row, col)` to `val`.
@@ -107,9 +109,13 @@ impl Matrix {
     /// * `col` - Column index.
     /// * `val` - Value to set.
     pub fn set(&mut self, row: usize, col: usize, val: f64) {
-        if row < self.rows && col < self.cols {
-            self.data[row * self.cols + col] = val;
-        }
+        assert!(
+            row < self.rows && col < self.cols,
+            "Matrix::set out of bounds: ({row}, {col}) for ({}, {})",
+            self.rows,
+            self.cols
+        );
+        self.data[row * self.cols + col] = val;
     }
 
     /// Returns the transpose of this matrix.
@@ -230,8 +236,17 @@ pub fn softmax_masked(logits: &[f64], mask: &[usize]) -> Vec<f64> {
     if mask.is_empty() {
         return result;
     }
+    assert!(
+        mask.iter().all(|&i| i < logits.len()),
+        "softmax_masked: mask index out of bounds (max mask={}, logits len={})",
+        mask.iter().max().unwrap_or(&0),
+        logits.len()
+    );
 
-    let max_val = mask.iter().map(|&i| logits[i]).fold(f64::NEG_INFINITY, f64::max);
+    let max_val = mask
+        .iter()
+        .map(|&i| logits[i])
+        .fold(f64::NEG_INFINITY, f64::max);
     let mut sum = 0.0;
     for &i in mask {
         let exp_val = (logits[i] - max_val).exp();
@@ -258,6 +273,12 @@ pub fn softmax_masked(logits: &[f64], mask: &[usize]) -> Vec<f64> {
 /// Panics if `mask` is empty.
 pub fn argmax_masked(values: &[f64], mask: &[usize]) -> usize {
     assert!(!mask.is_empty(), "argmax_masked: empty mask");
+    assert!(
+        mask.iter().all(|&i| i < values.len()),
+        "argmax_masked: mask index out of bounds (max mask={}, values len={})",
+        mask.iter().max().unwrap_or(&0),
+        values.len()
+    );
     let mut best_idx = mask[0];
     let mut best_val = values[mask[0]];
     for &i in &mask[1..] {
@@ -356,6 +377,13 @@ pub fn clip_vec(v: &mut [f64], max_abs: f64) {
 ///
 /// A new vector where each element is `a[i] - b[i]`.
 pub fn vec_sub(a: &[f64], b: &[f64]) -> Vec<f64> {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "vec_sub: length mismatch {} vs {}",
+        a.len(),
+        b.len()
+    );
     a.iter().zip(b.iter()).map(|(x, y)| x - y).collect()
 }
 
@@ -370,6 +398,13 @@ pub fn vec_sub(a: &[f64], b: &[f64]) -> Vec<f64> {
 ///
 /// A new vector where each element is `a[i] + b[i]`.
 pub fn vec_add(a: &[f64], b: &[f64]) -> Vec<f64> {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "vec_add: length mismatch {} vs {}",
+        a.len(),
+        b.len()
+    );
     a.iter().zip(b.iter()).map(|(x, y)| x + y).collect()
 }
 
@@ -438,8 +473,6 @@ mod tests {
     fn test_get_zero_default() {
         let m = Matrix::zeros(2, 2);
         assert_eq!(m.get(0, 0), 0.0);
-        // Out of bounds returns 0.0
-        assert_eq!(m.get(5, 5), 0.0);
     }
 
     #[test]
@@ -796,11 +829,74 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn test_vec_sub_panics_on_length_mismatch() {
+        vec_sub(&[1.0, 2.0], &[1.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "length mismatch")]
+    fn test_vec_add_panics_on_length_mismatch() {
+        vec_add(&[1.0, 2.0], &[1.0]);
+    }
+
+    #[test]
     fn test_clip_vec_leaves_safe_values() {
         let mut v = vec![1.0, -1.0, 0.0];
         clip_vec(&mut v, 5.0);
         assert!((v[0] - 1.0).abs() < 1e-10);
         assert!((v[1] - (-1.0)).abs() < 1e-10);
         assert!((v[2] - 0.0).abs() < 1e-10);
+    }
+
+    // ── Defensive: OOB assertions ────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn test_get_panics_on_oob_row() {
+        let m = Matrix::zeros(2, 2);
+        m.get(5, 0); // should panic, not return 0.0
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn test_set_panics_on_oob_row() {
+        let mut m = Matrix::zeros(2, 2);
+        m.set(5, 0, 1.0); // should panic, not silently do nothing
+    }
+
+    #[test]
+    #[should_panic(expected = "mask index out of bounds")]
+    fn test_softmax_masked_panics_on_oob_mask() {
+        let logits = vec![1.0, 2.0, 3.0];
+        softmax_masked(&logits, &[0, 5]); // 5 >= logits.len()
+    }
+
+    #[test]
+    #[should_panic(expected = "mask index out of bounds")]
+    fn test_argmax_masked_panics_on_oob_mask() {
+        let values = vec![1.0, 2.0, 3.0];
+        argmax_masked(&values, &[0, 5]); // 5 >= values.len()
+    }
+
+    // ── sample_from_probs distribution ───────────────────────────
+
+    #[test]
+    fn test_sample_from_probs_distribution_roughly_correct() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let probs = vec![0.7, 0.3];
+        let mask = vec![0, 1];
+        let mut counts = [0usize; 2];
+        let n = 1000;
+        for _ in 0..n {
+            let idx = sample_from_probs(&probs, &mask, &mut rng);
+            counts[idx] += 1;
+        }
+        let ratio = counts[0] as f64 / n as f64;
+        // Should be roughly 0.7, allow 10% tolerance
+        assert!(
+            (ratio - 0.7).abs() < 0.1,
+            "Expected ~0.7 for action 0, got {ratio}"
+        );
     }
 }

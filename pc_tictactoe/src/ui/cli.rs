@@ -129,7 +129,7 @@ pub fn run_train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     config.validate()?;
     let agent_config = config.to_agent_config()?;
-    let agent = PcActorCritic::new(agent_config, config.training.seed);
+    let agent = PcActorCritic::new(agent_config, config.training.seed)?;
 
     if args.continuous {
         if let Some(max_ep) = args.max_episodes {
@@ -142,7 +142,12 @@ pub fn run_train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
         });
         let mut trainer = ContinuousTrainer::new(agent, &config, stop_flag);
         trainer.train();
-        save_agent(trainer.agent(), "model.json", config.continuous.max_episodes, None)?;
+        save_agent(
+            trainer.agent(),
+            "model.json",
+            config.continuous.max_episodes,
+            None,
+        )?;
     } else {
         let episodes = config.training.episodes;
         let mut trainer = Trainer::new(agent, &config);
@@ -172,7 +177,7 @@ pub fn run_play(args: PlayArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let config = AppConfig::default();
         let agent_config = config.to_agent_config()?;
-        PcActorCritic::new(agent_config, 42)
+        PcActorCritic::new(agent_config, 42)?
     };
 
     let mut env = TicTacToe::new();
@@ -274,7 +279,7 @@ pub fn run_evaluate(args: EvaluateArgs) -> Result<(), Box<dyn std::error::Error>
     } else {
         let config = AppConfig::default();
         let agent_config = config.to_agent_config()?;
-        PcActorCritic::new(agent_config, 42)
+        PcActorCritic::new(agent_config, 42)?
     };
 
     let mut minimax = MinimaxPlayer::new(args.depth);
@@ -284,7 +289,11 @@ pub fn run_evaluate(args: EvaluateArgs) -> Result<(), Box<dyn std::error::Error>
 
     for game_idx in 0..args.games {
         let mut env = TicTacToe::new();
-        let agent_side = if game_idx % 2 == 0 { Player::One } else { Player::Two };
+        let agent_side = if game_idx.is_multiple_of(2) {
+            Player::One
+        } else {
+            Player::Two
+        };
 
         while !env.is_terminal() {
             if env.current_player() == agent_side {
@@ -306,11 +315,23 @@ pub fn run_evaluate(args: EvaluateArgs) -> Result<(), Box<dyn std::error::Error>
         }
     }
 
-    println!("Evaluation: {games} games vs minimax depth {depth}",
-        games = args.games, depth = args.depth);
-    println!("  Wins:   {wins} ({:.1}%)", 100.0 * wins as f64 / args.games as f64);
-    println!("  Draws:  {draws} ({:.1}%)", 100.0 * draws as f64 / args.games as f64);
-    println!("  Losses: {losses} ({:.1}%)", 100.0 * losses as f64 / args.games as f64);
+    println!(
+        "Evaluation: {games} games vs minimax depth {depth}",
+        games = args.games,
+        depth = args.depth
+    );
+    println!(
+        "  Wins:   {wins} ({:.1}%)",
+        100.0 * wins as f64 / args.games as f64
+    );
+    println!(
+        "  Draws:  {draws} ({:.1}%)",
+        100.0 * draws as f64 / args.games as f64
+    );
+    println!(
+        "  Losses: {losses} ({:.1}%)",
+        100.0 * losses as f64 / args.games as f64
+    );
 
     Ok(())
 }
@@ -333,7 +354,7 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
     } else {
         let config = AppConfig::default();
         let agent_config = config.to_agent_config()?;
-        PcActorCritic::new(agent_config, 42)
+        PcActorCritic::new(agent_config, 42)?
     };
 
     let config = AppConfig::default();
@@ -344,8 +365,10 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
     let elapsed = start.elapsed();
 
     let eps_per_sec = args.episodes as f64 / elapsed.as_secs_f64();
-    println!("Benchmark: {ep} episodes in {elapsed:.2?} ({eps_per_sec:.1} episodes/sec)",
-        ep = args.episodes);
+    println!(
+        "Benchmark: {ep} episodes in {elapsed:.2?} ({eps_per_sec:.1} episodes/sec)",
+        ep = args.episodes
+    );
 
     Ok(())
 }

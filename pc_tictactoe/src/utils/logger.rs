@@ -87,6 +87,60 @@ pub struct Logger {
 }
 
 impl Logger {
+    /// Creates a new logger, returning an error on I/O failure.
+    ///
+    /// Fallible alternative to [`Logger::new`] that propagates file-open
+    /// errors instead of panicking.
+    pub fn try_new(
+        min_level: LogLevel,
+        file_path: Option<&str>,
+        csv_path: Option<&str>,
+        max_backups: usize,
+        max_size: u64,
+    ) -> Result<Self, std::io::Error> {
+        let file = match file_path {
+            Some(p) => {
+                if let Some(parent) = Path::new(p).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
+                let f = OpenOptions::new().create(true).append(true).open(p)?;
+                Some(Arc::new(Mutex::new(BufWriter::new(f))))
+            }
+            None => None,
+        };
+
+        let csv = match csv_path {
+            Some(p) => {
+                if let Some(parent) = Path::new(p).parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
+                let mut f = OpenOptions::new().create(true).append(true).open(p)?;
+                let meta = f.metadata()?;
+                if meta.len() == 0 {
+                    writeln!(
+                        f,
+                        "episode,win_rate,avg_reward,avg_surprise,curriculum_depth,timestamp"
+                    )?;
+                }
+                Some(Arc::new(Mutex::new(BufWriter::new(f))))
+            }
+            None => None,
+        };
+
+        Ok(Self {
+            min_level,
+            file,
+            csv,
+            file_path: file_path.map(String::from),
+            max_backups,
+            max_size,
+        })
+    }
+
     /// Creates a new logger.
     ///
     /// Opens the log file and CSV file if paths are provided. Writes the CSV
@@ -134,8 +188,11 @@ impl Logger {
             // Write header if file is empty.
             let meta = f.metadata().expect("failed to read CSV metadata");
             if meta.len() == 0 {
-                writeln!(f, "episode,win_rate,avg_reward,avg_surprise,curriculum_depth,timestamp")
-                    .expect("failed to write CSV header");
+                writeln!(
+                    f,
+                    "episode,win_rate,avg_reward,avg_surprise,curriculum_depth,timestamp"
+                )
+                .expect("failed to write CSV header");
             }
             Arc::new(Mutex::new(BufWriter::new(f)))
         });
@@ -282,19 +339,26 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("pc_logger_test_{}", std::process::id()));
+    fn temp_dir(test_name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("pc_logger_test_{}_{test_name}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         dir
     }
 
     #[test]
     fn test_creates_log_file() {
-        let dir = temp_dir();
+        let dir = temp_dir("creates_log_file");
         let log_path = dir.join("test.log");
         let _ = fs::remove_file(&log_path);
 
-        let logger = Logger::new(LogLevel::Debug, Some(log_path.to_str().unwrap()), None, 3, 10_000_000);
+        let logger = Logger::new(
+            LogLevel::Debug,
+            Some(log_path.to_str().unwrap()),
+            None,
+            3,
+            10_000_000,
+        );
         logger.log(LogLevel::Info, "hello");
 
         assert!(log_path.exists());
@@ -306,11 +370,17 @@ mod tests {
 
     #[test]
     fn test_all_levels_written_at_debug() {
-        let dir = temp_dir();
+        let dir = temp_dir("all_levels");
         let log_path = dir.join("levels.log");
         let _ = fs::remove_file(&log_path);
 
-        let logger = Logger::new(LogLevel::Debug, Some(log_path.to_str().unwrap()), None, 3, 10_000_000);
+        let logger = Logger::new(
+            LogLevel::Debug,
+            Some(log_path.to_str().unwrap()),
+            None,
+            3,
+            10_000_000,
+        );
         logger.log(LogLevel::Debug, "d");
         logger.log(LogLevel::Info, "i");
         logger.log(LogLevel::Training, "t");
@@ -329,11 +399,17 @@ mod tests {
 
     #[test]
     fn test_min_level_info_filters_debug_and_training() {
-        let dir = temp_dir();
+        let dir = temp_dir("min_level_filter");
         let log_path = dir.join("filtered.log");
         let _ = fs::remove_file(&log_path);
 
-        let logger = Logger::new(LogLevel::Info, Some(log_path.to_str().unwrap()), None, 3, 10_000_000);
+        let logger = Logger::new(
+            LogLevel::Info,
+            Some(log_path.to_str().unwrap()),
+            None,
+            3,
+            10_000_000,
+        );
         logger.log(LogLevel::Debug, "should_not_appear");
         logger.log(LogLevel::Info, "should_appear");
 
@@ -346,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_rotation_creates_backup() {
-        let dir = temp_dir();
+        let dir = temp_dir("rotation_backup");
         let log_path = dir.join("rotate.log");
         let _ = fs::remove_file(&log_path);
         let _ = fs::remove_file(dir.join("rotate.log.1"));
@@ -373,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_rotation_respects_max_backups() {
-        let dir = temp_dir();
+        let dir = temp_dir("rotation_max");
         let log_path = dir.join("rot_max.log");
         for i in 0..5 {
             let _ = fs::remove_file(dir.join(format!("rot_max.log.{i}")));
@@ -402,26 +478,39 @@ mod tests {
 
     #[test]
     fn test_csv_export_creates_file_with_header() {
-        let dir = temp_dir();
+        let dir = temp_dir("csv_header");
         let csv_path = dir.join("metrics.csv");
         let _ = fs::remove_file(&csv_path);
 
-        let _logger = Logger::new(LogLevel::Info, None, Some(csv_path.to_str().unwrap()), 3, 10_000_000);
+        let _logger = Logger::new(
+            LogLevel::Info,
+            None,
+            Some(csv_path.to_str().unwrap()),
+            3,
+            10_000_000,
+        );
 
         assert!(csv_path.exists());
         let content = fs::read_to_string(&csv_path).unwrap();
-        assert!(content.starts_with("episode,win_rate,avg_reward,avg_surprise,curriculum_depth,timestamp"));
+        assert!(content
+            .starts_with("episode,win_rate,avg_reward,avg_surprise,curriculum_depth,timestamp"));
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_csv_appends_one_row_per_call() {
-        let dir = temp_dir();
+        let dir = temp_dir("csv_append");
         let csv_path = dir.join("append.csv");
         let _ = fs::remove_file(&csv_path);
 
-        let logger = Logger::new(LogLevel::Info, None, Some(csv_path.to_str().unwrap()), 3, 10_000_000);
+        let logger = Logger::new(
+            LogLevel::Info,
+            None,
+            Some(csv_path.to_str().unwrap()),
+            3,
+            10_000_000,
+        );
         logger.log_metrics(1, 0.5, 0.1, 0.05, 1);
         logger.log_metrics(2, 0.6, 0.2, 0.04, 1);
 
@@ -434,10 +523,23 @@ mod tests {
     }
 
     #[test]
+    fn test_new_invalid_path_returns_error() {
+        // A path with null bytes should fail gracefully, not panic
+        let result = Logger::try_new(
+            LogLevel::Info,
+            Some("/nonexistent\0/path/log.txt"),
+            None,
+            3,
+            10_000_000,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_thread_safe_40_concurrent_writes() {
         use std::thread;
 
-        let dir = temp_dir();
+        let dir = temp_dir("concurrent");
         let log_path = dir.join("concurrent.log");
         let _ = fs::remove_file(&log_path);
 

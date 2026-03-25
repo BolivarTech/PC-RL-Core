@@ -18,6 +18,7 @@
 //! - [`serializer`] — JSON weight persistence with checkpointing support.
 
 pub mod activation;
+pub mod error;
 pub mod layer;
 pub mod matrix;
 pub mod mlp_critic;
@@ -26,6 +27,7 @@ pub mod pc_actor_critic;
 pub mod serializer;
 
 pub use activation::Activation;
+pub use error::PcError;
 pub use layer::{Layer, LayerDef};
 pub use matrix::{
     argmax_masked, rms_error, sample_from_probs, softmax_masked, Matrix, GRAD_CLIP, WEIGHT_CLIP,
@@ -34,6 +36,6 @@ pub use mlp_critic::{MlpCritic, MlpCriticConfig, MlpCriticWeights};
 pub use pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
 pub use pc_actor_critic::{PcActorCritic, PcActorCriticConfig, TrajectoryStep};
 pub use serializer::{
-    save_agent, load_agent, checkpoint_filename, save_checkpoint,
-    AgentMetadata, PcActorWeights, PcError, SaveFile, SerializerCriticWeights, TrainingMetrics,
+    checkpoint_filename, load_agent, save_agent, save_checkpoint, AgentMetadata, PcActorWeights,
+    SaveFile, TrainingMetrics,
 };

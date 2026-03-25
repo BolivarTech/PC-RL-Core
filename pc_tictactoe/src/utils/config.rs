@@ -215,40 +215,100 @@ impl Error for ConfigError {}
 
 // ─── Default value functions ────────────────────────────────────────────────
 
-fn default_input_size() -> usize { 9 }
-fn default_output_size() -> usize { 9 }
-fn default_critic_input_size() -> usize { 27 }
-fn default_gamma() -> f64 { 0.95 }
-fn default_surprise_low() -> f64 { 0.02 }
-fn default_surprise_high() -> f64 { 0.15 }
-fn default_entropy_coeff() -> f64 { 0.01 }
-fn default_alpha() -> f64 { 0.1 }
-fn default_tol() -> f64 { 0.01 }
-fn default_min_steps() -> usize { 1 }
-fn default_max_steps() -> usize { 20 }
-fn default_lr_weights() -> f64 { 0.01 }
-fn default_true() -> bool { true }
-fn default_temperature() -> f64 { 1.0 }
-fn default_critic_lr() -> f64 { 0.005 }
-fn default_episodes() -> usize { 10000 }
-fn default_checkpoint_interval() -> usize { 1000 }
-fn default_seed() -> u64 { 42 }
-fn default_advance_threshold() -> f64 { 0.6 }
-fn default_window_size() -> usize { 100 }
-fn default_max_episodes() -> usize { 50000 }
-fn default_surprise_threshold() -> f64 { 0.1 }
-fn default_log_level() -> String { "info".to_string() }
-fn default_max_backups() -> usize { 3 }
-fn default_max_size() -> u64 { 10_485_760 }
-fn default_activation_tanh() -> String { "tanh".to_string() }
-fn default_activation_linear() -> String { "linear".to_string() }
+fn default_input_size() -> usize {
+    9
+}
+fn default_output_size() -> usize {
+    9
+}
+fn default_critic_input_size() -> usize {
+    27
+}
+fn default_gamma() -> f64 {
+    0.95
+}
+fn default_surprise_low() -> f64 {
+    0.02
+}
+fn default_surprise_high() -> f64 {
+    0.15
+}
+fn default_entropy_coeff() -> f64 {
+    0.01
+}
+fn default_alpha() -> f64 {
+    0.1
+}
+fn default_tol() -> f64 {
+    0.01
+}
+fn default_min_steps() -> usize {
+    1
+}
+fn default_max_steps() -> usize {
+    20
+}
+fn default_lr_weights() -> f64 {
+    0.01
+}
+fn default_true() -> bool {
+    true
+}
+fn default_temperature() -> f64 {
+    1.0
+}
+fn default_critic_lr() -> f64 {
+    0.005
+}
+fn default_episodes() -> usize {
+    10000
+}
+fn default_checkpoint_interval() -> usize {
+    1000
+}
+fn default_seed() -> u64 {
+    42
+}
+fn default_advance_threshold() -> f64 {
+    0.6
+}
+fn default_window_size() -> usize {
+    100
+}
+fn default_max_episodes() -> usize {
+    50000
+}
+fn default_surprise_threshold() -> f64 {
+    0.1
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_max_backups() -> usize {
+    3
+}
+fn default_max_size() -> u64 {
+    10_485_760
+}
+fn default_activation_tanh() -> String {
+    "tanh".to_string()
+}
+fn default_activation_linear() -> String {
+    "linear".to_string()
+}
 
 fn default_actor_hidden() -> Vec<HiddenLayerDef> {
-    vec![HiddenLayerDef { size: 18, activation: "tanh".to_string() }]
+    vec![HiddenLayerDef {
+        size: 18,
+        activation: "tanh".to_string(),
+    }]
 }
 
 fn default_critic_hidden() -> Vec<HiddenLayerDef> {
-    vec![HiddenLayerDef { size: 36, activation: "tanh".to_string() }]
+    vec![HiddenLayerDef {
+        size: 36,
+        activation: "tanh".to_string(),
+    }]
 }
 
 // ─── Default trait impls ────────────────────────────────────────────────────
@@ -354,7 +414,9 @@ fn parse_activation(s: &str) -> Result<Activation, ConfigError> {
         "sigmoid" => Ok(Activation::Sigmoid),
         "linear" => Ok(Activation::Linear),
         other => Err(ConfigError {
-            message: format!("unknown activation '{other}'; expected tanh, relu, sigmoid, or linear"),
+            message: format!(
+                "unknown activation '{other}'; expected tanh, relu, sigmoid, or linear"
+            ),
         }),
     }
 }
@@ -550,8 +612,14 @@ episodes = 5000
     fn test_two_hidden_layers_validates_correctly() {
         let mut config = AppConfig::default();
         config.agent.actor.hidden_layers = vec![
-            HiddenLayerDef { size: 18, activation: "tanh".to_string() },
-            HiddenLayerDef { size: 12, activation: "relu".to_string() },
+            HiddenLayerDef {
+                size: 18,
+                activation: "tanh".to_string(),
+            },
+            HiddenLayerDef {
+                size: 12,
+                activation: "relu".to_string(),
+            },
         ];
         // critic input must be input_size + 18 + 12 = 39
         config.agent.critic.input_size = 39;

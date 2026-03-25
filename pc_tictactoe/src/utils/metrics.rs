@@ -66,6 +66,9 @@ impl Metrics {
     ///
     /// * `outcome` - The result of the most recent game.
     pub fn record(&mut self, outcome: GameOutcome) {
+        if self.window_size == 0 {
+            return;
+        }
         if self.outcomes.len() == self.window_size {
             self.outcomes.pop_front();
         }
@@ -187,5 +190,13 @@ mod tests {
         m.record_surprise(0.5);
         let avg = m.surprise_avg();
         assert!((avg - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_zero_window_size_still_safe() {
+        let mut m = Metrics::new(0);
+        m.record(GameOutcome::Win);
+        // Should not panic; win_rate on empty window returns 0.0
+        assert_eq!(m.win_rate(), 0.0);
     }
 }

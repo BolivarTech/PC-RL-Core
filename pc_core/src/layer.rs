@@ -136,7 +136,10 @@ impl Layer {
         surprise_scale: f64,
     ) -> Vec<f64> {
         // 1. Activation derivative
-        let deriv: Vec<f64> = output.iter().map(|&o| self.activation.derivative(o)).collect();
+        let deriv: Vec<f64> = output
+            .iter()
+            .map(|&o| self.activation.derivative(o))
+            .collect();
 
         // 2. Local gradient = delta * deriv
         let mut grad: Vec<f64> = delta.iter().zip(deriv.iter()).map(|(d, r)| d * r).collect();
@@ -168,8 +171,8 @@ impl Layer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     fn make_rng() -> StdRng {
         StdRng::seed_from_u64(42)
@@ -279,7 +282,10 @@ mod tests {
             .iter()
             .zip(out_linear.iter())
             .any(|(a, b)| (a - b).abs() > 1e-12);
-        assert!(differs, "Different activations should produce different outputs");
+        assert!(
+            differs,
+            "Different activations should produce different outputs"
+        );
     }
 
     #[test]

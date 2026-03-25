@@ -30,7 +30,7 @@ use crate::utils::metrics::{GameOutcome, Metrics};
 ///
 /// let config = AppConfig::default();
 /// let agent_config = config.to_agent_config().unwrap();
-/// let agent = PcActorCritic::new(agent_config, 42);
+/// let agent = PcActorCritic::new(agent_config, 42).unwrap();
 /// let mut trainer = Trainer::new(agent, &config);
 /// trainer.train(10);
 /// ```
@@ -58,10 +58,7 @@ impl Trainer {
     ///
     /// * `agent` - The PC Actor-Critic agent to train.
     /// * `config` - Application configuration with curriculum and training settings.
-    pub fn new(
-        agent: PcActorCritic,
-        config: &crate::utils::config::AppConfig,
-    ) -> Self {
+    pub fn new(agent: PcActorCritic, config: &crate::utils::config::AppConfig) -> Self {
         Self {
             agent,
             env: TicTacToe::new(),
@@ -126,6 +123,7 @@ impl Trainer {
                     input: state.to_vec(),
                     latent_concat: infer.latent_concat,
                     y_conv: infer.y_conv,
+                    hidden_states: infer.hidden_states,
                     action,
                     valid_actions: valid,
                     reward: 0.0,
@@ -193,7 +191,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.training.episodes = num_episodes;
         let agent_config = config.to_agent_config().unwrap();
-        let agent = PcActorCritic::new(agent_config, 42);
+        let agent = PcActorCritic::new(agent_config, 42).unwrap();
         Trainer::new(agent, &config)
     }
 
@@ -217,7 +215,7 @@ mod tests {
         let agent_config = config.to_agent_config().unwrap();
 
         // Train an agent
-        let trained_agent = PcActorCritic::new(agent_config.clone(), 42);
+        let trained_agent = PcActorCritic::new(agent_config.clone(), 42).unwrap();
         let mut trainer = Trainer::new(trained_agent, &config);
         trainer.train(20);
 
@@ -228,13 +226,16 @@ mod tests {
         let fresh_path = dir.join("fresh.json");
         let trained_path = dir.join("trained.json");
 
-        let fresh2 = PcActorCritic::new(config.to_agent_config().unwrap(), 42);
+        let fresh2 = PcActorCritic::new(config.to_agent_config().unwrap(), 42).unwrap();
         save_agent(&fresh2, &fresh_path.to_string_lossy(), 0, None).unwrap();
         save_agent(trainer.agent(), &trained_path.to_string_lossy(), 20, None).unwrap();
 
         let fresh_data = std::fs::read_to_string(&fresh_path).unwrap();
         let trained_data = std::fs::read_to_string(&trained_path).unwrap();
-        assert_ne!(fresh_data, trained_data, "Weights should differ after training");
+        assert_ne!(
+            fresh_data, trained_data,
+            "Weights should differ after training"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -272,7 +273,7 @@ mod tests {
         config.curriculum.advance_threshold = 0.0; // Always advance
         config.curriculum.window_size = 1;
         let agent_config = config.to_agent_config().unwrap();
-        let agent = PcActorCritic::new(agent_config, 42);
+        let agent = PcActorCritic::new(agent_config, 42).unwrap();
         let mut trainer = Trainer::new(agent, &config);
 
         // With threshold=0.0 and window=1, any win advances depth

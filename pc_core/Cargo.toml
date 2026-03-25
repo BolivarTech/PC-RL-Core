@@ -1,0 +1,13 @@
+[package]
+name = "pc_core"
+version = "0.1.0"
+edition = "2021"
+description = "Predictive Coding Actor-Critic framework"
+license = "MIT"
+keywords = ["predictive-coding", "reinforcement-learning", "actor-critic"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+chrono.workspace = true

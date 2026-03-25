@@ -312,9 +312,7 @@ mod tests {
             let mut game = TicTacToe::new();
             // Player One takes cells a, b, c with Player Two taking
             // filler cells in between (avoiding the winning line)
-            let filler: Vec<usize> = (0..9)
-                .filter(|&x| x != a && x != b && x != c)
-                .collect();
+            let filler: Vec<usize> = (0..9).filter(|&x| x != a && x != b && x != c).collect();
 
             game.step(a).unwrap(); // P1
             game.step(filler[0]).unwrap(); // P2
@@ -345,7 +343,12 @@ mod tests {
         for (i, &m) in moves.iter().enumerate() {
             let result = game.step(m).unwrap();
             if i < 8 {
-                assert_eq!(result, GameResult::InProgress, "Move {} should be in progress", i);
+                assert_eq!(
+                    result,
+                    GameResult::InProgress,
+                    "Move {} should be in progress",
+                    i
+                );
             } else {
                 assert_eq!(result, GameResult::Draw);
             }
@@ -453,13 +456,13 @@ mod tests {
         let masks = TicTacToe::win_masks();
         assert_eq!(masks.len(), 8);
         // Verify specific mask values
-        assert_eq!(masks[0], 7);   // Row 0
-        assert_eq!(masks[1], 56);  // Row 1
+        assert_eq!(masks[0], 7); // Row 0
+        assert_eq!(masks[1], 56); // Row 1
         assert_eq!(masks[2], 448); // Row 2
-        assert_eq!(masks[3], 73);  // Col 0
+        assert_eq!(masks[3], 73); // Col 0
         assert_eq!(masks[4], 146); // Col 1
         assert_eq!(masks[5], 292); // Col 2
         assert_eq!(masks[6], 273); // Diagonal
-        assert_eq!(masks[7], 84);  // Anti-diagonal
+        assert_eq!(masks[7], 84); // Anti-diagonal
     }
 }

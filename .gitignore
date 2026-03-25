@@ -1,0 +1,21 @@
+# Build
+/target
+.claude/tdd-guard/data/
+Cargo.lock
+
+# Claude Files
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+
+# IDE Files
+.idea/
+*.swp
+*.swo
+
+# Ralph-Loop
+/plans
+/scripts
+/planning
+BLOCKED.md
+run-tests.sh

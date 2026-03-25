@@ -45,7 +45,15 @@ impl MinimaxPlayer {
     /// # Arguments
     ///
     /// * `depth` - Search depth from 1 (weak) to 9 (perfect).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `depth` is not in `[1, 9]`.
     pub fn new(depth: usize) -> Self {
+        assert!(
+            (1..=9).contains(&depth),
+            "depth must be in [1, 9], got {depth}"
+        );
         Self {
             depth,
             transposition_table: HashMap::new(),
@@ -122,8 +130,7 @@ impl MinimaxPlayer {
         for action in ordered {
             let mut clone = board.clone();
             clone.step(action).unwrap();
-            let score =
-                -self.alpha_beta(&clone, depth - 1, -beta, -alpha, depth_from_root + 1);
+            let score = -self.alpha_beta(&clone, depth - 1, -beta, -alpha, depth_from_root + 1);
             if score > best {
                 best = score;
             }
@@ -354,5 +361,17 @@ mod tests {
             game.valid_actions().contains(&action),
             "Depth-1 minimax should return a valid action"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "depth must be")]
+    fn test_minimax_zero_depth_panics() {
+        MinimaxPlayer::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "depth must be")]
+    fn test_minimax_depth_over_9_panics() {
+        MinimaxPlayer::new(10);
     }
 }

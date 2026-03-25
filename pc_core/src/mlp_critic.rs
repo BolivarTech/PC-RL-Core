@@ -11,6 +11,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::activation::Activation;
+use crate::error::PcError;
 use crate::layer::{Layer, LayerDef};
 
 /// Configuration for the MLP critic network.
@@ -72,10 +73,11 @@ pub struct MlpCriticWeights {
 ///     lr: 0.005,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
-/// let critic = MlpCritic::new(config, &mut rng);
+/// let critic = MlpCritic::new(config, &mut rng).unwrap();
 /// let value = critic.forward(&vec![0.0; 27]);
 /// assert!(value.is_finite());
 /// ```
+#[derive(Debug)]
 pub struct MlpCritic {
     /// Dense layers: hidden layers followed by the output layer (1 neuron).
     pub(crate) layers: Vec<Layer>,
@@ -93,7 +95,16 @@ impl MlpCritic {
     ///
     /// * `config` - Critic topology and hyperparameters.
     /// * `rng` - Random number generator for Xavier weight initialization.
-    pub fn new(config: MlpCriticConfig, rng: &mut impl Rng) -> Self {
+    /// # Errors
+    ///
+    /// Returns `PcError::ConfigValidation` if `input_size` is zero.
+    pub fn new(config: MlpCriticConfig, rng: &mut impl Rng) -> Result<Self, PcError> {
+        if config.input_size == 0 {
+            return Err(PcError::ConfigValidation(
+                "critic input_size must be > 0".into(),
+            ));
+        }
+
         let mut layers = Vec::with_capacity(config.hidden_layers.len() + 1);
         let mut prev_size = config.input_size;
 
@@ -105,7 +116,7 @@ impl MlpCritic {
         // Output layer: 1 neuron
         layers.push(Layer::new(prev_size, 1, config.output_activation, rng));
 
-        Self { layers, config }
+        Ok(Self { layers, config })
     }
 
     /// Computes the scalar value estimate V(s).
@@ -202,8 +213,8 @@ mod tests {
     use crate::activation::Activation;
     use crate::layer::LayerDef;
 
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     use super::*;
 
@@ -228,7 +239,7 @@ mod tests {
     #[test]
     fn test_forward_returns_finite_scalar() {
         let mut rng = make_rng();
-        let critic = MlpCritic::new(default_config(), &mut rng);
+        let critic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let input = vec![0.0; 27];
         let v = critic.forward(&input);
         assert!(v.is_finite(), "forward output {v} is not finite");
@@ -237,7 +248,7 @@ mod tests {
     #[test]
     fn test_forward_different_inputs_give_different_outputs() {
         let mut rng = make_rng();
-        let critic = MlpCritic::new(default_config(), &mut rng);
+        let critic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let a = critic.forward(&vec![0.0; 27]);
         let mut input_b = vec![0.0; 27];
         input_b[0] = 1.0;
@@ -267,7 +278,7 @@ mod tests {
             output_activation: Activation::Linear,
             lr: 0.005,
         };
-        let critic = MlpCritic::new(config, &mut rng);
+        let critic = MlpCritic::new(config, &mut rng).unwrap();
         let v = critic.forward(&vec![0.5; 27]);
         assert!(v.is_finite(), "Deep topology output {v} is not finite");
     }
@@ -275,8 +286,10 @@ mod tests {
     #[test]
     fn test_forward_extreme_input_still_finite() {
         let mut rng = make_rng();
-        let critic = MlpCritic::new(default_config(), &mut rng);
-        let input: Vec<f64> = (0..27).map(|i| if i % 2 == 0 { 1e6 } else { -1e6 }).collect();
+        let critic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let input: Vec<f64> = (0..27)
+            .map(|i| if i % 2 == 0 { 1e6 } else { -1e6 })
+            .collect();
         let v = critic.forward(&input);
         assert!(v.is_finite(), "Extreme input output {v} is not finite");
     }
@@ -285,7 +298,7 @@ mod tests {
     #[should_panic]
     fn test_forward_panics_wrong_input_size() {
         let mut rng = make_rng();
-        let critic = MlpCritic::new(default_config(), &mut rng);
+        let critic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let _ = critic.forward(&[0.0; 10]); // wrong size
     }
 
@@ -294,7 +307,7 @@ mod tests {
     #[test]
     fn test_update_loss_decreases_over_30_iterations() {
         let mut rng = make_rng();
-        let mut critic = MlpCritic::new(default_config(), &mut rng);
+        let mut critic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let input = vec![0.1; 27];
         let target = 0.5;
         let initial_loss = critic.update(&input, target);
@@ -311,7 +324,7 @@ mod tests {
     #[test]
     fn test_update_returns_finite_nonneg_loss() {
         let mut rng = make_rng();
-        let mut critic = MlpCritic::new(default_config(), &mut rng);
+        let mut critic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let loss = critic.update(&vec![0.0; 27], 1.0);
         assert!(loss.is_finite(), "Loss {loss} is not finite");
         assert!(loss >= 0.0, "Loss {loss} is negative");
@@ -320,7 +333,7 @@ mod tests {
     #[test]
     fn test_update_changes_weights() {
         let mut rng = make_rng();
-        let mut critic = MlpCritic::new(default_config(), &mut rng);
+        let mut critic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let w_before = critic.layers[0].weights.get(0, 0);
         let _ = critic.update(&vec![0.1; 27], 1.0);
         let w_after = critic.layers[0].weights.get(0, 0);
@@ -333,7 +346,7 @@ mod tests {
     #[test]
     fn test_update_clips_weights() {
         let mut rng = make_rng();
-        let mut critic = MlpCritic::new(default_config(), &mut rng);
+        let mut critic = MlpCritic::new(default_config(), &mut rng).unwrap();
         // Extreme update to force clipping
         for _ in 0..100 {
             let _ = critic.update(&vec![10.0; 27], 1e6);
@@ -356,7 +369,7 @@ mod tests {
     #[test]
     fn test_serde_roundtrip_preserves_weights() {
         let mut rng = make_rng();
-        let critic = MlpCritic::new(default_config(), &mut rng);
+        let critic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let input = vec![0.3; 27];
         let original_output = critic.forward(&input);
 

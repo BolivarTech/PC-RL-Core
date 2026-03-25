@@ -20,7 +20,7 @@ mod tests {
     fn agent_from_default_config() -> PcActorCritic {
         let config = AppConfig::default();
         let agent_config = config.to_agent_config().unwrap();
-        PcActorCritic::new(agent_config, 42)
+        PcActorCritic::new(agent_config, 42).unwrap()
     }
 
     #[test]
@@ -41,10 +41,17 @@ mod tests {
     #[test]
     fn test_latent_size_matches_critic_input_size() {
         let config = AppConfig::default();
-        let latent_sum: usize = config.agent.actor.hidden_layers.iter().map(|h| h.size).sum();
+        let latent_sum: usize = config
+            .agent
+            .actor
+            .hidden_layers
+            .iter()
+            .map(|h| h.size)
+            .sum();
         let expected_critic_input = config.agent.actor.input_size + latent_sum;
         assert_eq!(
-            config.agent.critic.input_size, expected_critic_input,
+            config.agent.critic.input_size,
+            expected_critic_input,
             "critic.input_size ({}) != actor.input_size ({}) + latent_sum ({}) = {}",
             config.agent.critic.input_size,
             config.agent.actor.input_size,
@@ -83,8 +90,14 @@ mod tests {
         // Load
         let (loaded, metadata) = load_agent(&path_str).unwrap();
         assert_eq!(metadata.episode, 1);
-        assert_eq!(loaded.config.actor.input_size, agent.config.actor.input_size);
-        assert_eq!(loaded.config.critic.input_size, agent.config.critic.input_size);
+        assert_eq!(
+            loaded.config.actor.input_size,
+            agent.config.actor.input_size
+        );
+        assert_eq!(
+            loaded.config.critic.input_size,
+            agent.config.critic.input_size
+        );
 
         // Loaded agent can still play
         let mut env2 = TicTacToe::new();
@@ -104,8 +117,14 @@ mod tests {
     fn test_toml_two_hidden_layers_correct_critic_input_fails_if_wrong() {
         let mut config = AppConfig::default();
         config.agent.actor.hidden_layers = vec![
-            HiddenLayerDef { size: 18, activation: "tanh".to_string() },
-            HiddenLayerDef { size: 12, activation: "relu".to_string() },
+            HiddenLayerDef {
+                size: 18,
+                activation: "tanh".to_string(),
+            },
+            HiddenLayerDef {
+                size: 12,
+                activation: "relu".to_string(),
+            },
         ];
         // Wrong critic input: still 27 instead of 9 + 18 + 12 = 39
         config.agent.critic.input_size = 27;
@@ -116,8 +135,14 @@ mod tests {
     fn test_toml_two_hidden_layers_correct_input_passes() {
         let mut config = AppConfig::default();
         config.agent.actor.hidden_layers = vec![
-            HiddenLayerDef { size: 18, activation: "tanh".to_string() },
-            HiddenLayerDef { size: 12, activation: "relu".to_string() },
+            HiddenLayerDef {
+                size: 18,
+                activation: "tanh".to_string(),
+            },
+            HiddenLayerDef {
+                size: 12,
+                activation: "relu".to_string(),
+            },
         ];
         // Correct critic input: 9 + 18 + 12 = 39
         config.agent.critic.input_size = 39;
@@ -125,7 +150,7 @@ mod tests {
 
         // Also verify we can create an agent from this config
         let agent_config = config.to_agent_config().unwrap();
-        let mut agent = PcActorCritic::new(agent_config, 42);
+        let mut agent = PcActorCritic::new(agent_config, 42).unwrap();
 
         // Play a game to verify topology works end-to-end
         let mut env = TicTacToe::new();

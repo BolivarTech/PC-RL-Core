@@ -12,8 +12,11 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::activation::Activation;
+use crate::error::PcError;
 use crate::layer::{Layer, LayerDef};
-use crate::matrix::{argmax_masked, rms_error, sample_from_probs, softmax_masked, vec_add, vec_scale, vec_sub};
+use crate::matrix::{
+    argmax_masked, rms_error, sample_from_probs, softmax_masked, vec_add, vec_scale, vec_sub,
+};
 
 /// Configuration for the predictive coding actor network.
 ///
@@ -116,10 +119,11 @@ pub enum SelectionMode {
 ///     lr_weights: 0.01, synchronous: true, temperature: 1.0,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
-/// let actor = PcActor::new(config, &mut rng);
+/// let actor = PcActor::new(config, &mut rng).unwrap();
 /// let result = actor.infer(&[0.0; 9]);
 /// assert_eq!(result.y_conv.len(), 9);
 /// ```
+#[derive(Debug)]
 pub struct PcActor {
     /// Network layers: hidden_layers.len() + 1 (output layer).
     pub(crate) layers: Vec<Layer>,
@@ -134,7 +138,25 @@ impl PcActor {
     ///
     /// * `config` - Actor configuration specifying topology and hyperparameters.
     /// * `rng` - Random number generator for weight initialization.
-    pub fn new(config: PcActorConfig, rng: &mut impl Rng) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::ConfigValidation` if `input_size`, `output_size`,
+    /// or `temperature` are invalid.
+    pub fn new(config: PcActorConfig, rng: &mut impl Rng) -> Result<Self, PcError> {
+        if config.input_size == 0 {
+            return Err(PcError::ConfigValidation("input_size must be > 0".into()));
+        }
+        if config.output_size == 0 {
+            return Err(PcError::ConfigValidation("output_size must be > 0".into()));
+        }
+        if config.temperature <= 0.0 {
+            return Err(PcError::ConfigValidation(format!(
+                "temperature must be positive, got {}",
+                config.temperature
+            )));
+        }
+
         let mut layers = Vec::new();
         let mut prev_size = config.input_size;
 
@@ -151,16 +173,12 @@ impl PcActor {
             rng,
         ));
 
-        Self { layers, config }
+        Ok(Self { layers, config })
     }
 
     /// Returns the total size of the latent concatenation (sum of hidden layer sizes).
     pub fn latent_size(&self) -> usize {
-        self.config
-            .hidden_layers
-            .iter()
-            .map(|def| def.size)
-            .sum()
+        self.config.hidden_layers.iter().map(|def| def.size).sum()
     }
 
     /// Runs the predictive coding inference loop on the given input.
@@ -263,8 +281,7 @@ impl PcActor {
                     let error = vec_sub(&prediction, &hidden_states[i]);
                     error_vecs.push(error.clone());
 
-                    let update =
-                        vec_add(&hidden_states[i], &vec_scale(&error, self.config.alpha));
+                    let update = vec_add(&hidden_states[i], &vec_scale(&error, self.config.alpha));
                     hidden_states[i] = update;
                 }
 
@@ -290,7 +307,10 @@ impl PcActor {
         }
 
         // Build latent_concat
-        let latent_concat: Vec<f64> = hidden_states.iter().flat_map(|h| h.iter().copied()).collect();
+        let latent_concat: Vec<f64> = hidden_states
+            .iter()
+            .flat_map(|h| h.iter().copied())
+            .collect();
 
         InferResult {
             y_conv: y,
@@ -324,7 +344,10 @@ impl PcActor {
         assert!(!valid_actions.is_empty(), "valid_actions must not be empty");
 
         // Scale logits by temperature
-        let scaled: Vec<f64> = y_conv.iter().map(|&v| v / self.config.temperature).collect();
+        let scaled: Vec<f64> = y_conv
+            .iter()
+            .map(|&v| v / self.config.temperature)
+            .collect();
 
         let probs = softmax_masked(&scaled, valid_actions);
 
@@ -451,7 +474,7 @@ mod tests {
     #[test]
     fn test_infer_converges_on_zero_board() {
         let mut rng = make_rng();
-        let actor = PcActor::new(default_config(), &mut rng);
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         // Should complete without panic; all finite
         for &v in &result.y_conv {
@@ -466,7 +489,7 @@ mod tests {
             min_steps: 3,
             ..default_config()
         };
-        let actor = PcActor::new(config, &mut rng);
+        let actor = PcActor::new(config, &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert!(result.steps_used >= 3);
     }
@@ -478,7 +501,7 @@ mod tests {
             alpha: 0.0,
             ..default_config()
         };
-        let actor = PcActor::new(config, &mut rng);
+        let actor = PcActor::new(config, &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert!(!result.converged);
         assert_eq!(result.steps_used, 20);
@@ -487,7 +510,7 @@ mod tests {
     #[test]
     fn test_infer_does_not_modify_weights() {
         let mut rng = make_rng();
-        let actor = PcActor::new(default_config(), &mut rng);
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
         let weights_before: Vec<Vec<f64>> = actor
             .layers
             .iter()
@@ -502,7 +525,7 @@ mod tests {
     #[test]
     fn test_infer_latent_size_single_hidden() {
         let mut rng = make_rng();
-        let actor = PcActor::new(default_config(), &mut rng);
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert_eq!(result.latent_concat.len(), 18);
     }
@@ -510,7 +533,7 @@ mod tests {
     #[test]
     fn test_infer_latent_size_two_hidden() {
         let mut rng = make_rng();
-        let actor = PcActor::new(two_hidden_config(), &mut rng);
+        let actor = PcActor::new(two_hidden_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert_eq!(result.latent_concat.len(), 30);
     }
@@ -518,7 +541,7 @@ mod tests {
     #[test]
     fn test_infer_latent_size_matches_latent_size_method() {
         let mut rng = make_rng();
-        let actor = PcActor::new(two_hidden_config(), &mut rng);
+        let actor = PcActor::new(two_hidden_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert_eq!(result.latent_concat.len(), actor.latent_size());
     }
@@ -526,7 +549,7 @@ mod tests {
     #[test]
     fn test_infer_y_conv_length_equals_output_size() {
         let mut rng = make_rng();
-        let actor = PcActor::new(default_config(), &mut rng);
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert_eq!(result.y_conv.len(), 9);
     }
@@ -534,7 +557,7 @@ mod tests {
     #[test]
     fn test_infer_hidden_states_count_matches_hidden_layers() {
         let mut rng = make_rng();
-        let actor = PcActor::new(two_hidden_config(), &mut rng);
+        let actor = PcActor::new(two_hidden_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert_eq!(result.hidden_states.len(), 2);
     }
@@ -542,7 +565,7 @@ mod tests {
     #[test]
     fn test_infer_all_outputs_finite() {
         let mut rng = make_rng();
-        let actor = PcActor::new(default_config(), &mut rng);
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
         let result = actor.infer(&[1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5]);
         for &v in &result.y_conv {
             assert!(v.is_finite());
@@ -556,7 +579,7 @@ mod tests {
     #[test]
     fn test_infer_surprise_score_nonnegative() {
         let mut rng = make_rng();
-        let actor = PcActor::new(default_config(), &mut rng);
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert!(result.surprise_score >= 0.0);
     }
@@ -564,13 +587,13 @@ mod tests {
     #[test]
     fn test_infer_synchronous_and_inplace_both_converge() {
         let mut rng = make_rng();
-        let sync_actor = PcActor::new(default_config(), &mut rng);
+        let sync_actor = PcActor::new(default_config(), &mut rng).unwrap();
         let mut rng2 = make_rng();
         let inplace_config = PcActorConfig {
             synchronous: false,
             ..default_config()
         };
-        let inplace_actor = PcActor::new(inplace_config, &mut rng2);
+        let inplace_actor = PcActor::new(inplace_config, &mut rng2).unwrap();
         let sync_result = sync_actor.infer(&[0.0; 9]);
         let inplace_result = inplace_actor.infer(&[0.0; 9]);
         // Both should complete without panic; at least one should converge or use all steps
@@ -598,13 +621,13 @@ mod tests {
             max_steps: 3,
             ..default_config()
         };
-        let sync_actor = PcActor::new(config.clone(), &mut rng);
+        let sync_actor = PcActor::new(config.clone(), &mut rng).unwrap();
         let mut rng2 = make_rng();
         let inplace_config = PcActorConfig {
             synchronous: false,
             ..config
         };
-        let inplace_actor = PcActor::new(inplace_config, &mut rng2);
+        let inplace_actor = PcActor::new(inplace_config, &mut rng2).unwrap();
         let input = [1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
         let sync_result = sync_actor.infer(&input);
         let inplace_result = inplace_actor.infer(&input);
@@ -624,7 +647,7 @@ mod tests {
     #[should_panic(expected = "input size")]
     fn test_infer_panics_wrong_input_length() {
         let mut rng = make_rng();
-        let actor = PcActor::new(default_config(), &mut rng);
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
         let _ = actor.infer(&[0.0; 5]);
     }
 
@@ -633,7 +656,7 @@ mod tests {
     #[test]
     fn test_select_action_training_always_in_valid() {
         let mut rng = make_rng();
-        let actor = PcActor::new(default_config(), &mut rng);
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
         let logits = vec![0.1, -0.2, 0.5, -0.1, 0.3, 0.0, -0.3, 0.2, 0.4];
         let valid = vec![0, 2, 4, 6, 8];
         for _ in 0..20 {
@@ -647,7 +670,7 @@ mod tests {
         let mut rng1 = StdRng::seed_from_u64(1);
         let mut rng2 = StdRng::seed_from_u64(99);
         let mut rng_init = make_rng();
-        let actor = PcActor::new(default_config(), &mut rng_init);
+        let actor = PcActor::new(default_config(), &mut rng_init).unwrap();
         let logits = vec![0.1, -0.2, 0.5, -0.1, 0.3, 0.0, -0.3, 0.2, 0.4];
         let valid = vec![0, 2, 4, 6, 8];
         let a1 = actor.select_action(&logits, &valid, SelectionMode::Play, &mut rng1);
@@ -662,7 +685,7 @@ mod tests {
             temperature: 5.0,
             ..default_config()
         };
-        let actor = PcActor::new(hot_config, &mut rng);
+        let actor = PcActor::new(hot_config, &mut rng).unwrap();
         // With high temperature, sampling should visit more actions
         let logits = vec![10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let valid: Vec<usize> = (0..9).collect();
@@ -679,7 +702,7 @@ mod tests {
     #[should_panic]
     fn test_select_action_empty_valid_panics() {
         let mut rng = make_rng();
-        let actor = PcActor::new(default_config(), &mut rng);
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
         let logits = vec![0.1; 9];
         let _ = actor.select_action(&logits, &[], SelectionMode::Training, &mut rng);
     }
@@ -689,7 +712,7 @@ mod tests {
     #[test]
     fn test_update_weights_changes_first_layer() {
         let mut rng = make_rng();
-        let mut actor = PcActor::new(default_config(), &mut rng);
+        let mut actor = PcActor::new(default_config(), &mut rng).unwrap();
         let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
         let infer_result = actor.infer(&input);
         let weights_before = actor.layers[0].weights.data.clone();
@@ -701,7 +724,7 @@ mod tests {
     #[test]
     fn test_update_weights_clips_all_layers() {
         let mut rng = make_rng();
-        let mut actor = PcActor::new(default_config(), &mut rng);
+        let mut actor = PcActor::new(default_config(), &mut rng).unwrap();
         let input = vec![1.0; 9];
         let infer_result = actor.infer(&input);
         let delta = vec![1e6; 9];
@@ -719,25 +742,96 @@ mod tests {
     #[test]
     fn test_update_weights_two_hidden_changes_both_layers() {
         let mut rng = make_rng();
-        let mut actor = PcActor::new(two_hidden_config(), &mut rng);
+        let mut actor = PcActor::new(two_hidden_config(), &mut rng).unwrap();
         let input = vec![0.5; 9];
         let infer_result = actor.infer(&input);
         let w0_before = actor.layers[0].weights.data.clone();
         let w1_before = actor.layers[1].weights.data.clone();
         let delta = vec![0.1; 9];
         actor.update_weights(&delta, &infer_result, &input, 1.0);
-        assert_ne!(actor.layers[0].weights.data, w0_before, "Layer 0 should change");
-        assert_ne!(actor.layers[1].weights.data, w1_before, "Layer 1 should change");
+        assert_ne!(
+            actor.layers[0].weights.data, w0_before,
+            "Layer 0 should change"
+        );
+        assert_ne!(
+            actor.layers[1].weights.data, w1_before,
+            "Layer 1 should change"
+        );
     }
 
     #[test]
     #[should_panic(expected = "input size")]
     fn test_update_weights_panics_wrong_x_size() {
         let mut rng = make_rng();
-        let mut actor = PcActor::new(default_config(), &mut rng);
+        let mut actor = PcActor::new(default_config(), &mut rng).unwrap();
         let input = vec![0.0; 9];
         let infer_result = actor.infer(&input);
         let delta = vec![0.1; 9];
         actor.update_weights(&delta, &infer_result, &[0.0; 5], 1.0);
+    }
+
+    // ── Zero Hidden Layers Test ─────────────────────────────────
+
+    #[test]
+    fn test_infer_zero_hidden_layers_produces_finite_output() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            hidden_layers: vec![],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        assert_eq!(result.y_conv.len(), 9);
+        assert!(result.y_conv.iter().all(|v| v.is_finite()));
+        assert!(result.latent_concat.is_empty());
+        assert!(result.hidden_states.is_empty());
+    }
+
+    // ── Config Validation Tests ─────────────────────────────────
+
+    #[test]
+    fn test_new_zero_input_size_returns_error() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            input_size: 0,
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, crate::error::PcError::ConfigValidation(_)));
+    }
+
+    #[test]
+    fn test_new_zero_output_size_returns_error() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            output_size: 0,
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_zero_temperature_returns_error() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            temperature: 0.0,
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_negative_temperature_returns_error() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            temperature: -1.0,
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_err());
     }
 }

@@ -4,88 +4,19 @@
 
 //! JSON-based weight persistence for the PC-Actor-Critic agent.
 //!
-//! Provides save/load for complete agent state (weights, config, metadata),
-//! checkpoint support with auto-named files, and the [`PcError`] enum used
-//! across the `pc_core` crate.
+//! Provides save/load for complete agent state (weights, config, metadata)
+//! and checkpoint support with auto-named files.
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::error::PcError;
 use crate::layer::Layer;
 use crate::mlp_critic::MlpCritic;
 use crate::pc_actor::PcActor;
 use crate::pc_actor_critic::{PcActorCritic, PcActorCriticConfig};
-
-/// Crate-wide error type for `pc_core`.
-///
-/// # Examples
-///
-/// ```
-/// use pc_core::serializer::PcError;
-///
-/// let err = PcError::ConfigValidation("bad topology".to_string());
-/// assert!(format!("{err}").contains("bad topology"));
-/// ```
-#[derive(Debug)]
-pub enum PcError {
-    /// Matrix or vector dimension mismatch.
-    DimensionMismatch {
-        /// Expected dimension.
-        expected: usize,
-        /// Actual dimension.
-        got: usize,
-        /// Human-readable context.
-        context: &'static str,
-    },
-    /// Configuration validation failure.
-    ConfigValidation(String),
-    /// JSON serialization/deserialization error.
-    Serialization(String),
-    /// File I/O error.
-    Io(std::io::Error),
-}
-
-impl fmt::Display for PcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PcError::DimensionMismatch {
-                expected,
-                got,
-                context,
-            } => write!(
-                f,
-                "dimension mismatch in {context}: expected {expected}, got {got}"
-            ),
-            PcError::ConfigValidation(msg) => write!(f, "config validation: {msg}"),
-            PcError::Serialization(msg) => write!(f, "serialization: {msg}"),
-            PcError::Io(e) => write!(f, "I/O error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for PcError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            PcError::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for PcError {
-    fn from(e: std::io::Error) -> Self {
-        PcError::Io(e)
-    }
-}
-
-impl From<serde_json::Error> for PcError {
-    fn from(e: serde_json::Error) -> Self {
-        PcError::Serialization(e.to_string())
-    }
-}
 
 /// Metadata embedded in every save file.
 ///
@@ -125,13 +56,6 @@ pub struct PcActorWeights {
     pub layers: Vec<Layer>,
 }
 
-/// Serializable weight snapshot for the MLP critic.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SerializerCriticWeights {
-    /// Layer snapshots in order (hidden layers + output layer).
-    pub layers: Vec<Layer>,
-}
-
 /// Complete save file containing agent state and metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveFile {
@@ -142,7 +66,7 @@ pub struct SaveFile {
     /// Actor network weights.
     pub actor_weights: PcActorWeights,
     /// Critic network weights.
-    pub critic_weights: SerializerCriticWeights,
+    pub critic_weights: crate::mlp_critic::MlpCriticWeights,
 }
 
 /// Saves the agent's full state to a JSON file.
@@ -179,7 +103,7 @@ pub fn save_agent(
         actor_weights: PcActorWeights {
             layers: agent.actor.layers.clone(),
         },
-        critic_weights: SerializerCriticWeights {
+        critic_weights: crate::mlp_critic::MlpCriticWeights {
             layers: agent.critic.layers.clone(),
         },
     };
@@ -249,7 +173,7 @@ pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError>
     );
 
     use rand::SeedableRng;
-    let rng = rand::rngs::StdRng::seed_from_u64(0);
+    let rng = rand::rngs::StdRng::from_entropy();
 
     let agent = PcActorCritic::from_parts(save_file.config, actor, critic, rng);
 
@@ -353,7 +277,7 @@ mod tests {
     }
 
     fn make_agent() -> PcActorCritic {
-        PcActorCritic::new(default_config(), 42)
+        PcActorCritic::new(default_config(), 42).unwrap()
     }
 
     fn temp_path(name: &str) -> String {
@@ -364,12 +288,15 @@ mod tests {
 
     /// Asserts two f64 slices are approximately equal (within 1e-15).
     fn assert_vecs_approx_eq(a: &[f64], b: &[f64]) {
-        assert_eq!(a.len(), b.len(), "Lengths differ: {} vs {}", a.len(), b.len());
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "Lengths differ: {} vs {}",
+            a.len(),
+            b.len()
+        );
         for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
-            assert!(
-                (va - vb).abs() < 1e-15,
-                "Element {i} differs: {va} vs {vb}"
-            );
+            assert!((va - vb).abs() < 1e-15, "Element {i} differs: {va} vs {vb}");
         }
     }
 
@@ -499,6 +426,63 @@ mod tests {
     }
 
     #[test]
+    fn test_load_agent_uses_entropy_seed_not_fixed() {
+        let agent = make_agent();
+        let path = temp_path("test_seed_entropy.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+
+        let (mut loaded1, _) = load_agent(&path).unwrap();
+        let (mut loaded2, _) = load_agent(&path).unwrap();
+
+        // Both agents should produce different action sequences
+        // because they use entropy-based RNG seeding
+        let input = vec![0.5; 9];
+        let valid: Vec<usize> = (0..9).collect();
+
+        let mut actions1 = Vec::new();
+        let mut actions2 = Vec::new();
+        for _ in 0..20 {
+            let (a1, _) = loaded1.act(&input, &valid, crate::pc_actor::SelectionMode::Training);
+            let (a2, _) = loaded2.act(&input, &valid, crate::pc_actor::SelectionMode::Training);
+            actions1.push(a1);
+            actions2.push(a2);
+        }
+
+        assert_ne!(
+            actions1, actions2,
+            "Two loaded agents should have different exploration due to entropy seeding"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_loaded_agent_produces_identical_inference() {
+        let agent = make_agent();
+        let path = temp_path("test_identical_infer.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+        let (loaded, _) = load_agent(&path).unwrap();
+
+        let input = vec![0.5, -0.5, 1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0];
+        let orig_result = agent.infer(&input);
+        let loaded_result = loaded.infer(&input);
+
+        // y_conv must be identical
+        assert_eq!(orig_result.y_conv.len(), loaded_result.y_conv.len());
+        for (a, b) in orig_result.y_conv.iter().zip(loaded_result.y_conv.iter()) {
+            assert!((a - b).abs() < 1e-12, "y_conv differs: {a} vs {b}");
+        }
+        // latent_concat must be identical
+        for (a, b) in orig_result
+            .latent_concat
+            .iter()
+            .zip(loaded_result.latent_concat.iter())
+        {
+            assert!((a - b).abs() < 1e-12, "latent_concat differs: {a} vs {b}");
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_save_creates_parent_directories() {
         let dir = std::env::temp_dir()
             .join("pc_core_tests")
@@ -514,10 +498,6 @@ mod tests {
         assert!(Path::new(&path).exists());
 
         // Cleanup
-        let _ = fs::remove_dir_all(
-            std::env::temp_dir()
-                .join("pc_core_tests")
-                .join("nested"),
-        );
+        let _ = fs::remove_dir_all(std::env::temp_dir().join("pc_core_tests").join("nested"));
     }
 }

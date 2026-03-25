@@ -36,7 +36,7 @@ use crate::utils::metrics::{GameOutcome, Metrics};
 ///
 /// let config = AppConfig::default();
 /// let agent_config = config.to_agent_config().unwrap();
-/// let agent = PcActorCritic::new(agent_config, 42);
+/// let agent = PcActorCritic::new(agent_config, 42).unwrap();
 /// let stop = Arc::new(AtomicBool::new(false));
 /// let mut trainer = ContinuousTrainer::new(agent, &config, stop);
 /// trainer.train();
@@ -127,6 +127,7 @@ impl ContinuousTrainer {
                     input: state.to_vec(),
                     latent_concat: infer.latent_concat.clone(),
                     y_conv: infer.y_conv.clone(),
+                    hidden_states: infer.hidden_states.clone(),
                     action,
                     valid_actions: valid.clone(),
                     reward: 0.0,
@@ -136,24 +137,33 @@ impl ContinuousTrainer {
 
                 self.env.step(action).unwrap();
 
-                // Per-step surprise check for immediate update
+                // Per-step surprise check for immediate TD(0) update
                 if surprise > self.surprise_threshold && !self.env.is_terminal() {
+                    // Let opponent respond before evaluating next state
+                    // so V(s') is the agent's actual next decision point
+                    if self.env.current_player() != agent_side && !self.env.is_terminal() {
+                        let opp_action = self.minimax.choose_action(&self.env);
+                        self.env.step(opp_action).unwrap();
+                    }
+
+                    let terminal = self.env.is_terminal();
                     let next_state = self.env.board_as_f64(agent_side);
-                    let next_infer = self.agent.act(
-                        &next_state,
-                        &self.env.valid_actions(),
-                        SelectionMode::Training,
-                    ).1;
+                    // Use infer() directly to avoid perturbing the RNG
+                    let next_infer = self.agent.infer(&next_state);
 
                     self.agent.learn_continuous(
                         &state,
                         &infer,
                         action,
                         &valid,
-                        0.0, // intermediate reward
+                        if terminal {
+                            self.env.reward(agent_side)
+                        } else {
+                            0.0
+                        },
                         &next_state,
                         &next_infer,
-                        false,
+                        terminal,
                     );
                     self.surprise_events += 1;
                 } else {
@@ -214,7 +224,7 @@ mod tests {
         config.continuous.max_episodes = max_episodes;
         config.continuous.surprise_threshold = 0.0; // Low threshold to trigger events
         let agent_config = config.to_agent_config().unwrap();
-        let agent = PcActorCritic::new(agent_config, 42);
+        let agent = PcActorCritic::new(agent_config, 42).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         ContinuousTrainer::new(agent, &config, stop)
     }
