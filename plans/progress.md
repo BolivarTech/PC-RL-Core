@@ -210,3 +210,27 @@ Workspace structure was already in place from prior setup:
 - 11 new training tests (205 total workspace), clippy clean
 
 ---
+
+## Iteration 14 — F-014: Integration Tests and CLI (2026-03-25)
+
+**Status:** PASSED (CHECKPOINT 4 — ALL FEATURES COMPLETE)
+
+- Implemented `ui/cli.rs`: Clap-derive CLI with 4 subcommands (train, play, evaluate, benchmark)
+  - `run_train`: loads config, creates agent, trains episodic or continuous, saves model
+  - `run_play`: interactive text-based game with board display
+  - `run_evaluate`: plays N games vs minimax, prints win/draw/loss stats
+  - `run_benchmark`: times training, reports episodes/sec
+- Updated `main.rs` to parse CLI and dispatch to subcommands
+- Created `integration_tests.rs` with 6 cross-crate integration tests:
+  - `test_agent_from_config_plays_complete_game_without_panic`
+  - `test_latent_size_matches_critic_input_size`
+  - `test_config_validation_catches_topology_inconsistency`
+  - `test_save_load_survives_full_session`
+  - `test_toml_two_hidden_layers_correct_critic_input_fails_if_wrong`
+  - `test_toml_two_hidden_layers_correct_input_passes`
+- Added 2 CLI unit tests (clap struct validity, subcommand enumeration)
+- 213 total workspace tests passing, clippy clean
+- CLI smoke test: `--help` exits 0 with all 4 subcommands listed
+- Key: `ContinuousTrainer::new` takes 3 args (max_episodes from config internally); `MinimaxPlayer` needs `mut` for `choose_action`
+
+---

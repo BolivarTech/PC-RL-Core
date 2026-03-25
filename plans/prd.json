@@ -375,7 +375,8 @@
     {
       "id": "F-014",
       "title": "Integration Tests and CLI",
-      "passes": false,
+      "passes": true,
+      "completed_at": "2026-03-25",
       "priority": "high",
       "acceptance_criteria": [
         "test_agent_from_config_plays_complete_game_without_panic",
