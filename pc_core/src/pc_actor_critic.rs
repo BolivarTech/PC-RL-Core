@@ -126,6 +126,29 @@ impl PcActorCritic {
         }
     }
 
+    /// Reconstructs an agent from pre-built components (used by serializer).
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Agent configuration.
+    /// * `actor` - Pre-built PC actor with loaded weights.
+    /// * `critic` - Pre-built MLP critic with loaded weights.
+    /// * `rng` - Random number generator.
+    pub fn from_parts(
+        config: PcActorCriticConfig,
+        actor: PcActor,
+        critic: MlpCritic,
+        rng: StdRng,
+    ) -> Self {
+        Self {
+            actor,
+            critic,
+            config,
+            rng,
+            surprise_buffer: Vec::new(),
+        }
+    }
+
     /// Selects an action given the current state.
     ///
     /// Runs PC inference on the input, then selects an action using the

@@ -90,8 +90,6 @@ Workspace structure was already in place from prior setup:
 - 22 tests passing (109 total workspace tests)
 - Added `pub mod pc_actor;` to lib.rs
 
----
-
 ## Iteration 6 — F-006: MLP Critic (2026-03-25)
 
 **Status:** PASSED
@@ -124,5 +122,23 @@ Workspace structure was already in place from prior setup:
   - `rand::Rng` import not needed when only using concrete StdRng type
 - 18 tests passing (137 total workspace tests)
 - Added `pub mod pc_actor_critic;` to lib.rs
+
+---
+
+## Iteration 8 — F-008: Serializer (2026-03-25)
+
+**Status:** PASSED
+
+- Implemented `PcError` enum with `DimensionMismatch`, `ConfigValidation`, `Serialization`, `Io` variants
+- Implemented `Display`, `Error`, `From<std::io::Error>`, `From<serde_json::Error>` for `PcError`
+- Implemented `AgentMetadata`, `TrainingMetrics`, `PcActorWeights`, `SerializerCriticWeights`, `SaveFile` structs
+- Implemented `save_agent`, `load_agent`, `checkpoint_filename`, `save_checkpoint` functions
+- Added `from_parts` constructor to `PcActorCritic` for reconstructing from loaded components
+- Key learnings:
+  - `serde_json` f64 roundtrip can have last-digit precision differences (~1e-16); tests use approximate equality (1e-15 tolerance)
+  - `PcActor` and `MlpCritic` don't implement `Debug`, so `Result::unwrap_err()` won't compile; use `result.err().unwrap()` + `matches!` macro instead
+  - `pub(crate)` access on actor/critic layers works since serializer is in the same crate
+- 10 serializer tests + 137 prior = 147 total workspace tests passing
+- Added `pub mod serializer;` to lib.rs
 
 ---

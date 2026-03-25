@@ -10,3 +10,4 @@ pub mod matrix;
 pub mod mlp_critic;
 pub mod pc_actor;
 pub mod pc_actor_critic;
+pub mod serializer;
