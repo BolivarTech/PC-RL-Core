@@ -62,6 +62,8 @@ pub struct ContinuousTrainer {
     surprise_events: usize,
     /// Number of steps where surprise was below threshold (absorbed).
     absorbed_events: usize,
+    /// How often to print progress (every N episodes). 0 = silent.
+    log_interval: usize,
 }
 
 impl ContinuousTrainer {
@@ -88,6 +90,7 @@ impl ContinuousTrainer {
             episode_count: 0,
             surprise_events: 0,
             absorbed_events: 0,
+            log_interval: config.training.log_interval,
         }
     }
 
@@ -101,6 +104,19 @@ impl ContinuousTrainer {
         while !self.stop_flag.load(Ordering::Relaxed) && self.episode_count < self.max_episodes {
             self.run_episode();
             self.episode_count += 1;
+
+            if self.log_interval > 0 && self.episode_count.is_multiple_of(self.log_interval) {
+                eprintln!(
+                    "[ep {ep:>6}/{total}] win={win:.1}% loss={loss:.1}% draw={draw:.1}% | surprise_events={se} absorbed={ab}",
+                    ep = self.episode_count,
+                    total = self.max_episodes,
+                    win = self.metrics.win_rate() * 100.0,
+                    loss = self.metrics.loss_rate() * 100.0,
+                    draw = self.metrics.draw_rate() * 100.0,
+                    se = self.surprise_events,
+                    ab = self.absorbed_events,
+                );
+            }
         }
     }
 

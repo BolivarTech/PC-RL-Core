@@ -115,6 +115,21 @@ impl Metrics {
         }
     }
 
+    /// Returns the number of recorded outcomes in the window.
+    pub fn count(&self) -> usize {
+        self.outcomes.len()
+    }
+
+    /// Returns the configured window size.
+    pub fn window_size(&self) -> usize {
+        self.window_size
+    }
+
+    /// Clears all recorded outcomes, resetting win/loss/draw rates to zero.
+    pub fn reset(&mut self) {
+        self.outcomes.clear();
+    }
+
     /// Computes the rate of a specific outcome in the window.
     ///
     /// # Parameters

@@ -151,6 +151,9 @@ pub struct TrainingSection {
     /// Checkpoint interval (episodes).
     #[serde(default = "default_checkpoint_interval")]
     pub checkpoint_interval: usize,
+    /// How often to print progress stats (every N episodes).
+    #[serde(default = "default_log_interval")]
+    pub log_interval: usize,
     /// Random seed.
     #[serde(default = "default_seed")]
     pub seed: u64,
@@ -266,6 +269,9 @@ fn default_episodes() -> usize {
 fn default_checkpoint_interval() -> usize {
     1000
 }
+fn default_log_interval() -> usize {
+    500
+}
 fn default_seed() -> u64 {
     42
 }
@@ -361,6 +367,7 @@ impl Default for TrainingSection {
         Self {
             episodes: default_episodes(),
             checkpoint_interval: default_checkpoint_interval(),
+            log_interval: default_log_interval(),
             seed: default_seed(),
         }
     }

@@ -1,0 +1,51 @@
+[agent]
+gamma = 0.99
+surprise_low = 0.02
+surprise_high = 0.15
+adaptive_surprise = false
+entropy_coeff = 0.0
+
+[agent.actor]
+input_size = 9
+output_size = 9
+output_activation = "linear"
+alpha = 0.03
+tol = 0.01
+min_steps = 1
+max_steps = 5
+lr_weights = 0.005
+synchronous = true
+temperature = 1.0
+
+[[agent.actor.hidden_layers]]
+size = 27
+activation = "tanh"
+
+[agent.critic]
+# 9 + 27 = 36
+input_size = 36
+output_activation = "linear"
+lr = 0.005
+
+[[agent.critic.hidden_layers]]
+size = 36
+activation = "tanh"
+
+[training]
+episodes = 50000
+checkpoint_interval = 5000
+log_interval = 500
+seed = 42
+
+[curriculum]
+advance_threshold = 0.95
+window_size = 1000
+
+[continuous]
+max_episodes = 50000
+surprise_threshold = 0.1
+
+[logger]
+level = "info"
+max_backups = 3
+max_size = 10485760

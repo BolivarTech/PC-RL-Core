@@ -849,6 +849,89 @@ mod tests {
         let _ = agent.act(&input, &[], SelectionMode::Training);
     }
 
+    // ── learning diagnostic test ──────────────────────────────
+
+    #[test]
+    fn test_learn_improves_policy_for_rewarded_action() {
+        // Linear output so logits are unbounded
+        let config = PcActorCriticConfig {
+            actor: PcActorConfig {
+                input_size: 9,
+                hidden_layers: vec![LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                }],
+                output_size: 9,
+                output_activation: Activation::Linear,
+                alpha: 0.1,
+                tol: 0.01,
+                min_steps: 1,
+                max_steps: 5,
+                lr_weights: 0.01,
+                synchronous: true,
+                temperature: 1.0,
+            },
+            critic: MlpCriticConfig {
+                input_size: 27,
+                hidden_layers: vec![LayerDef {
+                    size: 36,
+                    activation: Activation::Tanh,
+                }],
+                output_activation: Activation::Linear,
+                lr: 0.005,
+            },
+            gamma: 0.99,
+            surprise_low: 0.02,
+            surprise_high: 0.15,
+            adaptive_surprise: false,
+            entropy_coeff: 0.0, // no entropy to isolate gradient effect
+        };
+        let mut agent = PcActorCritic::new(config, 42).unwrap();
+
+        let input = vec![0.0; 9];
+        let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let target_action = 4; // center
+
+        // Repeatedly reward action 4
+        for _ in 0..200 {
+            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            let trajectory = vec![TrajectoryStep {
+                input: input.clone(),
+                latent_concat: infer.latent_concat,
+                y_conv: infer.y_conv,
+                hidden_states: infer.hidden_states,
+                action: target_action,
+                valid_actions: valid.clone(),
+                reward: 1.0,
+                surprise_score: infer.surprise_score,
+                steps_used: infer.steps_used,
+            }];
+            agent.learn(&trajectory);
+        }
+
+        // After 200 episodes always rewarding action 4, it should be the
+        // preferred action in Play mode (deterministic argmax)
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Play);
+
+        // Check that action 4's logit is the highest
+        let logit_4 = infer.y_conv[4];
+        let max_other = valid.iter()
+            .filter(|&&a| a != 4)
+            .map(|&a| infer.y_conv[a])
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        eprintln!(
+            "DIAGNOSTIC: action={action}, logit[4]={logit_4:.4}, max_other={max_other:.4}, \
+             y_conv={:?}",
+            infer.y_conv.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            action, target_action,
+            "After 200 episodes rewarding action 4, agent should prefer it. Got action {action}"
+        );
+    }
+
     // ── config validation tests ────────────────────────────────
 
     #[test]

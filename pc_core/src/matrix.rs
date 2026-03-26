@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub const WEIGHT_CLIP: f64 = 5.0;
 
 /// Maximum absolute value for gradient clamping.
-pub const GRAD_CLIP: f64 = 1.0;
+pub const GRAD_CLIP: f64 = 5.0;
 
 /// A dense row-major matrix of `f64` values.
 ///

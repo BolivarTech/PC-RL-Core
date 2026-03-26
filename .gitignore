@@ -13,6 +13,10 @@ CLAUDE.local.md
 *.swp
 *.swo
 
+# Model files
+model.json
+*.json.bak
+
 # Ralph-Loop
 /plans
 /scripts

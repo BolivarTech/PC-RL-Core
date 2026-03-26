@@ -49,6 +49,8 @@ pub struct Trainer {
     advance_threshold: f64,
     /// Total episodes trained so far.
     episode_count: usize,
+    /// How often to print progress (every N episodes). 0 = silent.
+    log_interval: usize,
 }
 
 impl Trainer {
@@ -67,6 +69,7 @@ impl Trainer {
             current_depth: 1,
             advance_threshold: config.curriculum.advance_threshold,
             episode_count: 0,
+            log_interval: config.training.log_interval,
         }
     }
 
@@ -88,13 +91,38 @@ impl Trainer {
             let outcome = self.episode_outcome();
             self.metrics.record(outcome);
 
-            // Check curriculum advancement
-            if self.metrics.win_rate() > self.advance_threshold && self.current_depth < 9 {
+            // Check curriculum advancement (only after window is full for stable stats)
+            let prev_depth = self.current_depth;
+            let non_loss_rate = self.metrics.win_rate() + self.metrics.draw_rate();
+            if self.metrics.count() >= self.metrics.window_size()
+                && non_loss_rate > self.advance_threshold
+                && self.current_depth < 9
+            {
                 self.current_depth += 1;
                 self.minimax = MinimaxPlayer::new(self.current_depth);
+                self.metrics.reset();
             }
 
             self.episode_count += 1;
+
+            // Progress reporting
+            if self.log_interval > 0 && self.episode_count.is_multiple_of(self.log_interval) {
+                eprintln!(
+                    "[ep {ep:>6}/{total}] win={win:.1}% loss={loss:.1}% draw={draw:.1}% | depth={depth}",
+                    ep = self.episode_count,
+                    total = num_episodes,
+                    win = self.metrics.win_rate() * 100.0,
+                    loss = self.metrics.loss_rate() * 100.0,
+                    draw = self.metrics.draw_rate() * 100.0,
+                    depth = self.current_depth,
+                );
+            }
+            if prev_depth != self.current_depth {
+                eprintln!(
+                    "  >> Curriculum advanced: depth {} -> {}",
+                    prev_depth, self.current_depth
+                );
+            }
         }
     }
 
@@ -254,6 +282,29 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_linear_output_agent_learns_against_depth1() {
+        let mut config = AppConfig::default();
+        config.agent.actor.output_activation = "linear".to_string();
+        config.agent.entropy_coeff = 0.01;
+        config.curriculum.window_size = 500;
+        config.curriculum.advance_threshold = 0.99; // prevent advancement during test
+        config.training.log_interval = 0;
+        let agent_config = config.to_agent_config().unwrap();
+        let agent = PcActorCritic::new(agent_config, 42).unwrap();
+        let mut trainer = Trainer::new(agent, &config);
+
+        trainer.train(500);
+
+        let wr = trainer.metrics().win_rate();
+        assert!(
+            wr > 0.25,
+            "Linear output agent should learn above random after 500 episodes, got {:.1}%",
+            wr * 100.0
+        );
+    }
+
 
     #[test]
     fn test_agent_sees_both_sides_over_episodes() {
