@@ -1065,4 +1065,138 @@ mod tests {
             "Local learning should produce different weight updates than backprop"
         );
     }
+
+    // ── Hybrid Learning (local_lambda) Tests ────────────────────
+
+    fn hybrid_config(lambda: f64) -> PcActorConfig {
+        PcActorConfig {
+            local_lambda: lambda,
+            ..default_config()
+        }
+    }
+
+    #[test]
+    fn test_local_lambda_one_equals_backprop() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let delta = vec![0.1; 9];
+
+        // Pure backprop (local_learning=false, default)
+        let mut rng1 = make_rng();
+        let mut bp_actor = PcActor::new(default_config(), &mut rng1).unwrap();
+        let bp_infer = bp_actor.infer(&input);
+        bp_actor.update_weights(&delta, &bp_infer, &input, 1.0);
+
+        // lambda=1.0 should be identical to backprop
+        let mut rng2 = make_rng();
+        let mut lam_actor = PcActor::new(hybrid_config(1.0), &mut rng2).unwrap();
+        let lam_infer = lam_actor.infer(&input);
+        lam_actor.update_weights(&delta, &lam_infer, &input, 1.0);
+
+        assert_eq!(
+            bp_actor.layers[0].weights.data, lam_actor.layers[0].weights.data,
+            "lambda=1.0 should produce identical weights to pure backprop"
+        );
+    }
+
+    #[test]
+    fn test_local_lambda_zero_equals_local_learning() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let delta = vec![0.1; 9];
+
+        // Pure local (local_learning=true)
+        let mut rng1 = make_rng();
+        let mut ll_actor = PcActor::new(local_learning_config(), &mut rng1).unwrap();
+        let ll_infer = ll_actor.infer(&input);
+        ll_actor.update_weights(&delta, &ll_infer, &input, 1.0);
+
+        // lambda=0.0 should be identical to pure local
+        let mut rng2 = make_rng();
+        let mut lam_actor = PcActor::new(hybrid_config(0.0), &mut rng2).unwrap();
+        let lam_infer = lam_actor.infer(&input);
+        lam_actor.update_weights(&delta, &lam_infer, &input, 1.0);
+
+        assert_eq!(
+            ll_actor.layers[0].weights.data, lam_actor.layers[0].weights.data,
+            "lambda=0.0 should produce identical weights to pure local learning"
+        );
+    }
+
+    #[test]
+    fn test_local_lambda_half_differs_from_both_pure_modes() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let delta = vec![0.1; 9];
+
+        // Pure backprop
+        let mut rng1 = make_rng();
+        let mut bp_actor = PcActor::new(default_config(), &mut rng1).unwrap();
+        let bp_infer = bp_actor.infer(&input);
+        bp_actor.update_weights(&delta, &bp_infer, &input, 1.0);
+
+        // Pure local
+        let mut rng2 = make_rng();
+        let mut ll_actor = PcActor::new(local_learning_config(), &mut rng2).unwrap();
+        let ll_infer = ll_actor.infer(&input);
+        ll_actor.update_weights(&delta, &ll_infer, &input, 1.0);
+
+        // Hybrid lambda=0.5
+        let mut rng3 = make_rng();
+        let mut hy_actor = PcActor::new(hybrid_config(0.5), &mut rng3).unwrap();
+        let hy_infer = hy_actor.infer(&input);
+        hy_actor.update_weights(&delta, &hy_infer, &input, 1.0);
+
+        assert_ne!(
+            hy_actor.layers[0].weights.data, bp_actor.layers[0].weights.data,
+            "lambda=0.5 should differ from pure backprop"
+        );
+        assert_ne!(
+            hy_actor.layers[0].weights.data, ll_actor.layers[0].weights.data,
+            "lambda=0.5 should differ from pure local"
+        );
+    }
+
+    #[test]
+    fn test_local_lambda_changes_weights() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(hybrid_config(0.5), &mut rng).unwrap();
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let infer_result = actor.infer(&input);
+        let weights_before = actor.layers[0].weights.data.clone();
+        let delta = vec![0.1; 9];
+        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        assert_ne!(actor.layers[0].weights.data, weights_before);
+    }
+
+    #[test]
+    fn test_local_lambda_clips_weights() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(hybrid_config(0.5), &mut rng).unwrap();
+        let input = vec![1.0; 9];
+        let infer_result = actor.infer(&input);
+        let delta = vec![1e6; 9];
+        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        for layer in &actor.layers {
+            for &w in &layer.weights.data {
+                assert!(
+                    w.abs() <= WEIGHT_CLIP + 1e-12,
+                    "Weight {w} exceeds WEIGHT_CLIP"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_local_lambda_negative_returns_error() {
+        let mut rng = make_rng();
+        let config = hybrid_config(-0.1);
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_local_lambda_above_one_returns_error() {
+        let mut rng = make_rng();
+        let config = hybrid_config(1.1);
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_err());
+    }
 }
