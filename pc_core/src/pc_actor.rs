@@ -40,6 +40,7 @@ use crate::matrix::{
 ///     synchronous: true,
 ///     temperature: 1.0,
 ///     local_learning: false,
+///     local_lambda: 1.0,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +71,16 @@ pub struct PcActorConfig {
     /// of standard backpropagation (Millidge et al. 2022).
     #[serde(default)]
     pub local_learning: bool,
+    /// Blend factor between backprop and local PC error for hidden layers.
+    /// 1.0 = pure backprop, 0.0 = pure local PC, intermediate = hybrid.
+    /// When set to a value in [0, 1], overrides `local_learning`.
+    #[serde(default = "default_local_lambda")]
+    pub local_lambda: f64,
+}
+
+/// Default local_lambda: 1.0 (pure backprop).
+fn default_local_lambda() -> f64 {
+    1.0
 }
 
 /// Result of the predictive coding inference loop.
@@ -126,6 +137,7 @@ pub enum SelectionMode {
 ///     alpha: 0.1, tol: 0.01, min_steps: 1, max_steps: 20,
 ///     lr_weights: 0.01, synchronous: true, temperature: 1.0,
 ///     local_learning: false,
+///     local_lambda: 1.0,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
 /// let actor = PcActor::new(config, &mut rng).unwrap();
@@ -163,6 +175,12 @@ impl PcActor {
             return Err(PcError::ConfigValidation(format!(
                 "temperature must be positive, got {}",
                 config.temperature
+            )));
+        }
+        if !(0.0..=1.0).contains(&config.local_lambda) {
+            return Err(PcError::ConfigValidation(format!(
+                "local_lambda must be in [0.0, 1.0], got {}",
+                config.local_lambda
             )));
         }
 
@@ -401,80 +419,46 @@ impl PcActor {
             self.config.input_size
         );
 
-        if self.config.local_learning {
-            self.update_weights_local(output_delta, infer_result, input, surprise_scale);
+        // Resolve effective lambda: local_learning=true forces lambda=0.0,
+        // otherwise use local_lambda (default 1.0 = pure backprop).
+        let lambda = if self.config.local_learning {
+            0.0
         } else {
-            self.update_weights_backprop(output_delta, infer_result, input, surprise_scale);
-        }
-    }
-
-    /// Standard backpropagation weight update.
-    fn update_weights_backprop(
-        &mut self,
-        output_delta: &[f64],
-        infer_result: &InferResult,
-        input: &[f64],
-        surprise_scale: f64,
-    ) {
-        let n_hidden = self.config.hidden_layers.len();
-        let n_layers = self.layers.len();
-
-        // Output layer backward
-        let output_input = if n_hidden > 0 {
-            &infer_result.hidden_states[n_hidden - 1]
-        } else {
-            input
+            self.config.local_lambda
         };
-        let output_output = &infer_result.y_conv;
-        let mut delta = self.layers[n_layers - 1].backward(
-            output_input,
-            output_output,
-            output_delta,
-            self.config.lr_weights,
-            surprise_scale,
-        );
 
-        // Hidden layers backward (from top to bottom)
-        for i in (0..n_hidden).rev() {
-            let layer_input = if i > 0 {
-                &infer_result.hidden_states[i - 1]
-            } else {
-                input
-            };
-            let layer_output = &infer_result.hidden_states[i];
-            delta = self.layers[i].backward(
-                layer_input,
-                layer_output,
-                &delta,
-                self.config.lr_weights,
-                surprise_scale,
-            );
-        }
+        self.update_weights_hybrid(output_delta, infer_result, input, surprise_scale, lambda);
     }
 
-    /// Local PC learning weight update (Millidge et al. 2022).
+    /// Hybrid weight update blending backprop and local PC error signals.
     ///
-    /// Uses prediction errors from the PC inference loop as local gradient
-    /// signals. The output layer still uses backprop from `output_delta`.
-    /// Hidden layers use their PC prediction error: `ΔW[i] = -lr * error[i] * h[i-1]^T`.
-    fn update_weights_local(
+    /// For hidden layers, the effective delta is:
+    /// `delta = lambda * backprop_delta + (1 - lambda) * pc_error`
+    ///
+    /// * `lambda = 1.0` → pure backprop (standard mode).
+    /// * `lambda = 0.0` → pure local PC learning (Millidge et al. 2022).
+    /// * `0 < lambda < 1` → hybrid blend.
+    ///
+    /// The output layer always uses standard backprop from `output_delta`.
+    fn update_weights_hybrid(
         &mut self,
         output_delta: &[f64],
         infer_result: &InferResult,
         input: &[f64],
         surprise_scale: f64,
+        lambda: f64,
     ) {
         let n_hidden = self.config.hidden_layers.len();
         let n_layers = self.layers.len();
 
-        // Output layer: standard backward (no PC error for output)
+        // Output layer: always standard backward
         let output_input = if n_hidden > 0 {
             &infer_result.hidden_states[n_hidden - 1]
         } else {
             input
         };
         let output_output = &infer_result.y_conv;
-        let _ = self.layers[n_layers - 1].backward(
+        let mut bp_delta = self.layers[n_layers - 1].backward(
             output_input,
             output_output,
             output_delta,
@@ -482,9 +466,7 @@ impl PcActor {
             surprise_scale,
         );
 
-        // Hidden layers: use local prediction errors as gradient signals.
-        // prediction_errors are stored in reverse layer order (top→bottom),
-        // so index 0 corresponds to the topmost hidden layer.
+        // Hidden layers (from top to bottom)
         for i in (0..n_hidden).rev() {
             let layer_input = if i > 0 {
                 &infer_result.hidden_states[i - 1]
@@ -492,13 +474,30 @@ impl PcActor {
                 input
             };
             let layer_output = &infer_result.hidden_states[i];
-            // Map reverse-order index: layer n_hidden-1 → error index 0
-            let error_idx = n_hidden - 1 - i;
-            let local_error = &infer_result.prediction_errors[error_idx];
-            self.layers[i].backward(
+
+            // Blend backprop delta with local PC error
+            let effective_delta = if (lambda - 1.0).abs() < f64::EPSILON {
+                // Pure backprop: use bp_delta directly
+                bp_delta.clone()
+            } else if lambda.abs() < f64::EPSILON {
+                // Pure local: use PC error directly
+                let error_idx = n_hidden - 1 - i;
+                infer_result.prediction_errors[error_idx].clone()
+            } else {
+                // Hybrid: blend both signals
+                let error_idx = n_hidden - 1 - i;
+                let pc_error = &infer_result.prediction_errors[error_idx];
+                bp_delta
+                    .iter()
+                    .zip(pc_error.iter())
+                    .map(|(&bp, &pc)| lambda * bp + (1.0 - lambda) * pc)
+                    .collect()
+            };
+
+            bp_delta = self.layers[i].backward(
                 layer_input,
                 layer_output,
-                local_error,
+                &effective_delta,
                 self.config.lr_weights,
                 surprise_scale,
             );
@@ -536,6 +535,7 @@ mod tests {
             synchronous: true,
             temperature: 1.0,
             local_learning: false,
+            local_lambda: 1.0,
         }
     }
 

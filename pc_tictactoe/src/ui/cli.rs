@@ -70,6 +70,12 @@ pub struct TrainArgs {
     /// Target win rate for curriculum advancement.
     #[arg(long)]
     pub target_winrate: Option<f64>,
+    /// Use local PC prediction errors for weight updates (Millidge et al. 2022).
+    #[arg(long)]
+    pub local_learning: bool,
+    /// Blend factor: 1.0 = pure backprop, 0.0 = pure local PC (overrides local_learning).
+    #[arg(long)]
+    pub local_lambda: Option<f64>,
 }
 
 /// Arguments for the play subcommand.
@@ -125,6 +131,14 @@ pub fn run_train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(wr) = args.target_winrate {
         config.curriculum.advance_threshold = wr;
+    }
+
+    if args.local_learning {
+        config.agent.actor.local_learning = true;
+    }
+
+    if let Some(lambda) = args.local_lambda {
+        config.agent.actor.local_lambda = lambda;
     }
 
     config.validate()?;

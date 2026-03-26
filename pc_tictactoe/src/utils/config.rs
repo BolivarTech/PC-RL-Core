@@ -117,6 +117,14 @@ pub struct ActorSection {
     /// Use local PC prediction errors for weight updates (Millidge et al. 2022).
     #[serde(default)]
     pub local_learning: bool,
+    /// Blend factor: 1.0 = pure backprop, 0.0 = pure local PC, intermediate = hybrid.
+    #[serde(default = "default_local_lambda")]
+    pub local_lambda: f64,
+}
+
+/// Default local_lambda: 1.0 (pure backprop).
+fn default_local_lambda() -> f64 {
+    1.0
 }
 
 /// Critic network configuration section.
@@ -351,6 +359,7 @@ impl Default for ActorSection {
             synchronous: default_true(),
             temperature: default_temperature(),
             local_learning: false,
+            local_lambda: default_local_lambda(),
         }
     }
 }
@@ -522,6 +531,7 @@ impl AppConfig {
                 synchronous: self.agent.actor.synchronous,
                 temperature: self.agent.actor.temperature,
                 local_learning: self.agent.actor.local_learning,
+                local_lambda: self.agent.actor.local_lambda,
             },
             critic: MlpCriticConfig {
                 input_size: self.agent.critic.input_size,
