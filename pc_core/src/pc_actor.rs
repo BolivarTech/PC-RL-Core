@@ -66,8 +66,19 @@ pub struct PcActorConfig {
     pub synchronous: bool,
     /// Softmax temperature for action selection.
     pub temperature: f64,
-    /// Blend factor between backprop and local PC error for hidden layers.
-    /// 1.0 = pure backprop, 0.0 = pure local PC, intermediate = hybrid.
+    /// Blend factor for hidden layer weight updates, range `[0.0, 1.0]`.
+    ///
+    /// Controls how hidden layers combine two gradient signals:
+    /// `delta = lambda * backprop_grad + (1 - lambda) * pc_prediction_error`
+    ///
+    /// - `1.0` — Pure backprop: reward signal propagated from output (default).
+    /// - `0.0` — Pure local PC: prediction errors from inference loop
+    ///   used as gradients (Millidge et al. 2022). No vanishing gradient
+    ///   but no reward signal reaches hidden layers.
+    /// - `0.0 < lambda < 1.0` — Hybrid: reward-aware backprop regularized
+    ///   by local PC consistency errors.
+    ///
+    /// The output layer always uses standard backprop regardless of this value.
     #[serde(default = "default_local_lambda")]
     pub local_lambda: f64,
 }

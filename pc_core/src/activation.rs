@@ -32,6 +32,8 @@ pub enum Activation {
     Relu,
     /// Logistic sigmoid: output in (0, 1).
     Sigmoid,
+    /// Exponential linear unit: smooth in negatives, avoids dying neurons.
+    Elu,
     /// Identity function: output equals input.
     Linear,
 }
@@ -51,6 +53,13 @@ impl Activation {
             Activation::Tanh => x.tanh(),
             Activation::Relu => x.max(0.0),
             Activation::Sigmoid => 1.0 / (1.0 + (-x).exp()),
+            Activation::Elu => {
+                if x > 0.0 {
+                    x
+                } else {
+                    x.exp() - 1.0
+                }
+            }
             Activation::Linear => x,
         }
     }
@@ -75,6 +84,13 @@ impl Activation {
                 }
             }
             Activation::Sigmoid => fx * (1.0 - fx),
+            Activation::Elu => {
+                if fx > 0.0 {
+                    1.0
+                } else {
+                    fx + 1.0
+                }
+            }
             Activation::Linear => 1.0,
         }
     }
@@ -154,6 +170,29 @@ mod tests {
     }
 
     #[test]
+    fn test_elu_apply_positive_is_identity() {
+        assert_eq!(Activation::Elu.apply(3.0), 3.0);
+    }
+
+    #[test]
+    fn test_elu_apply_zero_is_zero() {
+        assert!((Activation::Elu.apply(0.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_elu_apply_negative_is_exp_minus_one() {
+        let expected = (-1.0_f64).exp() - 1.0;
+        let result = Activation::Elu.apply(-1.0);
+        assert!((result - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_elu_apply_large_negative_approaches_minus_one() {
+        let result = Activation::Elu.apply(-100.0);
+        assert!((result - (-1.0)).abs() < 1e-10);
+    }
+
+    #[test]
     fn test_linear_apply_is_identity() {
         assert_eq!(Activation::Linear.apply(42.0), 42.0);
     }
@@ -196,6 +235,24 @@ mod tests {
     }
 
     #[test]
+    fn test_elu_derivative_positive_is_one() {
+        assert_eq!(Activation::Elu.derivative(2.0), 1.0);
+    }
+
+    #[test]
+    fn test_elu_derivative_negative_is_fx_plus_one() {
+        // fx = -0.6, derivative = -0.6 + 1.0 = 0.4
+        let result = Activation::Elu.derivative(-0.6);
+        assert!((result - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_elu_derivative_at_minus_one_is_zero() {
+        // ELU floor is -1.0, derivative there = -1.0 + 1.0 = 0.0
+        assert!((Activation::Elu.derivative(-1.0)).abs() < 1e-12);
+    }
+
+    #[test]
     fn test_linear_derivative_always_one() {
         assert_eq!(Activation::Linear.derivative(999.0), 1.0);
         assert_eq!(Activation::Linear.derivative(-42.0), 1.0);
@@ -231,6 +288,7 @@ mod tests {
             Activation::Tanh,
             Activation::Relu,
             Activation::Sigmoid,
+            Activation::Elu,
             Activation::Linear,
         ];
         for act in &variants {
@@ -243,10 +301,11 @@ mod tests {
 
     #[test]
     fn test_all_derivatives_finite_for_typical_post_activation_values() {
-        let cases: [(Activation, f64); 4] = [
+        let cases: [(Activation, f64); 5] = [
             (Activation::Tanh, 0.5),
             (Activation::Relu, 1.0),
             (Activation::Sigmoid, 0.5),
+            (Activation::Elu, -0.5),
             (Activation::Linear, 0.0),
         ];
         for (act, fx) in &cases {
@@ -263,6 +322,7 @@ mod tests {
             Activation::Tanh,
             Activation::Relu,
             Activation::Sigmoid,
+            Activation::Elu,
             Activation::Linear,
         ];
         for act in &variants {
