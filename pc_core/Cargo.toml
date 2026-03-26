@@ -2,9 +2,14 @@
 name = "pc_core"
 version = "0.1.0"
 edition = "2021"
-description = "Predictive Coding Actor-Critic framework"
+authors = ["Julian Bolivar"]
+description = "Predictive Coding Actor-Critic reinforcement learning framework — pure Rust, zero ML dependencies"
 license = "MIT OR Apache-2.0"
-keywords = ["predictive-coding", "reinforcement-learning", "actor-critic"]
+repository = "https://github.com/BolivarTech/PC-TicTacToe"
+homepage = "https://github.com/BolivarTech/PC-TicTacToe"
+readme = "../README.md"
+keywords = ["predictive-coding", "reinforcement-learning", "actor-critic", "neural-network", "machine-learning"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 serde.workspace = true
