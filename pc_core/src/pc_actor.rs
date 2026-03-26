@@ -39,6 +39,7 @@ use crate::matrix::{
 ///     lr_weights: 0.01,
 ///     synchronous: true,
 ///     temperature: 1.0,
+///     local_lambda: 1.0,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +66,26 @@ pub struct PcActorConfig {
     pub synchronous: bool,
     /// Softmax temperature for action selection.
     pub temperature: f64,
+    /// Blend factor for hidden layer weight updates, range `[0.0, 1.0]`.
+    ///
+    /// Controls how hidden layers combine two gradient signals:
+    /// `delta = lambda * backprop_grad + (1 - lambda) * pc_prediction_error`
+    ///
+    /// - `1.0` — Pure backprop: reward signal propagated from output (default).
+    /// - `0.0` — Pure local PC: prediction errors from inference loop
+    ///   used as gradients (Millidge et al. 2022). No vanishing gradient
+    ///   but no reward signal reaches hidden layers.
+    /// - `0.0 < lambda < 1.0` — Hybrid: reward-aware backprop regularized
+    ///   by local PC consistency errors.
+    ///
+    /// The output layer always uses standard backprop regardless of this value.
+    #[serde(default = "default_local_lambda")]
+    pub local_lambda: f64,
+}
+
+/// Default local_lambda: 1.0 (pure backprop).
+fn default_local_lambda() -> f64 {
+    1.0
 }
 
 /// Result of the predictive coding inference loop.
@@ -79,6 +100,9 @@ pub struct InferResult {
     pub latent_concat: Vec<f64>,
     /// Per-layer hidden state activations.
     pub hidden_states: Vec<Vec<f64>>,
+    /// Per-layer prediction errors from the last PC inference step.
+    /// Ordered from top hidden layer to bottom (reverse layer order).
+    pub prediction_errors: Vec<Vec<f64>>,
     /// RMS prediction error across layers.
     pub surprise_score: f64,
     /// Number of inference steps performed.
@@ -117,6 +141,7 @@ pub enum SelectionMode {
 ///     output_activation: Activation::Tanh,
 ///     alpha: 0.1, tol: 0.01, min_steps: 1, max_steps: 20,
 ///     lr_weights: 0.01, synchronous: true, temperature: 1.0,
+///     local_lambda: 1.0,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
 /// let actor = PcActor::new(config, &mut rng).unwrap();
@@ -154,6 +179,12 @@ impl PcActor {
             return Err(PcError::ConfigValidation(format!(
                 "temperature must be positive, got {}",
                 config.temperature
+            )));
+        }
+        if !(0.0..=1.0).contains(&config.local_lambda) {
+            return Err(PcError::ConfigValidation(format!(
+                "local_lambda must be in [0.0, 1.0], got {}",
+                config.local_lambda
             )));
         }
 
@@ -222,6 +253,7 @@ impl PcActor {
         let mut steps_used = 0;
         let mut converged = false;
         let mut surprise_score = 0.0;
+        let mut last_errors: Vec<Vec<f64>> = Vec::new();
 
         for step in 0..self.config.max_steps {
             steps_used = step + 1;
@@ -264,6 +296,7 @@ impl PcActor {
                 // RMS error
                 let refs: Vec<&[f64]> = error_vecs.iter().map(|v| v.as_slice()).collect();
                 surprise_score = rms_error(&refs);
+                last_errors = error_vecs;
             } else {
                 // In-place mode: updates immediately visible
                 let mut error_vecs: Vec<Vec<f64>> = Vec::new();
@@ -294,6 +327,7 @@ impl PcActor {
 
                 let refs: Vec<&[f64]> = error_vecs.iter().map(|v| v.as_slice()).collect();
                 surprise_score = rms_error(&refs);
+                last_errors = error_vecs;
             }
 
             // Convergence check (alpha must be > 0 for meaningful convergence)
@@ -316,6 +350,7 @@ impl PcActor {
             y_conv: y,
             latent_concat,
             hidden_states,
+            prediction_errors: last_errors,
             surprise_score,
             steps_used,
             converged,
@@ -357,7 +392,10 @@ impl PcActor {
         }
     }
 
-    /// Updates network weights via backpropagation.
+    /// Updates network weights using a blend of backprop and local PC error.
+    ///
+    /// The `local_lambda` config controls the blend: 1.0 = pure backprop,
+    /// 0.0 = pure local PC learning (Millidge et al. 2022), intermediate = hybrid.
     ///
     /// # Arguments
     ///
@@ -384,17 +422,44 @@ impl PcActor {
             self.config.input_size
         );
 
+        self.update_weights_hybrid(
+            output_delta,
+            infer_result,
+            input,
+            surprise_scale,
+            self.config.local_lambda,
+        );
+    }
+
+    /// Hybrid weight update blending backprop and local PC error signals.
+    ///
+    /// For hidden layers, the effective delta is:
+    /// `delta = lambda * backprop_delta + (1 - lambda) * pc_error`
+    ///
+    /// * `lambda = 1.0` → pure backprop (standard mode).
+    /// * `lambda = 0.0` → pure local PC learning (Millidge et al. 2022).
+    /// * `0 < lambda < 1` → hybrid blend.
+    ///
+    /// The output layer always uses standard backprop from `output_delta`.
+    fn update_weights_hybrid(
+        &mut self,
+        output_delta: &[f64],
+        infer_result: &InferResult,
+        input: &[f64],
+        surprise_scale: f64,
+        lambda: f64,
+    ) {
         let n_hidden = self.config.hidden_layers.len();
         let n_layers = self.layers.len();
 
-        // Output layer backward
+        // Output layer: always standard backward
         let output_input = if n_hidden > 0 {
             &infer_result.hidden_states[n_hidden - 1]
         } else {
             input
         };
         let output_output = &infer_result.y_conv;
-        let mut delta = self.layers[n_layers - 1].backward(
+        let mut bp_delta = self.layers[n_layers - 1].backward(
             output_input,
             output_output,
             output_delta,
@@ -402,7 +467,7 @@ impl PcActor {
             surprise_scale,
         );
 
-        // Hidden layers backward (from top to bottom)
+        // Hidden layers (from top to bottom)
         for i in (0..n_hidden).rev() {
             let layer_input = if i > 0 {
                 &infer_result.hidden_states[i - 1]
@@ -410,10 +475,30 @@ impl PcActor {
                 input
             };
             let layer_output = &infer_result.hidden_states[i];
-            delta = self.layers[i].backward(
+
+            // Blend backprop delta with local PC error
+            let effective_delta = if (lambda - 1.0).abs() < f64::EPSILON {
+                // Pure backprop: use bp_delta directly
+                bp_delta.clone()
+            } else if lambda.abs() < f64::EPSILON {
+                // Pure local: use PC error directly
+                let error_idx = n_hidden - 1 - i;
+                infer_result.prediction_errors[error_idx].clone()
+            } else {
+                // Hybrid: blend both signals
+                let error_idx = n_hidden - 1 - i;
+                let pc_error = &infer_result.prediction_errors[error_idx];
+                bp_delta
+                    .iter()
+                    .zip(pc_error.iter())
+                    .map(|(&bp, &pc)| lambda * bp + (1.0 - lambda) * pc)
+                    .collect()
+            };
+
+            bp_delta = self.layers[i].backward(
                 layer_input,
                 layer_output,
-                &delta,
+                &effective_delta,
                 self.config.lr_weights,
                 surprise_scale,
             );
@@ -450,6 +535,7 @@ mod tests {
             lr_weights: 0.01,
             synchronous: true,
             temperature: 1.0,
+            local_lambda: 1.0,
         }
     }
 
@@ -831,6 +917,285 @@ mod tests {
             temperature: -1.0,
             ..default_config()
         };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_err());
+    }
+
+    // ── Local Learning (PC-based weight updates) Tests ──────────
+
+    fn local_learning_config() -> PcActorConfig {
+        PcActorConfig {
+            local_lambda: 0.0,
+            ..default_config()
+        }
+    }
+
+    #[test]
+    fn test_infer_prediction_errors_count_matches_hidden_layers() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.0; 9]);
+        assert_eq!(result.prediction_errors.len(), 1);
+    }
+
+    #[test]
+    fn test_infer_prediction_errors_two_hidden() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(two_hidden_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.0; 9]);
+        assert_eq!(result.prediction_errors.len(), 2);
+    }
+
+    #[test]
+    fn test_infer_prediction_errors_zero_hidden_is_empty() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            hidden_layers: vec![],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        assert!(result.prediction_errors.is_empty());
+    }
+
+    #[test]
+    fn test_infer_prediction_errors_all_finite() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
+        let result = actor.infer(&[1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5]);
+        for errors in &result.prediction_errors {
+            for &e in errors {
+                assert!(e.is_finite(), "prediction error not finite: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_infer_prediction_errors_size_matches_hidden_layer_size() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.0; 9]);
+        // default_config has one hidden layer of size 18
+        assert_eq!(result.prediction_errors[0].len(), 18);
+    }
+
+    #[test]
+    fn test_local_learning_config_accepted() {
+        let mut rng = make_rng();
+        let config = local_learning_config();
+        assert!((config.local_lambda).abs() < f64::EPSILON);
+        let actor = PcActor::new(config, &mut rng);
+        assert!(actor.is_ok());
+    }
+
+    #[test]
+    fn test_local_learning_update_changes_weights() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(local_learning_config(), &mut rng).unwrap();
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let infer_result = actor.infer(&input);
+        let weights_before = actor.layers[0].weights.data.clone();
+        let delta = vec![0.1; 9];
+        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        assert_ne!(actor.layers[0].weights.data, weights_before);
+    }
+
+    #[test]
+    fn test_local_learning_clips_weights() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(local_learning_config(), &mut rng).unwrap();
+        let input = vec![1.0; 9];
+        let infer_result = actor.infer(&input);
+        let delta = vec![1e6; 9];
+        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        for layer in &actor.layers {
+            for &w in &layer.weights.data {
+                assert!(
+                    w.abs() <= WEIGHT_CLIP + 1e-12,
+                    "Weight {w} exceeds WEIGHT_CLIP"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_local_learning_two_hidden_changes_both() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            local_lambda: 0.0,
+            ..two_hidden_config()
+        };
+        let mut actor = PcActor::new(config, &mut rng).unwrap();
+        let input = vec![0.5; 9];
+        let infer_result = actor.infer(&input);
+        let w0_before = actor.layers[0].weights.data.clone();
+        let w1_before = actor.layers[1].weights.data.clone();
+        let delta = vec![0.1; 9];
+        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        assert_ne!(
+            actor.layers[0].weights.data, w0_before,
+            "Layer 0 should change"
+        );
+        assert_ne!(
+            actor.layers[1].weights.data, w1_before,
+            "Layer 1 should change"
+        );
+    }
+
+    #[test]
+    fn test_local_learning_differs_from_backprop() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let delta = vec![0.1; 9];
+
+        // Backprop actor
+        let mut rng1 = make_rng();
+        let mut bp_actor = PcActor::new(default_config(), &mut rng1).unwrap();
+        let bp_infer = bp_actor.infer(&input);
+        bp_actor.update_weights(&delta, &bp_infer, &input, 1.0);
+
+        // Local learning actor (same initial weights)
+        let mut rng2 = make_rng();
+        let mut ll_actor = PcActor::new(local_learning_config(), &mut rng2).unwrap();
+        let ll_infer = ll_actor.infer(&input);
+        ll_actor.update_weights(&delta, &ll_infer, &input, 1.0);
+
+        // Hidden layer weights should differ between the two approaches
+        assert_ne!(
+            bp_actor.layers[0].weights.data, ll_actor.layers[0].weights.data,
+            "Local learning should produce different weight updates than backprop"
+        );
+    }
+
+    // ── Hybrid Learning (local_lambda) Tests ────────────────────
+
+    fn hybrid_config(lambda: f64) -> PcActorConfig {
+        PcActorConfig {
+            local_lambda: lambda,
+            ..default_config()
+        }
+    }
+
+    #[test]
+    fn test_local_lambda_one_equals_backprop() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let delta = vec![0.1; 9];
+
+        // Pure backprop (local_learning=false, default)
+        let mut rng1 = make_rng();
+        let mut bp_actor = PcActor::new(default_config(), &mut rng1).unwrap();
+        let bp_infer = bp_actor.infer(&input);
+        bp_actor.update_weights(&delta, &bp_infer, &input, 1.0);
+
+        // lambda=1.0 should be identical to backprop
+        let mut rng2 = make_rng();
+        let mut lam_actor = PcActor::new(hybrid_config(1.0), &mut rng2).unwrap();
+        let lam_infer = lam_actor.infer(&input);
+        lam_actor.update_weights(&delta, &lam_infer, &input, 1.0);
+
+        assert_eq!(
+            bp_actor.layers[0].weights.data, lam_actor.layers[0].weights.data,
+            "lambda=1.0 should produce identical weights to pure backprop"
+        );
+    }
+
+    #[test]
+    fn test_local_lambda_zero_equals_local_learning() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let delta = vec![0.1; 9];
+
+        // Pure local (local_learning=true)
+        let mut rng1 = make_rng();
+        let mut ll_actor = PcActor::new(local_learning_config(), &mut rng1).unwrap();
+        let ll_infer = ll_actor.infer(&input);
+        ll_actor.update_weights(&delta, &ll_infer, &input, 1.0);
+
+        // lambda=0.0 should be identical to pure local
+        let mut rng2 = make_rng();
+        let mut lam_actor = PcActor::new(hybrid_config(0.0), &mut rng2).unwrap();
+        let lam_infer = lam_actor.infer(&input);
+        lam_actor.update_weights(&delta, &lam_infer, &input, 1.0);
+
+        assert_eq!(
+            ll_actor.layers[0].weights.data, lam_actor.layers[0].weights.data,
+            "lambda=0.0 should produce identical weights to pure local learning"
+        );
+    }
+
+    #[test]
+    fn test_local_lambda_half_differs_from_both_pure_modes() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let delta = vec![0.1; 9];
+
+        // Pure backprop
+        let mut rng1 = make_rng();
+        let mut bp_actor = PcActor::new(default_config(), &mut rng1).unwrap();
+        let bp_infer = bp_actor.infer(&input);
+        bp_actor.update_weights(&delta, &bp_infer, &input, 1.0);
+
+        // Pure local
+        let mut rng2 = make_rng();
+        let mut ll_actor = PcActor::new(local_learning_config(), &mut rng2).unwrap();
+        let ll_infer = ll_actor.infer(&input);
+        ll_actor.update_weights(&delta, &ll_infer, &input, 1.0);
+
+        // Hybrid lambda=0.5
+        let mut rng3 = make_rng();
+        let mut hy_actor = PcActor::new(hybrid_config(0.5), &mut rng3).unwrap();
+        let hy_infer = hy_actor.infer(&input);
+        hy_actor.update_weights(&delta, &hy_infer, &input, 1.0);
+
+        assert_ne!(
+            hy_actor.layers[0].weights.data, bp_actor.layers[0].weights.data,
+            "lambda=0.5 should differ from pure backprop"
+        );
+        assert_ne!(
+            hy_actor.layers[0].weights.data, ll_actor.layers[0].weights.data,
+            "lambda=0.5 should differ from pure local"
+        );
+    }
+
+    #[test]
+    fn test_local_lambda_changes_weights() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(hybrid_config(0.5), &mut rng).unwrap();
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let infer_result = actor.infer(&input);
+        let weights_before = actor.layers[0].weights.data.clone();
+        let delta = vec![0.1; 9];
+        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        assert_ne!(actor.layers[0].weights.data, weights_before);
+    }
+
+    #[test]
+    fn test_local_lambda_clips_weights() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(hybrid_config(0.5), &mut rng).unwrap();
+        let input = vec![1.0; 9];
+        let infer_result = actor.infer(&input);
+        let delta = vec![1e6; 9];
+        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        for layer in &actor.layers {
+            for &w in &layer.weights.data {
+                assert!(
+                    w.abs() <= WEIGHT_CLIP + 1e-12,
+                    "Weight {w} exceeds WEIGHT_CLIP"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_local_lambda_negative_returns_error() {
+        let mut rng = make_rng();
+        let config = hybrid_config(-0.1);
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_local_lambda_above_one_returns_error() {
+        let mut rng = make_rng();
+        let config = hybrid_config(1.1);
         let result = PcActor::new(config, &mut rng);
         assert!(result.is_err());
     }

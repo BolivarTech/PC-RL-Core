@@ -152,6 +152,7 @@ impl Trainer {
                     latent_concat: infer.latent_concat,
                     y_conv: infer.y_conv,
                     hidden_states: infer.hidden_states,
+                    prediction_errors: infer.prediction_errors,
                     action,
                     valid_actions: valid,
                     reward: 0.0,

@@ -70,6 +70,9 @@ pub struct TrainArgs {
     /// Target win rate for curriculum advancement.
     #[arg(long)]
     pub target_winrate: Option<f64>,
+    /// Blend factor: 1.0 = pure backprop, 0.0 = pure local PC, intermediate = hybrid.
+    #[arg(long)]
+    pub local_lambda: Option<f64>,
 }
 
 /// Arguments for the play subcommand.
@@ -125,6 +128,10 @@ pub fn run_train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(wr) = args.target_winrate {
         config.curriculum.advance_threshold = wr;
+    }
+
+    if let Some(lambda) = args.local_lambda {
+        config.agent.actor.local_lambda = lambda;
     }
 
     config.validate()?;
