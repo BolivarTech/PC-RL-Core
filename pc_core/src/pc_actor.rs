@@ -39,6 +39,7 @@ use crate::matrix::{
 ///     lr_weights: 0.01,
 ///     synchronous: true,
 ///     temperature: 1.0,
+///     local_learning: false,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +66,10 @@ pub struct PcActorConfig {
     pub synchronous: bool,
     /// Softmax temperature for action selection.
     pub temperature: f64,
+    /// If true, use local PC prediction errors for weight updates instead
+    /// of standard backpropagation (Millidge et al. 2022).
+    #[serde(default)]
+    pub local_learning: bool,
 }
 
 /// Result of the predictive coding inference loop.
@@ -79,6 +84,9 @@ pub struct InferResult {
     pub latent_concat: Vec<f64>,
     /// Per-layer hidden state activations.
     pub hidden_states: Vec<Vec<f64>>,
+    /// Per-layer prediction errors from the last PC inference step.
+    /// Ordered from top hidden layer to bottom (reverse layer order).
+    pub prediction_errors: Vec<Vec<f64>>,
     /// RMS prediction error across layers.
     pub surprise_score: f64,
     /// Number of inference steps performed.
@@ -117,6 +125,7 @@ pub enum SelectionMode {
 ///     output_activation: Activation::Tanh,
 ///     alpha: 0.1, tol: 0.01, min_steps: 1, max_steps: 20,
 ///     lr_weights: 0.01, synchronous: true, temperature: 1.0,
+///     local_learning: false,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
 /// let actor = PcActor::new(config, &mut rng).unwrap();
@@ -222,6 +231,7 @@ impl PcActor {
         let mut steps_used = 0;
         let mut converged = false;
         let mut surprise_score = 0.0;
+        let mut last_errors: Vec<Vec<f64>> = Vec::new();
 
         for step in 0..self.config.max_steps {
             steps_used = step + 1;
@@ -264,6 +274,7 @@ impl PcActor {
                 // RMS error
                 let refs: Vec<&[f64]> = error_vecs.iter().map(|v| v.as_slice()).collect();
                 surprise_score = rms_error(&refs);
+                last_errors = error_vecs;
             } else {
                 // In-place mode: updates immediately visible
                 let mut error_vecs: Vec<Vec<f64>> = Vec::new();
@@ -294,6 +305,7 @@ impl PcActor {
 
                 let refs: Vec<&[f64]> = error_vecs.iter().map(|v| v.as_slice()).collect();
                 surprise_score = rms_error(&refs);
+                last_errors = error_vecs;
             }
 
             // Convergence check (alpha must be > 0 for meaningful convergence)
@@ -316,6 +328,7 @@ impl PcActor {
             y_conv: y,
             latent_concat,
             hidden_states,
+            prediction_errors: last_errors,
             surprise_score,
             steps_used,
             converged,
@@ -357,7 +370,11 @@ impl PcActor {
         }
     }
 
-    /// Updates network weights via backpropagation.
+    /// Updates network weights via backpropagation or local PC learning.
+    ///
+    /// When `local_learning` is false (default), uses standard backpropagation.
+    /// When true, uses local prediction errors from the PC inference loop
+    /// as gradient signals for hidden layers (Millidge et al. 2022).
     ///
     /// # Arguments
     ///
@@ -384,6 +401,21 @@ impl PcActor {
             self.config.input_size
         );
 
+        if self.config.local_learning {
+            self.update_weights_local(output_delta, infer_result, input, surprise_scale);
+        } else {
+            self.update_weights_backprop(output_delta, infer_result, input, surprise_scale);
+        }
+    }
+
+    /// Standard backpropagation weight update.
+    fn update_weights_backprop(
+        &mut self,
+        output_delta: &[f64],
+        infer_result: &InferResult,
+        input: &[f64],
+        surprise_scale: f64,
+    ) {
         let n_hidden = self.config.hidden_layers.len();
         let n_layers = self.layers.len();
 
@@ -414,6 +446,59 @@ impl PcActor {
                 layer_input,
                 layer_output,
                 &delta,
+                self.config.lr_weights,
+                surprise_scale,
+            );
+        }
+    }
+
+    /// Local PC learning weight update (Millidge et al. 2022).
+    ///
+    /// Uses prediction errors from the PC inference loop as local gradient
+    /// signals. The output layer still uses backprop from `output_delta`.
+    /// Hidden layers use their PC prediction error: `ΔW[i] = -lr * error[i] * h[i-1]^T`.
+    fn update_weights_local(
+        &mut self,
+        output_delta: &[f64],
+        infer_result: &InferResult,
+        input: &[f64],
+        surprise_scale: f64,
+    ) {
+        let n_hidden = self.config.hidden_layers.len();
+        let n_layers = self.layers.len();
+
+        // Output layer: standard backward (no PC error for output)
+        let output_input = if n_hidden > 0 {
+            &infer_result.hidden_states[n_hidden - 1]
+        } else {
+            input
+        };
+        let output_output = &infer_result.y_conv;
+        let _ = self.layers[n_layers - 1].backward(
+            output_input,
+            output_output,
+            output_delta,
+            self.config.lr_weights,
+            surprise_scale,
+        );
+
+        // Hidden layers: use local prediction errors as gradient signals.
+        // prediction_errors are stored in reverse layer order (top→bottom),
+        // so index 0 corresponds to the topmost hidden layer.
+        for i in (0..n_hidden).rev() {
+            let layer_input = if i > 0 {
+                &infer_result.hidden_states[i - 1]
+            } else {
+                input
+            };
+            let layer_output = &infer_result.hidden_states[i];
+            // Map reverse-order index: layer n_hidden-1 → error index 0
+            let error_idx = n_hidden - 1 - i;
+            let local_error = &infer_result.prediction_errors[error_idx];
+            self.layers[i].backward(
+                layer_input,
+                layer_output,
+                local_error,
                 self.config.lr_weights,
                 surprise_scale,
             );
@@ -450,6 +535,7 @@ mod tests {
             lr_weights: 0.01,
             synchronous: true,
             temperature: 1.0,
+            local_learning: false,
         }
     }
 
@@ -946,8 +1032,14 @@ mod tests {
         let w1_before = actor.layers[1].weights.data.clone();
         let delta = vec![0.1; 9];
         actor.update_weights(&delta, &infer_result, &input, 1.0);
-        assert_ne!(actor.layers[0].weights.data, w0_before, "Layer 0 should change");
-        assert_ne!(actor.layers[1].weights.data, w1_before, "Layer 1 should change");
+        assert_ne!(
+            actor.layers[0].weights.data, w0_before,
+            "Layer 0 should change"
+        );
+        assert_ne!(
+            actor.layers[1].weights.data, w1_before,
+            "Layer 1 should change"
+        );
     }
 
     #[test]
@@ -969,8 +1061,7 @@ mod tests {
 
         // Hidden layer weights should differ between the two approaches
         assert_ne!(
-            bp_actor.layers[0].weights.data,
-            ll_actor.layers[0].weights.data,
+            bp_actor.layers[0].weights.data, ll_actor.layers[0].weights.data,
             "Local learning should produce different weight updates than backprop"
         );
     }

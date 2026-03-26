@@ -38,6 +38,7 @@ use crate::pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
 ///         output_activation: Activation::Tanh,
 ///         alpha: 0.1, tol: 0.01, min_steps: 1, max_steps: 20,
 ///         lr_weights: 0.01, synchronous: true, temperature: 1.0,
+///         local_learning: false,
 ///     },
 ///     critic: MlpCriticConfig {
 ///         input_size: 27,
@@ -81,6 +82,8 @@ pub struct TrajectoryStep {
     pub y_conv: Vec<f64>,
     /// Per-layer hidden state activations from inference (for backprop).
     pub hidden_states: Vec<Vec<f64>>,
+    /// Per-layer prediction errors from the PC inference loop.
+    pub prediction_errors: Vec<Vec<f64>>,
     /// Action taken at this step.
     pub action: usize,
     /// Valid actions at this step (needed for masked softmax).
@@ -282,6 +285,7 @@ impl PcActorCritic {
                 y_conv: step.y_conv.clone(),
                 latent_concat: step.latent_concat.clone(),
                 hidden_states: step.hidden_states.clone(),
+                prediction_errors: step.prediction_errors.clone(),
                 surprise_score: step.surprise_score,
                 steps_used: step.steps_used,
                 converged: false,
@@ -454,6 +458,7 @@ mod tests {
                 lr_weights: 0.01,
                 synchronous: true,
                 temperature: 1.0,
+                local_learning: false,
             },
             critic: MlpCriticConfig {
                 input_size: 27,
@@ -485,6 +490,7 @@ mod tests {
             latent_concat: infer.latent_concat,
             y_conv: infer.y_conv,
             hidden_states: infer.hidden_states,
+            prediction_errors: infer.prediction_errors,
             action,
             valid_actions: valid,
             reward: 1.0,
@@ -544,6 +550,7 @@ mod tests {
             latent_concat: infer.latent_concat,
             y_conv: infer.y_conv,
             hidden_states: infer.hidden_states,
+            prediction_errors: infer.prediction_errors,
             action,
             valid_actions: valid,
             reward: -1.0,
@@ -573,6 +580,7 @@ mod tests {
                 latent_concat: infer.latent_concat,
                 y_conv: infer.y_conv,
                 hidden_states: infer.hidden_states,
+                prediction_errors: infer.prediction_errors,
                 action,
                 valid_actions: valid.clone(),
                 reward: if i == 2 { 1.0 } else { 0.0 },
@@ -806,6 +814,7 @@ mod tests {
                 latent_concat: infer.latent_concat,
                 y_conv: infer.y_conv,
                 hidden_states: infer.hidden_states,
+                prediction_errors: infer.prediction_errors,
                 action,
                 valid_actions: valid.clone(),
                 reward: 1.0,
@@ -870,6 +879,7 @@ mod tests {
                 lr_weights: 0.01,
                 synchronous: true,
                 temperature: 1.0,
+                local_learning: false,
             },
             critic: MlpCriticConfig {
                 input_size: 27,
@@ -900,6 +910,7 @@ mod tests {
                 latent_concat: infer.latent_concat,
                 y_conv: infer.y_conv,
                 hidden_states: infer.hidden_states,
+                prediction_errors: infer.prediction_errors,
                 action: target_action,
                 valid_actions: valid.clone(),
                 reward: 1.0,
@@ -915,7 +926,8 @@ mod tests {
 
         // Check that action 4's logit is the highest
         let logit_4 = infer.y_conv[4];
-        let max_other = valid.iter()
+        let max_other = valid
+            .iter()
             .filter(|&&a| a != 4)
             .map(|&a| infer.y_conv[a])
             .fold(f64::NEG_INFINITY, f64::max);
@@ -923,7 +935,11 @@ mod tests {
         eprintln!(
             "DIAGNOSTIC: action={action}, logit[4]={logit_4:.4}, max_other={max_other:.4}, \
              y_conv={:?}",
-            infer.y_conv.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>()
+            infer
+                .y_conv
+                .iter()
+                .map(|v| format!("{v:.3}"))
+                .collect::<Vec<_>>()
         );
 
         assert_eq!(

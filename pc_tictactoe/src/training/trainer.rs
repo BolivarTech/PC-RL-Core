@@ -152,6 +152,7 @@ impl Trainer {
                     latent_concat: infer.latent_concat,
                     y_conv: infer.y_conv,
                     hidden_states: infer.hidden_states,
+                    prediction_errors: infer.prediction_errors,
                     action,
                     valid_actions: valid,
                     reward: 0.0,
@@ -304,7 +305,6 @@ mod tests {
             wr * 100.0
         );
     }
-
 
     #[test]
     fn test_agent_sees_both_sides_over_episodes() {

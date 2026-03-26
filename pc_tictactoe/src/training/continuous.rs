@@ -144,6 +144,7 @@ impl ContinuousTrainer {
                     latent_concat: infer.latent_concat.clone(),
                     y_conv: infer.y_conv.clone(),
                     hidden_states: infer.hidden_states.clone(),
+                    prediction_errors: infer.prediction_errors.clone(),
                     action,
                     valid_actions: valid.clone(),
                     reward: 0.0,

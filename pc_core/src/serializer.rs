@@ -258,6 +258,7 @@ mod tests {
                 lr_weights: 0.01,
                 synchronous: true,
                 temperature: 1.0,
+                local_learning: false,
             },
             critic: MlpCriticConfig {
                 input_size: 27,
