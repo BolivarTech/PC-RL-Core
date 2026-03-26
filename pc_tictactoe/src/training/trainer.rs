@@ -305,7 +305,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_agent_sees_both_sides_over_episodes() {
         let mut trainer = make_trainer(4);

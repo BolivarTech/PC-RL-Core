@@ -915,7 +915,8 @@ mod tests {
 
         // Check that action 4's logit is the highest
         let logit_4 = infer.y_conv[4];
-        let max_other = valid.iter()
+        let max_other = valid
+            .iter()
             .filter(|&&a| a != 4)
             .map(|&a| infer.y_conv[a])
             .fold(f64::NEG_INFINITY, f64::max);
@@ -923,7 +924,11 @@ mod tests {
         eprintln!(
             "DIAGNOSTIC: action={action}, logit[4]={logit_4:.4}, max_other={max_other:.4}, \
              y_conv={:?}",
-            infer.y_conv.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>()
+            infer
+                .y_conv
+                .iter()
+                .map(|v| format!("{v:.3}"))
+                .collect::<Vec<_>>()
         );
 
         assert_eq!(
