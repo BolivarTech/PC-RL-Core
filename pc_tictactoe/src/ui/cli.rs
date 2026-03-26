@@ -50,6 +50,8 @@ pub enum Command {
     Evaluate(EvaluateArgs),
     /// Benchmark training throughput.
     Benchmark(BenchmarkArgs),
+    /// Run lambda sweep experiment with random seeds.
+    Experiment(ExperimentArgs),
 }
 
 /// Arguments for the train subcommand.
@@ -98,6 +100,17 @@ pub struct EvaluateArgs {
     /// Minimax search depth for the opponent.
     #[arg(long, short, default_value = "9")]
     pub depth: usize,
+}
+
+/// Arguments for the experiment subcommand.
+#[derive(Parser)]
+pub struct ExperimentArgs {
+    /// Number of repetitions (random seeds).
+    #[arg(long, short)]
+    pub n: usize,
+    /// Path to TOML configuration file.
+    #[arg(long, short, default_value = "config.toml")]
+    pub config: String,
 }
 
 /// Arguments for the benchmark subcommand.
@@ -377,6 +390,84 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
         ep = args.episodes
     );
 
+    Ok(())
+}
+
+/// Writer that duplicates output to two writers (file + stdout).
+struct MultiWriter<A: io::Write, B: io::Write> {
+    a: A,
+    b: B,
+}
+
+impl<A: io::Write, B: io::Write> io::Write for MultiWriter<A, B> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.a.write_all(buf)?;
+        self.b.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.a.flush()?;
+        self.b.flush()
+    }
+}
+
+/// Runs the experiment subcommand.
+///
+/// Loads config, runs N repetitions with lambda sweep [0.95..1.00],
+/// writes results to experiment.txt and stdout.
+///
+/// # Arguments
+///
+/// * `args` - Experiment arguments from CLI.
+///
+/// # Errors
+///
+/// Returns an error on config/IO/training failures.
+pub fn run_experiment(args: ExperimentArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::training::experiment;
+
+    let config = AppConfig::load(Path::new(&args.config))?;
+    config.validate()?;
+
+    let file = std::fs::File::create("experiment.txt")?;
+    let stdout = io::stdout();
+    let mut writer = MultiWriter {
+        a: io::BufWriter::new(file),
+        b: stdout.lock(),
+    };
+
+    let results = experiment::run_experiment(&config, args.n, &mut writer)?;
+
+    // Summary table
+    let summary = format!(
+        "\n=== SUMMARY ({} runs) ===\n{:<8} {:<8} {:<10} {:<10} {:<10} {:<10}\n{}\n",
+        results.len(),
+        "seed",
+        "lambda",
+        "max_depth",
+        "win%",
+        "loss%",
+        "draw%",
+        results
+            .iter()
+            .map(|r| format!(
+                "{:<8} {:<8.2} {:<10} {:<10.1} {:<10.1} {:<10.1}",
+                r.seed,
+                r.lambda,
+                r.max_depth,
+                r.win_rate * 100.0,
+                r.loss_rate * 100.0,
+                r.draw_rate * 100.0,
+            ))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
+    write!(writer, "{summary}")?;
+    writer.flush()?;
+
+    println!("\nResults saved to experiment.txt");
     Ok(())
 }
 

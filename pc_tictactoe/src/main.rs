@@ -18,6 +18,7 @@ fn main() {
         ui::cli::Command::Play(args) => ui::cli::run_play(args),
         ui::cli::Command::Evaluate(args) => ui::cli::run_evaluate(args),
         ui::cli::Command::Benchmark(args) => ui::cli::run_benchmark(args),
+        ui::cli::Command::Experiment(args) => ui::cli::run_experiment(args),
     };
     if let Err(e) = result {
         eprintln!("Error: {e}");

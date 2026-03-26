@@ -209,6 +209,38 @@ impl Trainer {
     pub fn metrics(&self) -> &Metrics {
         &self.metrics
     }
+
+    /// Returns a mutable reference to the agent.
+    pub fn agent_mut(&mut self) -> &mut PcActorCritic {
+        &mut self.agent
+    }
+
+    /// Runs a single episode and returns the trajectory.
+    ///
+    /// Public wrapper around `run_episode` for use by the experiment runner.
+    pub fn run_episode_pub(&mut self) -> Vec<TrajectoryStep> {
+        self.run_episode()
+    }
+
+    /// Records the latest episode outcome and advances curriculum if threshold met.
+    ///
+    /// Must be called after `run_episode_pub` and `agent.learn`.
+    pub fn record_and_advance(&mut self) {
+        let outcome = self.episode_outcome();
+        self.metrics.record(outcome);
+
+        let non_loss_rate = self.metrics.win_rate() + self.metrics.draw_rate();
+        if self.metrics.count() >= self.metrics.window_size()
+            && non_loss_rate > self.advance_threshold
+            && self.current_depth < 9
+        {
+            self.current_depth += 1;
+            self.minimax = MinimaxPlayer::new(self.current_depth);
+            self.metrics.reset();
+        }
+
+        self.episode_count += 1;
+    }
 }
 
 #[cfg(test)]
