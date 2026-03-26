@@ -3,7 +3,7 @@ name = "pc_core"
 version = "0.1.0"
 edition = "2021"
 description = "Predictive Coding Actor-Critic framework"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 keywords = ["predictive-coding", "reinforcement-learning", "actor-critic"]
 
 [dependencies]
