@@ -8,4 +8,5 @@
 //! - [`continuous`] — Continuous training with surprise-based immediate updates.
 
 pub mod continuous;
+pub mod experiment;
 pub mod trainer;
