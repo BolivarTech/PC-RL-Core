@@ -1,5 +1,9 @@
 # PC-TicTacToe
 
+[![CI](https://github.com/BolivarTech/PC-TicTacToe/actions/workflows/ci.yml/badge.svg)](https://github.com/BolivarTech/PC-TicTacToe/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+
 A Predictive Coding Actor-Critic reinforcement learning agent that learns to play Tic-Tac-Toe from scratch, implemented entirely in Rust with zero ML framework dependencies.
 
 The actor uses iterative top-down/bottom-up **predictive coding inference loops** instead of standard feedforward passes, combined with a standard MLP critic for value estimation. The agent trains via REINFORCE with baseline against a minimax opponent with curriculum learning.
