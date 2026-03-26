@@ -16,14 +16,19 @@ max_steps = 5
 lr_weights = 0.005
 synchronous = true
 temperature = 1.0
+local_lambda = 0.5
 
 [[agent.actor.hidden_layers]]
 size = 27
 activation = "tanh"
 
+[[agent.actor.hidden_layers]]
+size = 18
+activation = "tanh"
+
 [agent.critic]
-# 9 + 27 = 36
-input_size = 36
+# 9 + 27 + 18 = 54
+input_size = 54
 output_activation = "linear"
 lr = 0.005
 

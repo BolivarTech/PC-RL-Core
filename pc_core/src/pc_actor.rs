@@ -39,7 +39,6 @@ use crate::matrix::{
 ///     lr_weights: 0.01,
 ///     synchronous: true,
 ///     temperature: 1.0,
-///     local_learning: false,
 ///     local_lambda: 1.0,
 /// };
 /// ```
@@ -67,13 +66,8 @@ pub struct PcActorConfig {
     pub synchronous: bool,
     /// Softmax temperature for action selection.
     pub temperature: f64,
-    /// If true, use local PC prediction errors for weight updates instead
-    /// of standard backpropagation (Millidge et al. 2022).
-    #[serde(default)]
-    pub local_learning: bool,
     /// Blend factor between backprop and local PC error for hidden layers.
     /// 1.0 = pure backprop, 0.0 = pure local PC, intermediate = hybrid.
-    /// When set to a value in [0, 1], overrides `local_learning`.
     #[serde(default = "default_local_lambda")]
     pub local_lambda: f64,
 }
@@ -136,7 +130,6 @@ pub enum SelectionMode {
 ///     output_activation: Activation::Tanh,
 ///     alpha: 0.1, tol: 0.01, min_steps: 1, max_steps: 20,
 ///     lr_weights: 0.01, synchronous: true, temperature: 1.0,
-///     local_learning: false,
 ///     local_lambda: 1.0,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
@@ -388,11 +381,10 @@ impl PcActor {
         }
     }
 
-    /// Updates network weights via backpropagation or local PC learning.
+    /// Updates network weights using a blend of backprop and local PC error.
     ///
-    /// When `local_learning` is false (default), uses standard backpropagation.
-    /// When true, uses local prediction errors from the PC inference loop
-    /// as gradient signals for hidden layers (Millidge et al. 2022).
+    /// The `local_lambda` config controls the blend: 1.0 = pure backprop,
+    /// 0.0 = pure local PC learning (Millidge et al. 2022), intermediate = hybrid.
     ///
     /// # Arguments
     ///
@@ -419,15 +411,13 @@ impl PcActor {
             self.config.input_size
         );
 
-        // Resolve effective lambda: local_learning=true forces lambda=0.0,
-        // otherwise use local_lambda (default 1.0 = pure backprop).
-        let lambda = if self.config.local_learning {
-            0.0
-        } else {
-            self.config.local_lambda
-        };
-
-        self.update_weights_hybrid(output_delta, infer_result, input, surprise_scale, lambda);
+        self.update_weights_hybrid(
+            output_delta,
+            infer_result,
+            input,
+            surprise_scale,
+            self.config.local_lambda,
+        );
     }
 
     /// Hybrid weight update blending backprop and local PC error signals.
