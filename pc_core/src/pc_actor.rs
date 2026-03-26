@@ -534,7 +534,6 @@ mod tests {
             lr_weights: 0.01,
             synchronous: true,
             temperature: 1.0,
-            local_learning: false,
             local_lambda: 1.0,
         }
     }
@@ -925,7 +924,7 @@ mod tests {
 
     fn local_learning_config() -> PcActorConfig {
         PcActorConfig {
-            local_learning: true,
+            local_lambda: 0.0,
             ..default_config()
         }
     }
@@ -983,7 +982,7 @@ mod tests {
     fn test_local_learning_config_accepted() {
         let mut rng = make_rng();
         let config = local_learning_config();
-        assert!(config.local_learning);
+        assert!((config.local_lambda).abs() < f64::EPSILON);
         let actor = PcActor::new(config, &mut rng);
         assert!(actor.is_ok());
     }
@@ -1022,7 +1021,7 @@ mod tests {
     fn test_local_learning_two_hidden_changes_both() {
         let mut rng = make_rng();
         let config = PcActorConfig {
-            local_learning: true,
+            local_lambda: 0.0,
             ..two_hidden_config()
         };
         let mut actor = PcActor::new(config, &mut rng).unwrap();
