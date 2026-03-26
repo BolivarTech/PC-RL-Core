@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/BolivarTech/PC-TicTacToe"
 homepage = "https://github.com/BolivarTech/PC-TicTacToe"
 readme = "../README.md"
-keywords = ["predictive-coding", "reinforcement-learning", "actor-critic", "neural-network", "machine-learning"]
+keywords = ["predictive-coding", "reinforcement", "actor-critic", "neural-network", "machine-learning"]
 categories = ["science", "algorithms"]
 
 [dependencies]
