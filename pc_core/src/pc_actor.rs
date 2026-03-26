@@ -834,4 +834,144 @@ mod tests {
         let result = PcActor::new(config, &mut rng);
         assert!(result.is_err());
     }
+
+    // ── Local Learning (PC-based weight updates) Tests ──────────
+
+    fn local_learning_config() -> PcActorConfig {
+        PcActorConfig {
+            local_learning: true,
+            ..default_config()
+        }
+    }
+
+    #[test]
+    fn test_infer_prediction_errors_count_matches_hidden_layers() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.0; 9]);
+        assert_eq!(result.prediction_errors.len(), 1);
+    }
+
+    #[test]
+    fn test_infer_prediction_errors_two_hidden() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(two_hidden_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.0; 9]);
+        assert_eq!(result.prediction_errors.len(), 2);
+    }
+
+    #[test]
+    fn test_infer_prediction_errors_zero_hidden_is_empty() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            hidden_layers: vec![],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        assert!(result.prediction_errors.is_empty());
+    }
+
+    #[test]
+    fn test_infer_prediction_errors_all_finite() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
+        let result = actor.infer(&[1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5]);
+        for errors in &result.prediction_errors {
+            for &e in errors {
+                assert!(e.is_finite(), "prediction error not finite: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_infer_prediction_errors_size_matches_hidden_layer_size() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.0; 9]);
+        // default_config has one hidden layer of size 18
+        assert_eq!(result.prediction_errors[0].len(), 18);
+    }
+
+    #[test]
+    fn test_local_learning_config_accepted() {
+        let mut rng = make_rng();
+        let config = local_learning_config();
+        assert!(config.local_learning);
+        let actor = PcActor::new(config, &mut rng);
+        assert!(actor.is_ok());
+    }
+
+    #[test]
+    fn test_local_learning_update_changes_weights() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(local_learning_config(), &mut rng).unwrap();
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let infer_result = actor.infer(&input);
+        let weights_before = actor.layers[0].weights.data.clone();
+        let delta = vec![0.1; 9];
+        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        assert_ne!(actor.layers[0].weights.data, weights_before);
+    }
+
+    #[test]
+    fn test_local_learning_clips_weights() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(local_learning_config(), &mut rng).unwrap();
+        let input = vec![1.0; 9];
+        let infer_result = actor.infer(&input);
+        let delta = vec![1e6; 9];
+        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        for layer in &actor.layers {
+            for &w in &layer.weights.data {
+                assert!(
+                    w.abs() <= WEIGHT_CLIP + 1e-12,
+                    "Weight {w} exceeds WEIGHT_CLIP"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_local_learning_two_hidden_changes_both() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            local_learning: true,
+            ..two_hidden_config()
+        };
+        let mut actor = PcActor::new(config, &mut rng).unwrap();
+        let input = vec![0.5; 9];
+        let infer_result = actor.infer(&input);
+        let w0_before = actor.layers[0].weights.data.clone();
+        let w1_before = actor.layers[1].weights.data.clone();
+        let delta = vec![0.1; 9];
+        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        assert_ne!(actor.layers[0].weights.data, w0_before, "Layer 0 should change");
+        assert_ne!(actor.layers[1].weights.data, w1_before, "Layer 1 should change");
+    }
+
+    #[test]
+    fn test_local_learning_differs_from_backprop() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let delta = vec![0.1; 9];
+
+        // Backprop actor
+        let mut rng1 = make_rng();
+        let mut bp_actor = PcActor::new(default_config(), &mut rng1).unwrap();
+        let bp_infer = bp_actor.infer(&input);
+        bp_actor.update_weights(&delta, &bp_infer, &input, 1.0);
+
+        // Local learning actor (same initial weights)
+        let mut rng2 = make_rng();
+        let mut ll_actor = PcActor::new(local_learning_config(), &mut rng2).unwrap();
+        let ll_infer = ll_actor.infer(&input);
+        ll_actor.update_weights(&delta, &ll_infer, &input, 1.0);
+
+        // Hidden layer weights should differ between the two approaches
+        assert_ne!(
+            bp_actor.layers[0].weights.data,
+            ll_actor.layers[0].weights.data,
+            "Local learning should produce different weight updates than backprop"
+        );
+    }
 }
