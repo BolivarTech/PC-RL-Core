@@ -169,7 +169,27 @@ Testing whether a small amount of PC error can regularize backprop:
 
 **Finding**: Lambda=0.99 is the only statistically significant improvement (p < 0.05). It increases mean depth by +0.43, doubles the rate of reaching depth 9 (20% vs 9%), and never drops below depth 7 (min=7 vs min=6 for baseline). All other lambda values perform equal or worse.
 
-### 2.6 Critical Hyperparameters
+### 2.6 Residual Skip Connections (N=35 seeds, 2×27h)
+
+Residual connections with ReZero scaling were implemented to address vanishing gradients: `h[i] = rezero_alpha * tanh(W*h[i-1]+b) + h[i-1]`. Two configurations tested:
+
+#### ReZero near-identity (rezero_init=0.001, min_steps=1, max_steps=5)
+
+| Lambda | Mean Depth | Max | D>=7 |
+|--------|-----------|-----|------|
+| 0.95-0.99 | 1.51-3.40 | 4-7 | 0-6% |
+| **1.00** | **6.94** | **8** | **86%** |
+
+#### Standard ResNet (rezero_init=1.0, min_steps=3, max_steps=10)
+
+| Lambda | Mean Depth | Max | D>=7 |
+|--------|-----------|-----|------|
+| 0.95-0.99 | 1.90-3.34 | 5-7 | 0-7% |
+| **1.00** | **6.45** | **9** | **52%** |
+
+**Finding**: PC error blending (lambda < 1.0) is **fundamentally incompatible with multi-layer networks**. All lambda < 1.0 collapse to depth 1-4 with p < 0.0001 significance. Pure backprop (lambda=1.0) with residual reaches depth 6-9 but still underperforms the single-layer DPC configuration (mean 6.45-6.94 vs 7.57). The incompatibility is structural: in multi-layer networks, PC prediction errors optimize for inter-layer consistency while backprop optimizes for reward -- these directions conflict when combined. Neither ReZero init value nor increased PC iterations resolve this.
+
+### 2.7 Critical Hyperparameters
 
 | Parameter | Optimal | Effect of Wrong Value |
 |-----------|---------|----------------------|

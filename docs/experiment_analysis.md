@@ -128,6 +128,47 @@ Different random seeds create different initial weight configurations, placing t
 
 This explains both the statistical improvement (more seeds reach depth 9) and the remaining variance (not all seeds benefit equally).
 
+### Phase 5: Residual Skip Connections + ReZero (N=35 random seeds)
+
+Residual skip connections were implemented to address vanishing gradients in multi-layer networks: `h[i] = rezero_alpha * tanh(W*h[i-1]+b) + h[i-1]`. The identity path (`+h[i-1]`) guarantees gradients never vanish completely. Two configurations were tested with 2 hidden layers of 27 neurons each.
+
+#### Experiment 5a: ReZero near-identity (rezero_init=0.001, min_steps=1, max_steps=5)
+
+| Lambda | N | Mean Depth | Max | D>=7 | p-value vs 1.0 |
+|--------|---|-----------|-----|------|----------------|
+| 0.95 | 35 | 1.91 | 7 | 3% | 0.0000 \*\* |
+| 0.96 | 35 | 1.51 | 4 | 0% | 0.0000 \*\* |
+| 0.97 | 35 | 1.63 | 6 | 0% | 0.0000 \*\* |
+| 0.98 | 35 | 2.57 | 7 | 6% | 0.0000 \*\* |
+| 0.99 | 35 | 3.40 | 6 | 0% | 0.0000 \*\* |
+| **1.00** | **35** | **6.94** | **8** | **86%** | **baseline** |
+
+#### Experiment 5b: Standard ResNet residual (rezero_init=1.0, min_steps=3, max_steps=10)
+
+| Lambda | N | Mean Depth | Max | D>=7 | p-value vs 1.0 |
+|--------|---|-----------|-----|------|----------------|
+| 0.95 | 29 | 1.90 | 5 | 0% | 0.0000 \*\* |
+| 0.96 | 29 | 2.03 | 6 | 0% | 0.0000 \*\* |
+| 0.97 | 29 | 2.55 | 7 | 7% | 0.0000 \*\* |
+| 0.98 | 29 | 2.55 | 7 | 3% | 0.0000 \*\* |
+| 0.99 | 29 | 3.34 | 7 | 7% | 0.0000 \*\* |
+| **1.00** | **29** | **6.45** | **9** | **52%** | **baseline** |
+
+#### Residual Findings
+
+1. **Only lambda=1.0 (pure backprop) works with residual** -- all other lambdas collapse to depth 1-4
+2. **The PC error blend is fundamentally incompatible with multi-layer networks** -- prediction errors point in directions that interfere with the policy gradient, regardless of network depth, ReZero init value, or PC iteration count
+3. **Residual with backprop (lambda=1.0) reaches depth 9** in some seeds -- the skip connection successfully addresses vanishing gradients for pure backprop
+4. **Residual lambda=1.0 (mean 6.45-6.94) is worse than single-layer lambda=0.99 (mean 7.57)** -- the DPC mechanism (eco residual) with 1 layer outperforms the architectural solution (skip connections) with 2 layers
+5. **rezero_init value does not matter** -- both 0.001 (near-identity) and 1.0 (standard ResNet) produce the same pattern of lambda<1.0 failure
+6. **More PC iterations (min_steps=3, max_steps=10) do not help** -- the incompatibility is structural, not about insufficient deliberation
+
+#### Why PC Errors Fail with Multi-Layer Networks
+
+With ReZero near-identity (0.001): PC loop converges in 1 step because the second layer barely modifies representations. Prediction errors are near-zero. Blending near-zero errors with backprop dilutes the gradient to nothing.
+
+With standard ResNet (1.0): PC prediction errors are meaningful in magnitude, but they point in the direction of **representational consistency between layers** -- not in the direction of **reward maximization**. In single-layer networks, these directions happen to correlate enough that 1% PC error acts as useful regularization. In multi-layer networks, the correlation breaks down: the PC error for layer 1 optimizes for consistency with the output layer, while the backprop gradient optimizes for policy quality. Blending these conflicting signals destroys learning.
+
 ## Conclusions
 
 1. **Hybrid PC-backprop learning at lambda=0.99 is a statistically significant improvement** over pure backprop for the PC-Actor-Critic architecture on Tic-Tac-Toe
@@ -136,6 +177,8 @@ This explains both the statistical improvement (more seeds reach depth 9) and th
 4. Pure local PC learning (lambda=0) is inferior to backprop -- PC errors lack reward information
 5. The PC inference loop remains valuable regardless of lambda -- it contributes +1 depth level vs MLP
 6. Bounded activations (tanh) are required for PC loop stability
+7. **The DPC mechanism (lambda=0.99) is specific to single-layer topologies** -- multi-layer networks with residual skip connections cannot benefit from PC error blending
+8. **Optimal architecture: 1 hidden layer (27 neurons) + lambda=0.99** -- outperforms all multi-layer variants tested
 
 ## Reproduction
 

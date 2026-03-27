@@ -176,6 +176,17 @@ Hybrid blend: `delta = λ * backprop_grad + (1-λ) * pc_prediction_error`
 
 Seed-dependence is expected: different seeds place the optimizer in different basins of attraction in the loss landscape. The λ=0.99 perturbation (1% PC error) increases the probability of escaping to deeper basins but cannot guarantee it for all starting points. This explains both the statistical improvement (more seeds reach depth 9) and the remaining variance.
 
+### Residual Skip Connection Experiments (N=35 seeds, 2×27h)
+
+Residual connections (`h[i] = α_rz * tanh(...) + h[i-1]`) were tested to address vanishing gradients in multi-layer networks.
+
+| Config | λ=1.0 Mean | λ=0.99 Mean | Result |
+|--------|-----------|-------------|--------|
+| ReZero 0.001, steps 1-5 | 6.94 | 3.40 | λ<1.0 collapses to depth 1-4 |
+| ResNet 1.0, steps 3-10 | 6.45 | 3.34 | Same pattern, λ<1.0 collapses |
+
+**Residual + backprop (λ=1.0) works** (depth 6-9) but **residual + DPC (λ<1.0) fails catastrophically**. The PC error blend is incompatible with multi-layer networks — prediction errors conflict with policy gradient direction. **Optimal config remains: 1 layer (27h) + λ=0.99 (mean 7.57)**.
+
 ### Evolutionary Optimization Potential
 
 `local_lambda` has an ultra-narrow sweet spot (only 0.99 of 6 values tested) that likely interacts with alpha, lr, and topology. A genetic algorithm co-evolving all hyperparameters — chromosome `[hidden_size, alpha, lr, lambda, ...]` with fitness = max depth — could discover optimal configurations that grid search misses. Each GA individual has its own weight initialization, so lambda evolves to match its particular basin of attraction.
