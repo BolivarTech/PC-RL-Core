@@ -22,7 +22,7 @@ rezero_init = 0.001
 
 [[agent.actor.hidden_layers]]
 size = 27
-activation = "tanh"
+activation = "softsign"
 
 [agent.critic]
 # 9 + 27 = 36
@@ -32,7 +32,7 @@ lr = 0.005
 
 [[agent.critic.hidden_layers]]
 size = 36
-activation = "tanh"
+activation = "softsign"
 
 [training]
 episodes = 50000
