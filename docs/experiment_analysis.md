@@ -202,6 +202,34 @@ Softsign (`x/(1+|x|)`) is bounded in (-1,1) like tanh but with slower saturation
 4. **Pure backprop (lambda=1.0) is slightly worse** with softsign (mean 6.80, 0% D=9) than with tanh (mean 6.91, 3% D=9)
 5. **Practical implication**: softsign makes the architecture more robust to hyperparameter choice, reducing the sensitivity to the exact lambda value
 
+### Phase 7: Two-Layer Softsign without Residual (N=35 random seeds, 2×27h)
+
+Testing whether softsign's gradient preservation enables 2-layer networks to work better than tanh.
+
+| Lambda | N | Mean Depth | D>=7 | D>=8 | D=9 | p-value vs 1.0 |
+|--------|---|-----------|------|------|-----|----------------|
+| 0.95 | 35 | 6.31 | 43% | 0% | 0% | 0.020 \* (worse) |
+| 0.96 | 35 | 6.49 | 57% | 0% | 0% | 0.199 |
+| 0.97 | 35 | 6.86 | 74% | 6% | 6% | 0.283 |
+| 0.98 | 35 | 6.89 | 77% | 6% | 6% | 0.205 |
+| **0.99** | **35** | **7.31** | **94%** | **20%** | **17%** | **0.0007 \*\*** |
+| 1.00 | 35 | 6.69 | 63% | 3% | 3% | baseline |
+
+#### 2-Layer Activation Comparison (lambda=0.99, no residual)
+
+| Activation | Mean Depth | D>=8 | D=9 |
+|------------|-----------|------|-----|
+| tanh | 6.63 | 3% | 0% |
+| **softsign** | **7.31** | **20%** | **17%** |
+
+#### Findings
+
+1. **Softsign significantly mitigates vanishing gradient in 2-layer networks** -- +0.68 mean depth vs tanh, D=9 goes from 0% to 17%
+2. **lambda=0.99 remains the only significant improvement** with 2-layer softsign (p=0.0007)
+3. **94% of seeds reach D>=7** with lambda=0.99 -- very consistent
+4. **Still inferior to 1-layer** (mean 7.31 vs 7.89-7.94) -- depth penalty from 2 layers persists but is reduced
+5. **Confirms the vanishing gradient analysis**: softsign preserves more gradient at high saturation, directly translating to better multi-layer performance
+
 ## Conclusions
 
 1. **Hybrid PC-backprop learning at lambda=0.99 is a statistically significant improvement** over pure backprop for the PC-Actor-Critic architecture on Tic-Tac-Toe
@@ -213,6 +241,7 @@ Softsign (`x/(1+|x|)`) is bounded in (-1,1) like tanh but with slower saturation
 7. **The DPC mechanism (lambda=0.99) is specific to single-layer topologies** -- multi-layer networks with residual skip connections cannot benefit from PC error blending
 8. **Optimal architecture: 1 hidden layer (27 neurons) + lambda=0.99** -- outperforms all multi-layer variants tested
 9. **Softsign is a viable alternative to tanh** -- equivalent performance at lambda=0.99, with the bonus of widening the effective lambda range (0.97-0.99 vs only 0.99)
+10. **Softsign mitigates vanishing gradient in 2-layer networks** -- 2-layer softsign (mean 7.31, 17% D=9) significantly outperforms 2-layer tanh (mean 6.63, 0% D=9), confirming the gradient preservation hypothesis
 
 ## Reproduction
 
