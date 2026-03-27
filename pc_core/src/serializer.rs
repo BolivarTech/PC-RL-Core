@@ -54,6 +54,9 @@ pub struct TrainingMetrics {
 pub struct PcActorWeights {
     /// Layer snapshots in order (hidden layers + output layer).
     pub layers: Vec<Layer>,
+    /// ReZero scaling factors for residual skip connections.
+    #[serde(default)]
+    pub rezero_alpha: Vec<f64>,
 }
 
 /// Complete save file containing agent state and metadata.
@@ -102,6 +105,7 @@ pub fn save_agent(
         config: agent.config.clone(),
         actor_weights: PcActorWeights {
             layers: agent.actor.layers.clone(),
+            rezero_alpha: agent.actor.rezero_alpha.clone(),
         },
         critic_weights: crate::mlp_critic::MlpCriticWeights {
             layers: agent.critic.layers.clone(),
@@ -160,24 +164,10 @@ pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError>
         });
     }
 
-    // Reconstruct rezero_alpha from config (or from saved weights if available)
-    let config_actor = &save_file.config.actor;
-    let rezero_alpha = if config_actor.residual {
-        let mut alphas = Vec::new();
-        for i in 1..config_actor.hidden_layers.len() {
-            if config_actor.hidden_layers[i].size == config_actor.hidden_layers[i - 1].size {
-                alphas.push(config_actor.rezero_init);
-            }
-        }
-        alphas
-    } else {
-        Vec::new()
-    };
-
     let actor = PcActor {
         layers: save_file.actor_weights.layers,
         config: save_file.config.actor.clone(),
-        rezero_alpha,
+        rezero_alpha: save_file.actor_weights.rezero_alpha,
     };
 
     let critic = MlpCritic::from_weights(
