@@ -39,6 +39,8 @@ use crate::pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
 ///         alpha: 0.1, tol: 0.01, min_steps: 1, max_steps: 20,
 ///         lr_weights: 0.01, synchronous: true, temperature: 1.0,
 ///         local_lambda: 1.0,
+///         residual: false,
+///         rezero_init: 0.001,
 ///     },
 ///     critic: MlpCriticConfig {
 ///         input_size: 27,
@@ -459,6 +461,8 @@ mod tests {
                 synchronous: true,
                 temperature: 1.0,
                 local_lambda: 1.0,
+                residual: false,
+                rezero_init: 0.001,
             },
             critic: MlpCriticConfig {
                 input_size: 27,
@@ -880,6 +884,8 @@ mod tests {
                 synchronous: true,
                 temperature: 1.0,
                 local_lambda: 1.0,
+                residual: false,
+                rezero_init: 0.001,
             },
             critic: MlpCriticConfig {
                 input_size: 27,

@@ -527,6 +527,8 @@ impl AppConfig {
                 synchronous: self.agent.actor.synchronous,
                 temperature: self.agent.actor.temperature,
                 local_lambda: self.agent.actor.local_lambda,
+                residual: false,
+                rezero_init: 0.001,
             },
             critic: MlpCriticConfig {
                 input_size: self.agent.critic.input_size,

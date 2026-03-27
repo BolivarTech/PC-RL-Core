@@ -40,6 +40,8 @@ use crate::matrix::{
 ///     synchronous: true,
 ///     temperature: 1.0,
 ///     local_lambda: 1.0,
+///     residual: false,
+///     rezero_init: 0.001,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +83,17 @@ pub struct PcActorConfig {
     /// The output layer always uses standard backprop regardless of this value.
     #[serde(default = "default_local_lambda")]
     pub local_lambda: f64,
+    /// Enable residual skip connections between same-dimension hidden layers.
+    #[serde(default)]
+    pub residual: bool,
+    /// Initial value for ReZero scaling factors on residual connections.
+    #[serde(default = "default_rezero_init")]
+    pub rezero_init: f64,
+}
+
+/// Default rezero_init: 0.001 (near-identity at start).
+fn default_rezero_init() -> f64 {
+    0.001
 }
 
 /// Default local_lambda: 1.0 (pure backprop).
@@ -142,6 +155,8 @@ pub enum SelectionMode {
 ///     alpha: 0.1, tol: 0.01, min_steps: 1, max_steps: 20,
 ///     lr_weights: 0.01, synchronous: true, temperature: 1.0,
 ///     local_lambda: 1.0,
+///     residual: false,
+///     rezero_init: 0.001,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
 /// let actor = PcActor::new(config, &mut rng).unwrap();
@@ -186,6 +201,23 @@ impl PcActor {
                 "local_lambda must be in [0.0, 1.0], got {}",
                 config.local_lambda
             )));
+        }
+        if config.rezero_init < 0.0 {
+            return Err(PcError::ConfigValidation(format!(
+                "rezero_init must be >= 0, got {}",
+                config.rezero_init
+            )));
+        }
+        if config.residual && config.hidden_layers.len() >= 2 {
+            for i in 1..config.hidden_layers.len() {
+                if config.hidden_layers[i].size != config.hidden_layers[i - 1].size {
+                    return Err(PcError::ConfigValidation(format!(
+                        "residual requires same-size hidden layers, but layer {} has size {} and layer {} has size {}",
+                        i - 1, config.hidden_layers[i - 1].size,
+                        i, config.hidden_layers[i].size
+                    )));
+                }
+            }
         }
 
         let mut layers = Vec::new();
@@ -536,6 +568,8 @@ mod tests {
             synchronous: true,
             temperature: 1.0,
             local_lambda: 1.0,
+            residual: false,
+            rezero_init: 0.001,
         }
     }
 

@@ -259,6 +259,8 @@ mod tests {
                 synchronous: true,
                 temperature: 1.0,
                 local_lambda: 1.0,
+                residual: false,
+                rezero_init: 0.001,
             },
             critic: MlpCriticConfig {
                 input_size: 27,
