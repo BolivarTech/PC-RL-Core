@@ -674,4 +674,32 @@ episodes = 5000
         config.apply_cli_overrides(None, None);
         assert_eq!(config.training.episodes, original);
     }
+
+    #[test]
+    fn test_default_actor_section_residual_false() {
+        let config = AppConfig::default();
+        assert!(!config.agent.actor.residual);
+        assert!((config.agent.actor.rezero_init - 0.001).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_to_agent_config_passes_residual_fields() {
+        let mut config = AppConfig::default();
+        config.agent.actor.residual = true;
+        config.agent.actor.rezero_init = 0.01;
+        config.agent.actor.hidden_layers = vec![
+            HiddenLayerDef {
+                size: 27,
+                activation: "tanh".to_string(),
+            },
+            HiddenLayerDef {
+                size: 27,
+                activation: "tanh".to_string(),
+            },
+        ];
+        config.agent.critic.input_size = 63; // 9 + 27 + 27
+        let ac = config.to_agent_config().unwrap();
+        assert!(ac.actor.residual);
+        assert!((ac.actor.rezero_init - 0.01).abs() < 1e-12);
+    }
 }
