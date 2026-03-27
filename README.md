@@ -4,9 +4,9 @@
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 
-A Predictive Coding Actor-Critic reinforcement learning agent that learns to play Tic-Tac-Toe from scratch, implemented entirely in Rust with zero ML framework dependencies.
+A **Deliberative Predictive Coding (DPC)** reinforcement learning agent that learns to play Tic-Tac-Toe from scratch, implemented entirely in Rust with zero ML framework dependencies.
 
-The actor uses iterative top-down/bottom-up **predictive coding inference loops** instead of standard feedforward passes, combined with a standard MLP critic for value estimation. The agent trains via REINFORCE with baseline against a minimax opponent with curriculum learning.
+The actor **deliberates before acting** by running an iterative free energy minimization loop (predictive coding inference), and a **residual echo of that deliberation** (1% of prediction errors) feeds back into weight updates as a structured micro-regularizer. These two mechanisms form a coupled system: deliberation generates the signal, the signal improves learning, and better learning improves future deliberation. The agent trains via REINFORCE with baseline against minimax opponents with curriculum learning.
 
 ## Results
 
