@@ -11,14 +11,14 @@ output_size = 9
 output_activation = "linear"
 alpha = 0.03
 tol = 0.01
-min_steps = 1
-max_steps = 5
+min_steps = 3
+max_steps = 10
 lr_weights = 0.005
 synchronous = true
 temperature = 1.0
 local_lambda = 0.99
 residual = true
-rezero_init = 0.001
+rezero_init = 1.0
 
 [[agent.actor.hidden_layers]]
 size = 27
