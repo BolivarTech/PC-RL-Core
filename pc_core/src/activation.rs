@@ -34,6 +34,9 @@ pub enum Activation {
     Sigmoid,
     /// Exponential linear unit: smooth in negatives, avoids dying neurons.
     Elu,
+    /// Softsign: bounded in (-1, 1) with slower saturation than tanh.
+    /// Preserves more gradient in high-saturation regions.
+    Softsign,
     /// Identity function: output equals input.
     Linear,
 }
@@ -60,6 +63,7 @@ impl Activation {
                     x.exp() - 1.0
                 }
             }
+            Activation::Softsign => x / (1.0 + x.abs()),
             Activation::Linear => x,
         }
     }
@@ -90,6 +94,11 @@ impl Activation {
                 } else {
                     fx + 1.0
                 }
+            }
+            Activation::Softsign => {
+                // fx = x/(1+|x|), so (1-|fx|) = 1/(1+|x|), derivative = (1-|fx|)^2
+                let t = 1.0 - fx.abs();
+                t * t
             }
             Activation::Linear => 1.0,
         }
@@ -352,6 +361,7 @@ mod tests {
             Activation::Relu,
             Activation::Sigmoid,
             Activation::Elu,
+            Activation::Softsign,
             Activation::Linear,
         ];
         for act in &variants {
@@ -364,11 +374,12 @@ mod tests {
 
     #[test]
     fn test_all_derivatives_finite_for_typical_post_activation_values() {
-        let cases: [(Activation, f64); 5] = [
+        let cases: [(Activation, f64); 6] = [
             (Activation::Tanh, 0.5),
             (Activation::Relu, 1.0),
             (Activation::Sigmoid, 0.5),
             (Activation::Elu, -0.5),
+            (Activation::Softsign, 0.5),
             (Activation::Linear, 0.0),
         ];
         for (act, fx) in &cases {
@@ -386,6 +397,7 @@ mod tests {
             Activation::Relu,
             Activation::Sigmoid,
             Activation::Elu,
+            Activation::Softsign,
             Activation::Linear,
         ];
         for act in &variants {
