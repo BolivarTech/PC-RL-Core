@@ -160,9 +160,24 @@ pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError>
         });
     }
 
+    // Reconstruct rezero_alpha from config (or from saved weights if available)
+    let config_actor = &save_file.config.actor;
+    let rezero_alpha = if config_actor.residual {
+        let mut alphas = Vec::new();
+        for i in 1..config_actor.hidden_layers.len() {
+            if config_actor.hidden_layers[i].size == config_actor.hidden_layers[i - 1].size {
+                alphas.push(config_actor.rezero_init);
+            }
+        }
+        alphas
+    } else {
+        Vec::new()
+    };
+
     let actor = PcActor {
         layers: save_file.actor_weights.layers,
         config: save_file.config.actor.clone(),
+        rezero_alpha,
     };
 
     let critic = MlpCritic::from_weights(

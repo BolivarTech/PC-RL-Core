@@ -164,11 +164,15 @@ pub enum SelectionMode {
 /// assert_eq!(result.y_conv.len(), 9);
 /// ```
 #[derive(Debug)]
+#[allow(dead_code)] // rezero_alpha used in upcoming infer() and update_weights changes
 pub struct PcActor {
     /// Network layers: hidden_layers.len() + 1 (output layer).
     pub(crate) layers: Vec<Layer>,
     /// Actor configuration.
     pub config: PcActorConfig,
+    /// ReZero scaling factors for eligible skip connections.
+    /// One entry per hidden layer that has a skip connection (index >= 1, same size as previous).
+    pub(crate) rezero_alpha: Vec<f64>,
 }
 
 impl PcActor {
@@ -236,7 +240,24 @@ impl PcActor {
             rng,
         ));
 
-        Ok(Self { layers, config })
+        // Compute rezero_alpha: one entry per eligible skip layer
+        let rezero_alpha = if config.residual {
+            let mut alphas = Vec::new();
+            for i in 1..config.hidden_layers.len() {
+                if config.hidden_layers[i].size == config.hidden_layers[i - 1].size {
+                    alphas.push(config.rezero_init);
+                }
+            }
+            alphas
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            layers,
+            config,
+            rezero_alpha,
+        })
     }
 
     /// Returns the total size of the latent concatenation (sum of hidden layer sizes).
