@@ -205,6 +205,42 @@ Different random seeds create different initial weight configurations, placing t
 
 This is consistent with the statistical results: lambda=0.99 doesn't always reach depth 9 (only 20% of seeds), but it reaches depth 9 more than twice as often as the baseline (9%).
 
+### 3.4 Deliberative Inference: The Actor "Thinks" Before Acting
+
+The most fundamental insight from this work is that **allowing the actor to deliberate before acting produces a qualitative improvement in decision quality**, even with a very small network.
+
+A standard MLP actor **reacts**: one forward pass, one response. The PC actor **deliberates**: it runs an iterative free energy minimization loop that refines its internal representation until top-down predictions and bottom-up evidence converge to a stable interpretation. Only then does it select an action.
+
+The experimental evidence is unambiguous:
+
+| Mode | Alpha | Inference Steps | Max Depth |
+|------|-------|----------------|-----------|
+| React (MLP) | 0 | 1 (feedforward) | 6 |
+| **Deliberate (PC)** | **0.03** | **5 (iterative)** | **8-9** |
+
+Same weights, same topology (27 neurons), same learning algorithm. The only difference is that one system "thinks" and the other does not. That deliberation is worth +2 to +3 minimax depth levels.
+
+#### Biological Analogy
+
+This mechanism mirrors what the brain does according to predictive coding theory (Rao & Ballard 1999) and the Free Energy Principle (Friston 2009). The cortex does not process information in a single feedforward sweep. It maintains a continuous loop of top-down predictions and bottom-up corrections that converges to a stable interpretation before generating a motor response. The PC actor replicates this computational principle: prediction, error, correction, convergence, then action.
+
+#### The Residual Echo of Deliberation
+
+The lambda=0.99 finding adds a deeper dimension to this picture. Not only does deliberation help during inference, but a **residual echo of that deliberation** -- the 1% prediction error signal injected into weight updates -- helps the system learn better over time. It is as if the experience of "having thought carefully" leaves a subtle imprint on how the weights adjust, guiding learning toward solutions that are not just reward-maximizing but also internally coherent.
+
+This is conceptually distinct from standard regularization techniques (L2, dropout, noise injection). Those methods add random or uniform constraints. The PC error is **structured**: it points in the direction of improved internal consistency between layers, which correlates with (but is not identical to) improved policy quality. The 1% blend is enough to steer optimization toward basins of attraction where both reward maximization and representational coherence are satisfied simultaneously.
+
+#### Implications
+
+The deliberative inference mechanism suggests that PC architectures may be especially well-suited for:
+
+- **Decision-critical applications**: Where the cost of a wrong action is high and inference latency is acceptable (medical diagnosis, strategic planning, resource allocation)
+- **Small-model deployment**: Where parameter count must be minimized but inference compute is available (edge devices, embedded systems)
+- **Environments with complex state structure**: Where a single feedforward pass cannot capture the full relational structure of the input (multi-agent interactions, partially observable environments)
+- **Continual learning settings**: Where the system must maintain internal consistency while adapting to new data (the PC error acts as a natural coherence constraint during learning)
+
+The key design principle: **invest in inference depth (iteration count) rather than model width (parameter count)**. A small network that thinks deeply can outperform a large network that reacts instantly.
+
 ---
 
 ## 4. Lessons for Other PC Projects
