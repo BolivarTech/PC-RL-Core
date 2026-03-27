@@ -11,26 +11,22 @@ output_size = 9
 output_activation = "linear"
 alpha = 0.03
 tol = 0.01
-min_steps = 3
-max_steps = 10
+min_steps = 1
+max_steps = 5
 lr_weights = 0.005
 synchronous = true
 temperature = 1.0
 local_lambda = 0.99
-residual = true
-rezero_init = 1.0
-
-[[agent.actor.hidden_layers]]
-size = 27
-activation = "tanh"
+residual = false
+rezero_init = 0.001
 
 [[agent.actor.hidden_layers]]
 size = 27
 activation = "tanh"
 
 [agent.critic]
-# 9 + 27 + 27 = 63
-input_size = 63
+# 9 + 27 = 36
+input_size = 36
 output_activation = "linear"
 lr = 0.005
 
