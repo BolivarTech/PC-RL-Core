@@ -1337,6 +1337,149 @@ mod tests {
         assert_eq!(result.tanh_components[1].as_ref().unwrap().len(), 27);
     }
 
+    // ── Residual Backward Tests ────────────────────────────────
+
+    #[test]
+    fn test_residual_false_update_identical_to_non_residual() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let delta = vec![0.1; 9];
+
+        let mut rng1 = make_rng();
+        let mut actor1 = PcActor::new(two_hidden_config(), &mut rng1).unwrap();
+        let infer1 = actor1.infer(&input);
+        actor1.update_weights(&delta, &infer1, &input, 1.0);
+
+        let mut rng2 = make_rng();
+        let config2 = PcActorConfig {
+            residual: false,
+            ..two_hidden_config()
+        };
+        let mut actor2 = PcActor::new(config2, &mut rng2).unwrap();
+        let infer2 = actor2.infer(&input);
+        actor2.update_weights(&delta, &infer2, &input, 1.0);
+
+        for i in 0..actor1.layers.len() {
+            assert_eq!(actor1.layers[i].weights.data, actor2.layers[i].weights.data);
+        }
+    }
+
+    #[test]
+    fn test_residual_update_changes_all_layer_weights() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let input = vec![0.5; 9];
+        let infer_result = actor.infer(&input);
+        let w0 = actor.layers[0].weights.data.clone();
+        let w1 = actor.layers[1].weights.data.clone();
+        let w2 = actor.layers[2].weights.data.clone();
+        actor.update_weights(&vec![0.1; 9], &infer_result, &input, 1.0);
+        assert_ne!(actor.layers[0].weights.data, w0, "Layer 0 should change");
+        assert_ne!(actor.layers[1].weights.data, w1, "Layer 1 should change");
+        assert_ne!(actor.layers[2].weights.data, w2, "Output layer should change");
+    }
+
+    #[test]
+    fn test_residual_update_changes_rezero_alpha() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let input = vec![0.5; 9];
+        let infer_result = actor.infer(&input);
+        let alpha_before = actor.rezero_alpha.clone();
+        actor.update_weights(&vec![0.1; 9], &infer_result, &input, 1.0);
+        assert_ne!(
+            actor.rezero_alpha, alpha_before,
+            "rezero_alpha should be updated by backprop"
+        );
+    }
+
+    #[test]
+    fn test_residual_update_clips_weights() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let input = vec![1.0; 9];
+        let infer_result = actor.infer(&input);
+        actor.update_weights(&vec![1e6; 9], &infer_result, &input, 1.0);
+        for layer in &actor.layers {
+            for &w in &layer.weights.data {
+                assert!(
+                    w.abs() <= WEIGHT_CLIP + 1e-12,
+                    "Weight {w} exceeds WEIGHT_CLIP"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_residual_gradient_stronger_than_non_residual() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let delta = vec![0.1; 9];
+
+        // Non-residual 2 hidden layers (27, 27)
+        let mut rng1 = make_rng();
+        let config1 = PcActorConfig {
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let mut actor1 = PcActor::new(config1, &mut rng1).unwrap();
+        let w0_before1 = actor1.layers[0].weights.data.clone();
+        let infer1 = actor1.infer(&input);
+        actor1.update_weights(&delta, &infer1, &input, 1.0);
+        let change1: f64 = actor1.layers[0]
+            .weights
+            .data
+            .iter()
+            .zip(w0_before1.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+
+        // Residual 2 hidden layers (27, 27) with rezero_init=1.0
+        let mut rng2 = make_rng();
+        let config2 = PcActorConfig {
+            rezero_init: 1.0,
+            ..residual_two_hidden_config()
+        };
+        let mut actor2 = PcActor::new(config2, &mut rng2).unwrap();
+        let w0_before2 = actor2.layers[0].weights.data.clone();
+        let infer2 = actor2.infer(&input);
+        actor2.update_weights(&delta, &infer2, &input, 1.0);
+        let change2: f64 = actor2.layers[0]
+            .weights
+            .data
+            .iter()
+            .zip(w0_before2.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+
+        assert!(
+            change2 > change1,
+            "Residual should propagate stronger gradient to layer 0: residual={change2:.6}, non-residual={change1:.6}"
+        );
+    }
+
+    #[test]
+    fn test_residual_hybrid_lambda_works() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            local_lambda: 0.99,
+            ..residual_two_hidden_config()
+        };
+        let mut actor = PcActor::new(config, &mut rng).unwrap();
+        let input = vec![0.5; 9];
+        let infer_result = actor.infer(&input);
+        let w0_before = actor.layers[0].weights.data.clone();
+        actor.update_weights(&vec![0.1; 9], &infer_result, &input, 1.0);
+        assert_ne!(actor.layers[0].weights.data, w0_before);
+    }
+
     fn local_learning_config() -> PcActorConfig {
         PcActorConfig {
             local_lambda: 0.0,
