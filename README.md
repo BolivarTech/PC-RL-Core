@@ -134,7 +134,7 @@ Key parameters:
 
 **Next frontier**: `local_lambda` is a hyperparameter with an ultra-narrow sweet spot (only 0.99 works out of 6 values tested) that likely interacts with alpha, lr, and topology. A genetic algorithm co-evolving all hyperparameters -- chromosome `[hidden_size, alpha, lr, lambda, ...]` with fitness = max depth -- could discover optimal configurations that grid search misses.
 
-For the complete experimental methodology and statistical analysis, see [docs/experiment_analysis.md](docs/experiment_analysis.md).
+For the complete experimental methodology and statistical analysis, see [docs/experiment_analysis.md](docs/experiment_analysis.md). For the full architecture description, lessons learned, and applicability to other PC projects, see [docs/pc_actor_critic_paper.md](docs/pc_actor_critic_paper.md).
 
 ## Dependencies
 
