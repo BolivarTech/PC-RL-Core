@@ -117,6 +117,17 @@ pub struct ActorSection {
     /// Blend factor: 1.0 = pure backprop, 0.0 = pure local PC, intermediate = hybrid.
     #[serde(default = "default_local_lambda")]
     pub local_lambda: f64,
+    /// Enable residual skip connections between same-dimension hidden layers.
+    #[serde(default)]
+    pub residual: bool,
+    /// Initial value for ReZero scaling factors on residual connections.
+    #[serde(default = "default_rezero_init")]
+    pub rezero_init: f64,
+}
+
+/// Default rezero_init: 0.001.
+fn default_rezero_init() -> f64 {
+    0.001
 }
 
 /// Default local_lambda: 1.0 (pure backprop).
@@ -356,6 +367,8 @@ impl Default for ActorSection {
             synchronous: default_true(),
             temperature: default_temperature(),
             local_lambda: default_local_lambda(),
+            residual: false,
+            rezero_init: default_rezero_init(),
         }
     }
 }
@@ -527,8 +540,8 @@ impl AppConfig {
                 synchronous: self.agent.actor.synchronous,
                 temperature: self.agent.actor.temperature,
                 local_lambda: self.agent.actor.local_lambda,
-                residual: false,
-                rezero_init: 0.001,
+                residual: self.agent.actor.residual,
+                rezero_init: self.agent.actor.rezero_init,
             },
             critic: MlpCriticConfig {
                 input_size: self.agent.critic.input_size,

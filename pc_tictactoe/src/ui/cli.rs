@@ -75,6 +75,12 @@ pub struct TrainArgs {
     /// Blend factor: 1.0 = pure backprop, 0.0 = pure local PC, intermediate = hybrid.
     #[arg(long)]
     pub local_lambda: Option<f64>,
+    /// Enable residual skip connections between same-dimension hidden layers.
+    #[arg(long)]
+    pub residual: bool,
+    /// Initial ReZero scaling factor for residual connections.
+    #[arg(long)]
+    pub rezero_init: Option<f64>,
 }
 
 /// Arguments for the play subcommand.
@@ -145,6 +151,14 @@ pub fn run_train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(lambda) = args.local_lambda {
         config.agent.actor.local_lambda = lambda;
+    }
+
+    if args.residual {
+        config.agent.actor.residual = true;
+    }
+
+    if let Some(ri) = args.rezero_init {
+        config.agent.actor.rezero_init = ri;
     }
 
     config.validate()?;
