@@ -1023,6 +1023,84 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    fn residual_two_hidden_config() -> PcActorConfig {
+        PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        }
+    }
+
+    #[test]
+    fn test_non_residual_actor_empty_rezero_alpha() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
+        assert!(actor.rezero_alpha.is_empty());
+    }
+
+    #[test]
+    fn test_residual_two_hidden_one_rezero_alpha() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        assert_eq!(actor.rezero_alpha.len(), 1);
+    }
+
+    #[test]
+    fn test_residual_three_hidden_two_rezero_alpha() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        assert_eq!(actor.rezero_alpha.len(), 2);
+    }
+
+    #[test]
+    fn test_rezero_alpha_initialized_to_rezero_init() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            rezero_init: 0.005,
+            ..residual_two_hidden_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        assert!((actor.rezero_alpha[0] - 0.005).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_residual_single_hidden_zero_rezero_alpha() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        assert!(actor.rezero_alpha.is_empty());
+    }
+
     #[test]
     fn test_residual_single_hidden_accepted() {
         let mut rng = make_rng();
