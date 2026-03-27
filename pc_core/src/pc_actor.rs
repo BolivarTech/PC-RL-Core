@@ -122,6 +122,10 @@ pub struct InferResult {
     pub steps_used: usize,
     /// Whether the inference loop converged within tolerance.
     pub converged: bool,
+    /// Per-layer tanh components for residual layers.
+    /// `None` for non-skip layers, `Some(tanh_out)` for skip-eligible layers.
+    /// Needed for correct backward pass (derivative on tanh_out, not full h[i]).
+    pub tanh_components: Vec<Option<Vec<f64>>>,
 }
 
 /// Action selection mode.
@@ -276,6 +280,27 @@ impl PcActor {
     /// # Panics
     ///
     /// Panics if `input.len() != config.input_size`.
+    /// Returns whether hidden layer `i` has a skip connection.
+    fn is_skip_layer(&self, i: usize) -> bool {
+        self.config.residual
+            && i >= 1
+            && self.config.hidden_layers[i].size == self.config.hidden_layers[i - 1].size
+    }
+
+    /// Returns the rezero_alpha index for hidden layer `i`, if it is a skip layer.
+    fn skip_alpha_index(&self, i: usize) -> Option<usize> {
+        if !self.is_skip_layer(i) {
+            return None;
+        }
+        let mut idx = 0;
+        for j in 1..i {
+            if self.config.hidden_layers[j].size == self.config.hidden_layers[j - 1].size {
+                idx += 1;
+            }
+        }
+        Some(idx)
+    }
+
     pub fn infer(&self, input: &[f64]) -> InferResult {
         assert_eq!(
             input.len(),
@@ -289,9 +314,20 @@ impl PcActor {
 
         // Forward pass to initialize hidden states and output
         let mut hidden_states: Vec<Vec<f64>> = Vec::with_capacity(n_hidden);
+        let mut tanh_components: Vec<Option<Vec<f64>>> = Vec::with_capacity(n_hidden);
         let mut prev = input.to_vec();
-        for layer in &self.layers[..n_hidden] {
-            prev = layer.forward(&prev);
+        for (i, layer) in self.layers[..n_hidden].iter().enumerate() {
+            let tanh_out = layer.forward(&prev);
+            if let Some(alpha_idx) = self.skip_alpha_index(i) {
+                // Residual: h[i] = rezero_alpha * tanh_out + h[i-1]
+                let alpha = self.rezero_alpha[alpha_idx];
+                let scaled = vec_scale(&tanh_out, alpha);
+                prev = vec_add(&prev, &scaled);
+                tanh_components.push(Some(tanh_out));
+            } else {
+                prev = tanh_out;
+                tanh_components.push(None);
+            }
             hidden_states.push(prev.clone());
         }
         // Output from last hidden (or input if no hidden)
@@ -314,31 +350,42 @@ impl PcActor {
             if self.config.synchronous {
                 // Snapshot mode: freeze all states
                 let snapshot: Vec<Vec<f64>> = hidden_states.clone();
+                let tanh_snap: Vec<Option<Vec<f64>>> = tanh_components.clone();
 
                 let mut error_vecs: Vec<Vec<f64>> = Vec::new();
 
                 for i in (0..n_hidden).rev() {
-                    // State above: y for top hidden, hidden_states[i+1] otherwise
                     let state_above = if i == n_hidden - 1 {
                         &y
                     } else {
                         &snapshot[i + 1]
                     };
 
-                    // Top-down prediction
+                    // Top-down prediction targets tanh_component for skip layers
+                    let target = if let Some(ref tc) = tanh_snap[i] {
+                        tc
+                    } else {
+                        &snapshot[i]
+                    };
+
                     let prediction = self.layers[i + 1]
                         .transpose_forward(state_above, self.config.hidden_layers[i].activation);
 
-                    // Error = prediction - snapshot[i]
-                    let error = vec_sub(&prediction, &snapshot[i]);
+                    let error = vec_sub(&prediction, target);
                     error_vecs.push(error.clone());
 
-                    // Update: h[i] = snapshot[i] + alpha * error
-                    let update = vec_add(&snapshot[i], &vec_scale(&error, self.config.alpha));
-                    hidden_states[i] = update;
+                    // Update tanh_component or hidden_state
+                    let updated_target = vec_add(target, &vec_scale(&error, self.config.alpha));
+                    if let Some(alpha_idx) = self.skip_alpha_index(i) {
+                        tanh_components[i] = Some(updated_target.clone());
+                        let alpha = self.rezero_alpha[alpha_idx];
+                        let prev_h = if i > 0 { &hidden_states[i - 1] } else { input };
+                        hidden_states[i] = vec_add(prev_h, &vec_scale(&updated_target, alpha));
+                    } else {
+                        hidden_states[i] = updated_target;
+                    }
                 }
 
-                // Recompute output from updated top hidden
                 let top_hidden = if n_hidden > 0 {
                     &hidden_states[n_hidden - 1]
                 } else {
@@ -346,7 +393,6 @@ impl PcActor {
                 };
                 y = self.layers[n_hidden].forward(top_hidden);
 
-                // RMS error
                 let refs: Vec<&[f64]> = error_vecs.iter().map(|v| v.as_slice()).collect();
                 surprise_score = rms_error(&refs);
                 last_errors = error_vecs;
@@ -361,14 +407,27 @@ impl PcActor {
                         &hidden_states[i + 1]
                     };
 
+                    let target = if let Some(ref tc) = tanh_components[i] {
+                        tc.clone()
+                    } else {
+                        hidden_states[i].clone()
+                    };
+
                     let prediction = self.layers[i + 1]
                         .transpose_forward(state_above, self.config.hidden_layers[i].activation);
 
-                    let error = vec_sub(&prediction, &hidden_states[i]);
+                    let error = vec_sub(&prediction, &target);
                     error_vecs.push(error.clone());
 
-                    let update = vec_add(&hidden_states[i], &vec_scale(&error, self.config.alpha));
-                    hidden_states[i] = update;
+                    let updated_target = vec_add(&target, &vec_scale(&error, self.config.alpha));
+                    if let Some(alpha_idx) = self.skip_alpha_index(i) {
+                        tanh_components[i] = Some(updated_target.clone());
+                        let alpha = self.rezero_alpha[alpha_idx];
+                        let prev_h = if i > 0 { &hidden_states[i - 1] } else { input };
+                        hidden_states[i] = vec_add(prev_h, &vec_scale(&updated_target, alpha));
+                    } else {
+                        hidden_states[i] = updated_target;
+                    }
                 }
 
                 let top_hidden = if n_hidden > 0 {
@@ -407,6 +466,7 @@ impl PcActor {
             surprise_score,
             steps_used,
             converged,
+            tanh_components,
         }
     }
 
@@ -1225,8 +1285,11 @@ mod tests {
     fn test_residual_infer_does_not_modify_weights() {
         let mut rng = make_rng();
         let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
-        let weights_before: Vec<Vec<f64>> =
-            actor.layers.iter().map(|l| l.weights.data.clone()).collect();
+        let weights_before: Vec<Vec<f64>> = actor
+            .layers
+            .iter()
+            .map(|l| l.weights.data.clone())
+            .collect();
         let alpha_before = actor.rezero_alpha.clone();
         let _ = actor.infer(&[0.5; 9]);
         for (i, layer) in actor.layers.iter().enumerate() {

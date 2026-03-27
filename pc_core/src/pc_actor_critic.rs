@@ -86,6 +86,8 @@ pub struct TrajectoryStep {
     pub hidden_states: Vec<Vec<f64>>,
     /// Per-layer prediction errors from the PC inference loop.
     pub prediction_errors: Vec<Vec<f64>>,
+    /// Per-layer tanh components for residual layers (for correct backward pass).
+    pub tanh_components: Vec<Option<Vec<f64>>>,
     /// Action taken at this step.
     pub action: usize,
     /// Valid actions at this step (needed for masked softmax).
@@ -291,6 +293,7 @@ impl PcActorCritic {
                 surprise_score: step.surprise_score,
                 steps_used: step.steps_used,
                 converged: false,
+                tanh_components: step.tanh_components.clone(),
             };
             self.actor
                 .update_weights(&delta, &stored_infer, &step.input, s_scale);
@@ -495,6 +498,7 @@ mod tests {
             y_conv: infer.y_conv,
             hidden_states: infer.hidden_states,
             prediction_errors: infer.prediction_errors,
+            tanh_components: infer.tanh_components,
             action,
             valid_actions: valid,
             reward: 1.0,
@@ -555,6 +559,7 @@ mod tests {
             y_conv: infer.y_conv,
             hidden_states: infer.hidden_states,
             prediction_errors: infer.prediction_errors,
+            tanh_components: infer.tanh_components,
             action,
             valid_actions: valid,
             reward: -1.0,
@@ -585,6 +590,7 @@ mod tests {
                 y_conv: infer.y_conv,
                 hidden_states: infer.hidden_states,
                 prediction_errors: infer.prediction_errors,
+                tanh_components: infer.tanh_components,
                 action,
                 valid_actions: valid.clone(),
                 reward: if i == 2 { 1.0 } else { 0.0 },
@@ -819,6 +825,7 @@ mod tests {
                 y_conv: infer.y_conv,
                 hidden_states: infer.hidden_states,
                 prediction_errors: infer.prediction_errors,
+                tanh_components: infer.tanh_components,
                 action,
                 valid_actions: valid.clone(),
                 reward: 1.0,
@@ -917,6 +924,7 @@ mod tests {
                 y_conv: infer.y_conv,
                 hidden_states: infer.hidden_states,
                 prediction_errors: infer.prediction_errors,
+                tanh_components: infer.tanh_components,
                 action: target_action,
                 valid_actions: valid.clone(),
                 reward: 1.0,
