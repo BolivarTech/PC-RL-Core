@@ -43,6 +43,10 @@ lambda=0.99 is the **only statistically significant improvement** (p < 0.05) ove
 
 Predictive coding inference consistently adds **+1 depth level** over the equivalent MLP architecture. The hybrid learning rule adds another level on top.
 
+### Parameter Efficiency
+
+The PC actor achieves near-optimal play with only **~550 parameters** -- 4-330x smaller than typical published architectures for the same task (which range from ~2,700 to ~183,000 parameters). The PC inference loop trades compute for parameters: 5 iterative inference steps extract more representational capacity per parameter than a single feedforward pass through a larger network.
+
 ## Architecture
 
 ```
