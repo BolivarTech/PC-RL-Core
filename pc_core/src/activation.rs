@@ -193,6 +193,32 @@ mod tests {
     }
 
     #[test]
+    fn test_softsign_apply_positive() {
+        // softsign(2.0) = 2.0 / (1 + 2.0) = 2/3
+        let result = Activation::Softsign.apply(2.0);
+        assert!((result - 2.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_apply_zero() {
+        assert!((Activation::Softsign.apply(0.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_apply_negative() {
+        // softsign(-3.0) = -3.0 / (1 + 3.0) = -0.75
+        let result = Activation::Softsign.apply(-3.0);
+        assert!((result - (-0.75)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_apply_bounded() {
+        // Output must be in (-1, 1) for any input
+        assert!(Activation::Softsign.apply(100.0) < 1.0);
+        assert!(Activation::Softsign.apply(-100.0) > -1.0);
+    }
+
+    #[test]
     fn test_linear_apply_is_identity() {
         assert_eq!(Activation::Linear.apply(42.0), 42.0);
     }
@@ -250,6 +276,43 @@ mod tests {
     fn test_elu_derivative_at_minus_one_is_zero() {
         // ELU floor is -1.0, derivative there = -1.0 + 1.0 = 0.0
         assert!((Activation::Elu.derivative(-1.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_derivative_at_zero() {
+        // derivative(softsign(0)) = 1 / (1 + 0)^2 = 1.0
+        assert!((Activation::Softsign.derivative(0.0) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_derivative_positive() {
+        // softsign(2) = 2/3 ≈ 0.6667, |x| = 2, derivative = 1/(1+2)^2 = 1/9
+        // But derivative takes fx (post-activation), so we need to recover |x|
+        // fx = x/(1+|x|), so |x| = |fx|/(1-|fx|)
+        // For fx=0.5: |x| = 0.5/0.5 = 1.0, derivative = 1/(1+1)^2 = 0.25
+        let result = Activation::Softsign.derivative(0.5);
+        assert!((result - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_derivative_negative() {
+        // For fx=-0.5: |x| = 0.5/0.5 = 1.0, derivative = 1/(1+1)^2 = 0.25
+        let result = Activation::Softsign.derivative(-0.5);
+        assert!((result - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_derivative_high_saturation() {
+        // For fx=0.9: |x| = 0.9/0.1 = 9, derivative = 1/(1+9)^2 = 0.01
+        let result = Activation::Softsign.derivative(0.9);
+        assert!((result - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_derivative_always_positive() {
+        for &fx in &[-0.9, -0.5, 0.0, 0.5, 0.9] {
+            assert!(Activation::Softsign.derivative(fx) > 0.0);
+        }
     }
 
     #[test]
