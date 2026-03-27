@@ -168,7 +168,6 @@ pub enum SelectionMode {
 /// assert_eq!(result.y_conv.len(), 9);
 /// ```
 #[derive(Debug)]
-#[allow(dead_code)] // rezero_alpha used in upcoming infer() and update_weights changes
 pub struct PcActor {
     /// Network layers: hidden_layers.len() + 1 (output layer).
     pub(crate) layers: Vec<Layer>,
@@ -587,18 +586,14 @@ impl PcActor {
             } else {
                 input
             };
-            let layer_output = &infer_result.hidden_states[i];
 
             // Blend backprop delta with local PC error
             let effective_delta = if (lambda - 1.0).abs() < f64::EPSILON {
-                // Pure backprop: use bp_delta directly
                 bp_delta.clone()
             } else if lambda.abs() < f64::EPSILON {
-                // Pure local: use PC error directly
                 let error_idx = n_hidden - 1 - i;
                 infer_result.prediction_errors[error_idx].clone()
             } else {
-                // Hybrid: blend both signals
                 let error_idx = n_hidden - 1 - i;
                 let pc_error = &infer_result.prediction_errors[error_idx];
                 bp_delta
@@ -608,13 +603,46 @@ impl PcActor {
                     .collect()
             };
 
-            bp_delta = self.layers[i].backward(
-                layer_input,
-                layer_output,
-                &effective_delta,
-                self.config.lr_weights,
-                surprise_scale,
-            );
+            if let Some(alpha_idx) = self.skip_alpha_index(i) {
+                // Skip-eligible layer: use tanh_out for derivative, scale by alpha,
+                // add identity path to propagated gradient, update alpha.
+                let tanh_out = infer_result.tanh_components[i].as_ref().unwrap();
+                let alpha = self.rezero_alpha[alpha_idx];
+                let effective_lr = self.config.lr_weights * surprise_scale;
+
+                // Scale delta by rezero_alpha for the nonlinear path
+                let scaled_delta: Vec<f64> = effective_delta.iter().map(|&d| d * alpha).collect();
+
+                // Backward through the layer using tanh_out (not hidden_states[i])
+                let propagated = self.layers[i].backward(
+                    layer_input,
+                    tanh_out,
+                    &scaled_delta,
+                    self.config.lr_weights,
+                    surprise_scale,
+                );
+
+                // Update rezero_alpha: dL/d(alpha) = delta · tanh_out
+                let grad_alpha: f64 = effective_delta
+                    .iter()
+                    .zip(tanh_out.iter())
+                    .map(|(&d, &t)| d * t)
+                    .sum();
+                self.rezero_alpha[alpha_idx] -= effective_lr * grad_alpha;
+
+                // Propagated delta = nonlinear path + identity path
+                bp_delta = vec_add(&propagated, &effective_delta);
+            } else {
+                // Standard layer: use hidden_states[i] as output
+                let layer_output = &infer_result.hidden_states[i];
+                bp_delta = self.layers[i].backward(
+                    layer_input,
+                    layer_output,
+                    &effective_delta,
+                    self.config.lr_weights,
+                    surprise_scale,
+                );
+            }
         }
     }
 }
@@ -1372,10 +1400,13 @@ mod tests {
         let w0 = actor.layers[0].weights.data.clone();
         let w1 = actor.layers[1].weights.data.clone();
         let w2 = actor.layers[2].weights.data.clone();
-        actor.update_weights(&vec![0.1; 9], &infer_result, &input, 1.0);
+        actor.update_weights(&[0.1; 9], &infer_result, &input, 1.0);
         assert_ne!(actor.layers[0].weights.data, w0, "Layer 0 should change");
         assert_ne!(actor.layers[1].weights.data, w1, "Layer 1 should change");
-        assert_ne!(actor.layers[2].weights.data, w2, "Output layer should change");
+        assert_ne!(
+            actor.layers[2].weights.data, w2,
+            "Output layer should change"
+        );
     }
 
     #[test]
@@ -1385,7 +1416,7 @@ mod tests {
         let input = vec![0.5; 9];
         let infer_result = actor.infer(&input);
         let alpha_before = actor.rezero_alpha.clone();
-        actor.update_weights(&vec![0.1; 9], &infer_result, &input, 1.0);
+        actor.update_weights(&[0.1; 9], &infer_result, &input, 1.0);
         assert_ne!(
             actor.rezero_alpha, alpha_before,
             "rezero_alpha should be updated by backprop"
@@ -1398,7 +1429,7 @@ mod tests {
         let mut actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
         let input = vec![1.0; 9];
         let infer_result = actor.infer(&input);
-        actor.update_weights(&vec![1e6; 9], &infer_result, &input, 1.0);
+        actor.update_weights(&[1e6; 9], &infer_result, &input, 1.0);
         for layer in &actor.layers {
             for &w in &layer.weights.data {
                 assert!(
@@ -1476,7 +1507,7 @@ mod tests {
         let input = vec![0.5; 9];
         let infer_result = actor.infer(&input);
         let w0_before = actor.layers[0].weights.data.clone();
-        actor.update_weights(&vec![0.1; 9], &infer_result, &input, 1.0);
+        actor.update_weights(&[0.1; 9], &infer_result, &input, 1.0);
         assert_ne!(actor.layers[0].weights.data, w0_before);
     }
 
