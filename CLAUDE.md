@@ -159,13 +159,25 @@ Hybrid blend: `delta = λ * backprop_grad + (1-λ) * pc_prediction_error`
 - λ=0.99 reaches intermediate depths faster even when not reaching higher depths (3.4× faster with seed=123)
 - Training reaches depth=8 in ~11,000 episodes (baseline), depth=9 in ~14,500 episodes (λ=0.99)
 
+### Statistical Validation (N=35 random seeds, 210 runs)
+
+| Lambda | Mean Depth | StdDev | Min | Max | D>=8 | D=9 | p-value vs 1.0 |
+|--------|-----------|--------|-----|-----|------|-----|----------------|
+| 0.95 | 7.00 | 1.19 | 4 | 9 | 23% | 11% | 0.564 |
+| 0.96 | 6.66 | 1.33 | 4 | 9 | 14% | 9% | 0.072 |
+| 0.97 | 6.94 | 1.16 | 4 | 9 | 14% | 11% | 0.413 |
+| 0.98 | 7.00 | 0.87 | 4 | 9 | 11% | 9% | 0.490 |
+| **0.99** | **7.57** | **0.81** | **7** | **9** | **37%** | **20%** | **0.034\*** |
+| 1.00 | 7.14 | 0.85 | 6 | 9 | 26% | 9% | baseline |
+
+**λ=0.99 is the only statistically significant improvement** (p < 0.05). It has the highest mean depth, doubles the rate of depth=9, and never drops below depth 7. All other lambda values perform equal or worse than baseline.
+
 ### Seed Dependency Analysis
 
-Seed-dependence is expected, not a flaw. The seed determines initial weights, which define a starting point in the loss landscape. Different seeds land in different basins of attraction with different local topology:
+Seed-dependence is expected: different seeds place the optimizer in different basins of attraction in the loss landscape. The λ=0.99 perturbation (1% PC error) increases the probability of escaping to deeper basins but cannot guarantee it for all starting points. This explains both the statistical improvement (more seeds reach depth 9) and the remaining variance.
 
-- **seed=42**: initial weights fall in a basin where a deep minimum (depth 9) is reachable. The 1% PC error (λ=0.99) perturbs the optimization surface enough to escape a saddle point that pure backprop cannot cross
-- **seed=123**: initial weights fall in a basin where the deepest accessible minimum is shallower (depth 7), regardless of lambda
+### Evolutionary Optimization Potential
 
-This explains why the baseline (λ=1.0) also varies by seed (depth 8 with seed=42, depth 7 with seed=123) — same phenomenon, different basin geometry.
+`local_lambda` has an ultra-narrow sweet spot (only 0.99 of 6 values tested) that likely interacts with alpha, lr, and topology. A genetic algorithm co-evolving all hyperparameters — chromosome `[hidden_size, alpha, lr, lambda, ...]` with fitness = max depth — could discover optimal configurations that grid search misses. Each GA individual has its own weight initialization, so lambda evolves to match its particular basin of attraction.
 
-**To validate λ=0.99 as genuinely better**: run 20-50 seeds and compare the **distribution** of max depths between λ=1.0 and λ=0.99. If λ=0.99 produces a higher average depth, the PC error regularization effect is real and not an artifact of one favorable basin.
+Full analysis: [docs/experiment_analysis.md](docs/experiment_analysis.md)
