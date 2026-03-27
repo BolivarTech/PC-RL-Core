@@ -376,13 +376,13 @@ PC inference as a mechanism for parameter efficiency in RL is not well documente
 
 ### Predictive Coding Theory
 
-1. Rao, R. P., & Ballard, D. H. (1999). Predictive coding in the visual cortex: a functional interpretation of some extra-classical receptive-field effects. *Nature Neuroscience*, 2(1), 79-87.
+1. Rao, R. P., & Ballard, D. H. (1999). [Predictive coding in the visual cortex: a functional interpretation of some extra-classical receptive-field effects](https://www.nature.com/articles/nn0199_79). *Nature Neuroscience*, 2(1), 79-87.
 
 2. Millidge, B., Seth, A., & Buckley, C. L. (2022). [Predictive Coding Approximates Backprop Along Arbitrary Computation Graphs](https://direct.mit.edu/neco/article/34/6/1329/107068). *Neural Computation*, 34(6), 1329-1368.
 
-3. Whittington, J. C., & Bogacz, R. (2017). An Approximation of the Error Backpropagation Algorithm in a Predictive Coding Network with Local Hebbian Synaptic Plasticity. *Neural Computation*, 29(5), 1229-1262.
+3. Whittington, J. C., & Bogacz, R. (2017). [An Approximation of the Error Backpropagation Algorithm in a Predictive Coding Network with Local Hebbian Synaptic Plasticity](https://direct.mit.edu/neco/article/29/5/1229/8261). *Neural Computation*, 29(5), 1229-1262.
 
-4. Salvatori, T., Song, Y., Hong, Y., Sha, L., Frieder, S., Xu, Z., Bogacz, R., & Lukasiewicz, T. (2022). Associative Memories via Predictive Coding. *NeurIPS 2022*.
+4. Salvatori, T., Song, Y., Hong, Y., Sha, L., Frieder, S., Xu, Z., Bogacz, R., & Lukasiewicz, T. (2021). [Associative Memories via Predictive Coding](https://proceedings.neurips.cc/paper/2021/hash/1fb36c4ccf88f7e67ead155496f02338-Abstract.html). *NeurIPS 2021*.
 
 5. Alonso, N., Millidge, B., Krichmar, J., & Bhatt, U. (2024). [Understanding and Improving Optimization in Predictive Coding Networks](https://ojs.aaai.org/index.php/AAAI/article/view/28954). *AAAI 2024*.
 
@@ -404,7 +404,7 @@ PC inference as a mechanism for parameter efficiency in RL is not well documente
 
 ### Reinforcement Learning (General)
 
-12. Sutton, R. S., & Barto, A. G. (2018). *Reinforcement Learning: An Introduction* (2nd ed.). MIT Press.
+12. Sutton, R. S., & Barto, A. G. (2018). [*Reinforcement Learning: An Introduction*](http://incompleteideas.net/book/the-book-2nd.html) (2nd ed.). MIT Press.
 
 ### Tic-Tac-Toe RL (Peer-Reviewed)
 
