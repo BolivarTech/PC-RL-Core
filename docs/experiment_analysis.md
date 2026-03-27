@@ -169,6 +169,39 @@ With ReZero near-identity (0.001): PC loop converges in 1 step because the secon
 
 With standard ResNet (1.0): PC prediction errors are meaningful in magnitude, but they point in the direction of **representational consistency between layers** -- not in the direction of **reward maximization**. In single-layer networks, these directions happen to correlate enough that 1% PC error acts as useful regularization. In multi-layer networks, the correlation breaks down: the PC error for layer 1 optimizes for consistency with the output layer, while the backprop gradient optimizes for policy quality. Blending these conflicting signals destroys learning.
 
+### Phase 6: Softsign Activation (N=35 random seeds, 1×27h)
+
+Softsign (`x/(1+|x|)`) is bounded in (-1,1) like tanh but with slower saturation. At high saturation (|fx|>0.9), softsign preserves 3.8x more gradient than tanh. Tested as drop-in replacement for tanh in both actor and critic hidden layers.
+
+#### Softsign results
+
+| Lambda | N | Mean Depth | D>=8 | D=9 | p-value vs 1.0 |
+|--------|---|-----------|------|-----|----------------|
+| 0.95 | 35 | 7.09 | 26% | 14% | 0.201 |
+| 0.96 | 35 | 6.94 | 14% | 9% | 0.458 |
+| 0.97 | 35 | 7.23 | 26% | 9% | 0.013 \* |
+| 0.98 | 35 | 7.29 | 37% | 14% | 0.017 \* |
+| **0.99** | **35** | **7.89** | **63%** | **31%** | **0.0000 \*\*** |
+| 1.00 | 35 | 6.80 | 11% | 0% | baseline |
+
+#### Softsign vs Tanh comparison (lambda=0.99)
+
+| Metric | Tanh | Softsign |
+|--------|------|----------|
+| Mean depth | 7.94 | 7.89 |
+| D>=8 | 57% | 63% |
+| D=9 | 37% | 31% |
+| Min depth | 7 | 6 |
+| Significant lambdas | 0.99 only | 0.97, 0.98, 0.99 |
+
+#### Softsign Findings
+
+1. **Performance is equivalent to tanh** at lambda=0.99 (mean 7.89 vs 7.94, not significantly different)
+2. **Softsign widens the effective lambda range** -- lambda=0.97 and 0.98 become significant (p<0.02), whereas with tanh only 0.99 was significant. The smoother gradient profile of softsign tolerates more PC error without collapsing
+3. **More consistent at D>=8** (63% vs 57%) but **fewer D=9** (31% vs 37%) -- softsign is more reliable at reaching high performance but less likely to reach the absolute maximum
+4. **Pure backprop (lambda=1.0) is slightly worse** with softsign (mean 6.80, 0% D=9) than with tanh (mean 6.91, 3% D=9)
+5. **Practical implication**: softsign makes the architecture more robust to hyperparameter choice, reducing the sensitivity to the exact lambda value
+
 ## Conclusions
 
 1. **Hybrid PC-backprop learning at lambda=0.99 is a statistically significant improvement** over pure backprop for the PC-Actor-Critic architecture on Tic-Tac-Toe
@@ -179,6 +212,7 @@ With standard ResNet (1.0): PC prediction errors are meaningful in magnitude, bu
 6. Bounded activations (tanh) are required for PC loop stability
 7. **The DPC mechanism (lambda=0.99) is specific to single-layer topologies** -- multi-layer networks with residual skip connections cannot benefit from PC error blending
 8. **Optimal architecture: 1 hidden layer (27 neurons) + lambda=0.99** -- outperforms all multi-layer variants tested
+9. **Softsign is a viable alternative to tanh** -- equivalent performance at lambda=0.99, with the bonus of widening the effective lambda range (0.97-0.99 vs only 0.99)
 
 ## Reproduction
 

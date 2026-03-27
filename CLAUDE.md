@@ -139,6 +139,7 @@ Hybrid blend: `delta = λ * backprop_grad + (1-λ) * pc_prediction_error`
 | Activation | Depth | Notes |
 |------------|-------|-------|
 | tanh | 8 | Baseline. Bounded output stabilizes PC loop |
+| softsign | — | Equivalent to tanh (mean 7.89 vs 7.94 at λ=0.99, N=35). Widens effective lambda range (0.97-0.99 vs only 0.99) |
 | relu | 4 | Dying neurons: PC loop pushes activations negative permanently |
 | elu | 6 | Unbounded positives: PC loop creates unstable feedback → policy collapse |
 
