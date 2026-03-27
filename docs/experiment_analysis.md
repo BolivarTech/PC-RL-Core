@@ -159,5 +159,9 @@ A candidate chromosome: `[hidden_size, alpha, lr, lambda, temperature, ...]` wit
 
 ## References
 
-- Millidge, B., Seth, A., & Buckley, C. L. (2022). Predictive Coding Approximates Backprop Along Arbitrary Computation Graphs. *Neural Computation*, 34(6), 1329-1368.
+- Millidge, B., Seth, A., & Buckley, C. L. (2022). [Predictive Coding Approximates Backprop Along Arbitrary Computation Graphs](https://direct.mit.edu/neco/article/34/6/1329/107068). *Neural Computation*, 34(6), 1329-1368.
 - Whittington, J. C., & Bogacz, R. (2017). An Approximation of the Error Backpropagation Algorithm in a Predictive Coding Network with Local Hebbian Synaptic Plasticity. *Neural Computation*, 29(5), 1229-1262.
+- Ororbia, A., & Mali, A. (2023). [Active Predictive Coding: Brain-Inspired Reinforcement Learning for Sparse Reward Robotic Control Problems](https://ieeexplore.ieee.org/document/10160530). *IEEE ICRA 2023*.
+- Friston, K., Daunizeau, J., & Kiebel, S. (2009). [Reinforcement Learning or Active Inference?](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0006421) *PLOS ONE*, 4(7), e6421.
+
+See [pc_actor_critic_paper.md](pc_actor_critic_paper.md) for the complete reference list.
