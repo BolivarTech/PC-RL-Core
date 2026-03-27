@@ -1135,6 +1135,145 @@ mod tests {
 
     // ── Local Learning (PC-based weight updates) Tests ──────────
 
+    // ── Residual Inference Tests ──────────────────────────────
+
+    #[test]
+    fn test_residual_false_identical_to_non_residual() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let mut rng1 = make_rng();
+        let actor1 = PcActor::new(two_hidden_config(), &mut rng1).unwrap();
+        let result1 = actor1.infer(&input);
+
+        let mut rng2 = make_rng();
+        let config2 = PcActorConfig {
+            residual: false,
+            ..two_hidden_config()
+        };
+        let actor2 = PcActor::new(config2, &mut rng2).unwrap();
+        let result2 = actor2.infer(&input);
+
+        for (a, b) in result1.y_conv.iter().zip(result2.y_conv.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_residual_rezero_zero_second_hidden_near_identity() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            rezero_init: 0.0,
+            alpha: 0.0,
+            ..residual_two_hidden_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        let h0 = &result.hidden_states[0];
+        let h1 = &result.hidden_states[1];
+        for (a, b) in h0.iter().zip(h1.iter()) {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "With rezero_init=0, h[1] should equal h[0]"
+            );
+        }
+    }
+
+    #[test]
+    fn test_residual_infer_all_outputs_finite() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        for &v in &result.y_conv {
+            assert!(v.is_finite());
+        }
+        for &v in &result.latent_concat {
+            assert!(v.is_finite());
+        }
+        assert!(result.surprise_score.is_finite());
+    }
+
+    #[test]
+    fn test_residual_latent_concat_size() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        assert_eq!(result.latent_concat.len(), 54); // 27 + 27
+    }
+
+    #[test]
+    fn test_residual_pc_loop_completes() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            alpha: 0.03,
+            max_steps: 5,
+            ..residual_two_hidden_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        assert!(result.steps_used > 0);
+        assert!(result.steps_used <= 5);
+    }
+
+    #[test]
+    fn test_residual_hidden_states_count() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        assert_eq!(result.hidden_states.len(), 2);
+    }
+
+    #[test]
+    fn test_residual_infer_does_not_modify_weights() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let weights_before: Vec<Vec<f64>> =
+            actor.layers.iter().map(|l| l.weights.data.clone()).collect();
+        let alpha_before = actor.rezero_alpha.clone();
+        let _ = actor.infer(&[0.5; 9]);
+        for (i, layer) in actor.layers.iter().enumerate() {
+            assert_eq!(layer.weights.data, weights_before[i]);
+        }
+        assert_eq!(actor.rezero_alpha, alpha_before);
+    }
+
+    #[test]
+    fn test_residual_three_hidden_infer_finite() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        for &v in &result.y_conv {
+            assert!(v.is_finite());
+        }
+    }
+
+    #[test]
+    fn test_residual_tanh_components_populated() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        assert_eq!(result.tanh_components.len(), 2);
+        assert!(result.tanh_components[0].is_none()); // layer 0: no skip
+        assert!(result.tanh_components[1].is_some()); // layer 1: has skip
+        assert_eq!(result.tanh_components[1].as_ref().unwrap().len(), 27);
+    }
+
     fn local_learning_config() -> PcActorConfig {
         PcActorConfig {
             local_lambda: 0.0,
