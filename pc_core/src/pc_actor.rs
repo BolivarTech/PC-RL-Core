@@ -54,13 +54,19 @@ pub struct PcActorConfig {
     pub output_size: usize,
     /// Activation function for the output layer.
     pub output_activation: Activation,
-    /// Inference learning rate for PC loop updates.
+    /// Inference learning rate for PC loop state updates (`h += alpha * error`).
+    /// Set to 0.0 to disable PC inference (network behaves as standard MLP).
+    /// Active regardless of `residual` setting.
     pub alpha: f64,
     /// Convergence threshold for RMS prediction error.
+    /// PC loop exits early when surprise < tol (after at least `min_steps`).
+    /// Active regardless of `residual` setting.
     pub tol: f64,
-    /// Minimum inference steps before convergence check.
+    /// Minimum PC inference steps before convergence check is allowed.
+    /// Active regardless of `residual` setting.
     pub min_steps: usize,
-    /// Maximum inference steps.
+    /// Maximum PC inference steps per action.
+    /// Active regardless of `residual` setting.
     pub max_steps: usize,
     /// Base learning rate for weight updates.
     pub lr_weights: f64,
@@ -84,9 +90,20 @@ pub struct PcActorConfig {
     #[serde(default = "default_local_lambda")]
     pub local_lambda: f64,
     /// Enable residual skip connections between same-dimension hidden layers.
+    /// When false, `rezero_init` is ignored. When true, all hidden layers
+    /// must have the same size, and skip connections with learnable ReZero
+    /// scaling are added between consecutive hidden layers (not the first,
+    /// since input_size typically differs from hidden_size).
     #[serde(default)]
     pub residual: bool,
     /// Initial value for ReZero scaling factors on residual connections.
+    /// Only used when `residual = true`. Controls initial contribution of
+    /// the nonlinear component: `h[i] = rezero_init * tanh(...) + h[i-1]`.
+    ///
+    /// - `0.001` — Near-identity start (ReZero: network learns depth gradually)
+    /// - `1.0` — Standard ResNet residual (full contribution from start)
+    ///
+    /// Ignored when `residual = false`.
     #[serde(default = "default_rezero_init")]
     pub rezero_init: f64,
 }
