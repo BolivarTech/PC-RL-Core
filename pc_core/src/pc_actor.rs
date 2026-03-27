@@ -921,6 +921,85 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── Residual / ReZero Config Tests ────────────────────────
+
+    #[test]
+    fn test_default_config_residual_false() {
+        let config = default_config();
+        assert!(!config.residual);
+    }
+
+    #[test]
+    fn test_default_config_rezero_init() {
+        let config = default_config();
+        assert!((config.rezero_init - 0.001).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_new_negative_rezero_init_returns_error() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            rezero_init: -0.1,
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_residual_mismatched_hidden_sizes_returns_error() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_residual_same_size_hidden_layers_accepted() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_residual_single_hidden_accepted() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_ok());
+    }
+
     // ── Local Learning (PC-based weight updates) Tests ──────────
 
     fn local_learning_config() -> PcActorConfig {
