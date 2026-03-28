@@ -205,6 +205,11 @@ pub struct PcActor {
     /// ReZero scaling factors for eligible skip connections.
     /// One entry per hidden layer that has a skip connection (index >= 1, same size as previous).
     pub(crate) rezero_alpha: Vec<f64>,
+    /// Auxiliary linear heads for hidden layer gradient injection.
+    /// One per hidden layer when `aux_loss_coefficient > 0`. Maps hidden_size → output_size.
+    /// Used in `update_weights_hybrid()` for gradient injection.
+    #[allow(dead_code)] // Used in Cycle 3
+    pub(crate) aux_heads: Vec<Layer>,
 }
 
 impl PcActor {
@@ -291,10 +296,22 @@ impl PcActor {
             Vec::new()
         };
 
+        // Create auxiliary heads: one linear projection per hidden layer
+        let aux_heads = if config.aux_loss_coefficient > 0.0 {
+            config
+                .hidden_layers
+                .iter()
+                .map(|def| Layer::new(def.size, config.output_size, Activation::Linear, rng))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             layers,
             config,
             rezero_alpha,
+            aux_heads,
         })
     }
 

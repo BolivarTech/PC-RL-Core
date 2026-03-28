@@ -168,6 +168,7 @@ pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError>
         layers: save_file.actor_weights.layers,
         config: save_file.config.actor.clone(),
         rezero_alpha: save_file.actor_weights.rezero_alpha,
+        aux_heads: Vec::new(), // Restored from save file in Cycle 4
     };
 
     let critic = MlpCritic::from_weights(
