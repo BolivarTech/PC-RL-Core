@@ -83,6 +83,9 @@ pub struct TrainArgs {
     /// Initial ReZero scaling factor for residual connections.
     #[arg(long)]
     pub rezero_init: Option<f64>,
+    /// Auxiliary loss coefficient for hidden layer gradient injection.
+    #[arg(long)]
+    pub aux_loss_coefficient: Option<f64>,
 }
 
 /// Arguments for the play subcommand.
@@ -169,6 +172,10 @@ pub fn run_train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(ri) = args.rezero_init {
         config.agent.actor.rezero_init = ri;
+    }
+
+    if let Some(aux) = args.aux_loss_coefficient {
+        config.agent.actor.aux_loss_coefficient = aux;
     }
 
     config.validate()?;
@@ -460,6 +467,7 @@ temperature = 1.0
 local_lambda = 0.99
 residual = false
 rezero_init = 0.001
+aux_loss_coefficient = 0.0
 
 [[agent.actor.hidden_layers]]
 size = 27
