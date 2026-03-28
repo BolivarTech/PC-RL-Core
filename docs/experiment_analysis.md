@@ -230,6 +230,45 @@ Testing whether softsign's gradient preservation enables 2-layer networks to wor
 4. **Still inferior to 1-layer** (mean 7.31 vs 7.89-7.94) -- depth penalty from 2 layers persists but is reduced
 5. **Confirms the vanishing gradient analysis**: softsign preserves more gradient at high saturation, directly translating to better multi-layer performance
 
+### Phase 8: Two-Layer Softsign with Residual (N=35, 2×27h, rezero_init=0.1)
+
+Testing whether softsign + moderate residual (rezero_init=0.1) can combine gradient preservation from both mechanisms.
+
+| Lambda | N | Mean Depth | D>=7 | D>=8 | D=9 | p-value vs 1.0 |
+|--------|---|-----------|------|------|-----|----------------|
+| 0.95 | 35 | 2.11 | 0% | 0% | 0% | 0.0000 \*\* |
+| 0.96 | 35 | 1.83 | 0% | 0% | 0% | 0.0000 \*\* |
+| 0.97 | 35 | 2.20 | 0% | 0% | 0% | 0.0000 \*\* |
+| 0.98 | 35 | 3.03 | 9% | 0% | 0% | 0.0000 \*\* |
+| 0.99 | 35 | 3.94 | 3% | 0% | 0% | 0.0000 \*\* |
+| **1.00** | **35** | **6.66** | **60%** | **17%** | **0%** | **baseline** |
+
+#### Finding
+
+**Residual connections destroy the DPC mechanism regardless of activation function or rezero_init value.** Softsign does not rescue the residual + lambda<1.0 combination. The pattern is consistent across all 4 residual experiments:
+
+| Config (2 layers, lambda=0.99) | Mean | D>=8 |
+|-------------------------------|------|------|
+| softsign, no residual | 7.31 | 20% |
+| tanh, no residual | 6.63 | 3% |
+| softsign, residual rz=0.1 | 3.94 | 0% |
+| tanh, residual rz=0.001 | 3.40 | 0% |
+| tanh, residual rz=1.0 | 3.34 | 0% |
+
+The skip connection identity path creates a structural incompatibility with the PC error blend. When gradients flow through both the nonlinear path (scaled by rezero_alpha) and the identity path simultaneously, the PC prediction errors -- which target only the nonlinear component -- become misaligned with the composite gradient signal. This misalignment worsens with any lambda < 1.0, regardless of how the residual is scaled.
+
+### Global Results Summary (lambda=0.99)
+
+| Rank | Config | Mean Depth | D>=8 | D=9 |
+|------|--------|-----------|------|-----|
+| 1 | 1-layer tanh | 7.94 | 57% | 37% |
+| 2 | 1-layer softsign | 7.89 | 63% | 31% |
+| 3 | 2-layer softsign (no residual) | 7.31 | 20% | 17% |
+| 4 | 2-layer tanh (no residual) | 6.63 | 3% | 0% |
+| 5 | 2-layer softsign (residual rz=0.1) | 3.94 | 0% | 0% |
+| 6 | 2-layer tanh (residual rz=0.001) | 3.40 | 0% | 0% |
+| 7 | 2-layer tanh (residual rz=1.0) | 3.34 | 0% | 0% |
+
 ## Conclusions
 
 1. **Hybrid PC-backprop learning at lambda=0.99 is a statistically significant improvement** over pure backprop for the PC-Actor-Critic architecture on Tic-Tac-Toe
@@ -242,6 +281,7 @@ Testing whether softsign's gradient preservation enables 2-layer networks to wor
 8. **Optimal architecture: 1 hidden layer (27 neurons) + lambda=0.99** -- outperforms all multi-layer variants tested
 9. **Softsign is a viable alternative to tanh** -- equivalent performance at lambda=0.99, with the bonus of widening the effective lambda range (0.97-0.99 vs only 0.99)
 10. **Softsign mitigates vanishing gradient in 2-layer networks** -- 2-layer softsign (mean 7.31, 17% D=9) significantly outperforms 2-layer tanh (mean 6.63, 0% D=9), confirming the gradient preservation hypothesis
+11. **Residual skip connections are incompatible with DPC (lambda<1.0)** across all tested configurations -- tanh/softsign, rezero 0.001/0.1/1.0. The identity path creates structural misalignment with PC prediction errors. Without residual, 2-layer softsign is the best multi-layer option
 
 ## Reproduction
 
