@@ -1197,6 +1197,136 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // ── Auxiliary Loss Gradient Tests ─────────────────────────
+
+    #[test]
+    fn test_aux_disabled_update_identical_to_baseline() {
+        let input = vec![0.5; 9];
+        let delta = vec![0.1; 9];
+
+        let mut rng1 = make_rng();
+        let mut actor1 = PcActor::new(default_config(), &mut rng1).unwrap();
+        let infer1 = actor1.infer(&input);
+        actor1.update_weights(&delta, &infer1, &input, 1.0);
+
+        let mut rng2 = make_rng();
+        let config2 = PcActorConfig {
+            aux_loss_coefficient: 0.0,
+            ..default_config()
+        };
+        let mut actor2 = PcActor::new(config2, &mut rng2).unwrap();
+        let infer2 = actor2.infer(&input);
+        actor2.update_weights(&delta, &infer2, &input, 1.0);
+
+        for (l1, l2) in actor1.layers.iter().zip(actor2.layers.iter()) {
+            for (w1, w2) in l1.weights.data.iter().zip(l2.weights.data.iter()) {
+                assert!((w1 - w2).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn test_aux_enabled_changes_hidden_weights_differently() {
+        let input = vec![0.5; 9];
+        let delta = vec![0.1; 9];
+
+        let mut rng1 = make_rng();
+        let mut actor_no_aux = PcActor::new(default_config(), &mut rng1).unwrap();
+        let infer1 = actor_no_aux.infer(&input);
+        actor_no_aux.update_weights(&delta, &infer1, &input, 1.0);
+
+        let mut rng2 = make_rng();
+        let config2 = PcActorConfig {
+            aux_loss_coefficient: 0.5,
+            ..default_config()
+        };
+        let mut actor_aux = PcActor::new(config2, &mut rng2).unwrap();
+        let infer2 = actor_aux.infer(&input);
+        actor_aux.update_weights(&delta, &infer2, &input, 1.0);
+
+        let differs = actor_no_aux.layers[0]
+            .weights
+            .data
+            .iter()
+            .zip(actor_aux.layers[0].weights.data.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-12);
+        assert!(differs, "Aux loss should change hidden layer gradient");
+    }
+
+    #[test]
+    fn test_aux_heads_weights_change_after_update() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            aux_loss_coefficient: 0.1,
+            ..default_config()
+        };
+        let mut actor = PcActor::new(config, &mut rng).unwrap();
+        let aux_w_before = actor.aux_heads[0].weights.data.clone();
+        let input = vec![0.5; 9];
+        let infer = actor.infer(&input);
+        actor.update_weights(&[0.1; 9], &infer, &input, 1.0);
+        assert_ne!(
+            actor.aux_heads[0].weights.data, aux_w_before,
+            "Aux head weights should update"
+        );
+    }
+
+    #[test]
+    fn test_aux_output_layer_unaffected() {
+        let input = vec![0.5; 9];
+        let delta = vec![0.1; 9];
+
+        let mut rng1 = make_rng();
+        let mut actor1 = PcActor::new(default_config(), &mut rng1).unwrap();
+        let infer1 = actor1.infer(&input);
+        actor1.update_weights(&delta, &infer1, &input, 1.0);
+
+        let mut rng2 = make_rng();
+        let config2 = PcActorConfig {
+            aux_loss_coefficient: 0.5,
+            ..default_config()
+        };
+        let mut actor2 = PcActor::new(config2, &mut rng2).unwrap();
+        let infer2 = actor2.infer(&input);
+        actor2.update_weights(&delta, &infer2, &input, 1.0);
+
+        let out_idx = actor1.layers.len() - 1;
+        for (w1, w2) in actor1.layers[out_idx]
+            .weights
+            .data
+            .iter()
+            .zip(actor2.layers[out_idx].weights.data.iter())
+        {
+            assert!(
+                (w1 - w2).abs() < 1e-12,
+                "Output layer should not be affected by aux loss"
+            );
+        }
+    }
+
+    #[test]
+    fn test_aux_all_weights_finite() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            aux_loss_coefficient: 0.5,
+            ..two_hidden_config()
+        };
+        let mut actor = PcActor::new(config, &mut rng).unwrap();
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let infer = actor.infer(&input);
+        actor.update_weights(&[0.3; 9], &infer, &input, 1.0);
+        for layer in &actor.layers {
+            for &w in &layer.weights.data {
+                assert!(w.is_finite());
+            }
+        }
+        for head in &actor.aux_heads {
+            for &w in &head.weights.data {
+                assert!(w.is_finite());
+            }
+        }
+    }
+
     // ── Residual / ReZero Config Tests ────────────────────────
 
     #[test]
