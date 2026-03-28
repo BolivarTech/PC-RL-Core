@@ -1128,6 +1128,48 @@ mod tests {
     }
 
     #[test]
+    fn test_aux_heads_empty_when_disabled() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
+        assert!(actor.aux_heads.is_empty());
+    }
+
+    #[test]
+    fn test_aux_heads_one_per_hidden_layer() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            aux_loss_coefficient: 0.1,
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        assert_eq!(actor.aux_heads.len(), 1);
+    }
+
+    #[test]
+    fn test_aux_heads_two_hidden() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            aux_loss_coefficient: 0.1,
+            ..two_hidden_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        assert_eq!(actor.aux_heads.len(), 2);
+    }
+
+    #[test]
+    fn test_aux_head_dimensions() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            aux_loss_coefficient: 0.1,
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        // hidden_size=18 -> output_size=9, Linear activation
+        assert_eq!(actor.aux_heads[0].weights.rows, 9);
+        assert_eq!(actor.aux_heads[0].weights.cols, 18);
+    }
+
+    #[test]
     fn test_new_positive_aux_loss_accepted() {
         let mut rng = make_rng();
         let config = PcActorConfig {
