@@ -329,6 +329,32 @@ The auxiliary head computes `aux_logits = W_aux × h[i]` and minimizes `||aux_lo
 
 A better auxiliary loss would need to carry reward information directly (e.g., auxiliary policy head with advantage weighting), but this requires passing action/advantage data into the backward pass, which is a more invasive change.
 
+### Phase 11: Auxiliary Loss Coefficient Sweep (N=35, 2×27h softsign, λ=0.99)
+
+Full sweep of aux_loss_coefficient from 0.05 to 0.50 in steps of 0.05, with lambda fixed at 0.99.
+
+| Aux Coeff | N | Mean Depth | D>=7 | D>=8 | D=9 |
+|-----------|---|-----------|------|------|-----|
+| 0.05 | 35 | 6.57 | 57% | 0% | 0% |
+| 0.10 | 35 | 6.74 | 71% | 3% | 0% |
+| 0.15 | 35 | 6.66 | 66% | 0% | 0% |
+| 0.20 | 35 | 6.71 | 66% | 6% | 3% |
+| 0.25 | 35 | 6.69 | 63% | 3% | 3% |
+| 0.30 | 35 | 6.71 | 63% | 6% | 3% |
+| 0.35 | 35 | 6.77 | 74% | 3% | 0% |
+| 0.40 | 35 | 6.74 | 69% | 6% | 0% |
+| 0.45 | 35 | 6.60 | 60% | 0% | 0% |
+| 0.50 | 35 | 6.77 | 71% | 6% | 0% |
+
+No value is statistically significant vs aux=0.05 (all p > 0.09).
+
+#### Findings
+
+1. **No sweet spot exists** -- the entire range 0.05-0.50 produces uniformly mediocre results (mean 6.57-6.77)
+2. **All aux values degrade vs no-aux baseline** -- mean ~6.7 vs 7.31 without aux. A consistent ~0.5 depth loss
+3. **Flat response** -- no aux value differentiates from any other. The problem is the mechanism itself, not the coefficient
+4. **MSE auxiliary loss definitively ruled out** -- tested across 10 coefficient values × 35 seeds (350 runs), confirming the reconstruction gradient fundamentally conflicts with policy optimization
+
 ## Conclusions
 
 1. **Hybrid PC-backprop learning at lambda=0.99 is a statistically significant improvement** over pure backprop for the PC-Actor-Critic architecture on Tic-Tac-Toe
