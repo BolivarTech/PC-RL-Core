@@ -57,6 +57,9 @@ pub struct PcActorWeights {
     /// ReZero scaling factors for residual skip connections.
     #[serde(default)]
     pub rezero_alpha: Vec<f64>,
+    /// Auxiliary linear heads for hidden layer gradient injection.
+    #[serde(default)]
+    pub aux_heads: Vec<Layer>,
 }
 
 /// Complete save file containing agent state and metadata.
@@ -106,6 +109,7 @@ pub fn save_agent(
         actor_weights: PcActorWeights {
             layers: agent.actor.layers.clone(),
             rezero_alpha: agent.actor.rezero_alpha.clone(),
+            aux_heads: agent.actor.aux_heads.clone(),
         },
         critic_weights: crate::mlp_critic::MlpCriticWeights {
             layers: agent.critic.layers.clone(),
@@ -168,7 +172,7 @@ pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError>
         layers: save_file.actor_weights.layers,
         config: save_file.config.actor.clone(),
         rezero_alpha: save_file.actor_weights.rezero_alpha,
-        aux_heads: Vec::new(), // Restored from save file in Cycle 4
+        aux_heads: save_file.actor_weights.aux_heads,
     };
 
     let critic = MlpCritic::from_weights(
@@ -578,6 +582,47 @@ mod tests {
         save_agent(&agent, &path, 10, None).unwrap();
         let (loaded, _) = load_agent(&path).unwrap();
         assert!(loaded.actor.rezero_alpha.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_roundtrip_preserves_aux_heads() {
+        let config = PcActorCriticConfig {
+            actor: PcActorConfig {
+                aux_loss_coefficient: 0.1,
+                ..default_config().actor
+            },
+            ..default_config()
+        };
+        let agent = PcActorCritic::new(config, 42).unwrap();
+        assert_eq!(agent.actor.aux_heads.len(), 1);
+
+        let path = temp_path("test_aux_roundtrip.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+        let (loaded, _) = load_agent(&path).unwrap();
+        assert_eq!(loaded.actor.aux_heads.len(), 1);
+        for (a, b) in agent.actor.aux_heads[0]
+            .weights
+            .data
+            .iter()
+            .zip(loaded.actor.aux_heads[0].weights.data.iter())
+        {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "Aux head weight mismatch: {a} vs {b}"
+            );
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_roundtrip_no_aux_backward_compat() {
+        let agent = make_agent();
+        assert!(agent.actor.aux_heads.is_empty());
+        let path = temp_path("test_no_aux_compat.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+        let (loaded, _) = load_agent(&path).unwrap();
+        assert!(loaded.actor.aux_heads.is_empty());
         let _ = fs::remove_file(&path);
     }
 }
