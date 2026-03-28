@@ -269,6 +269,33 @@ The skip connection identity path creates a structural incompatibility with the 
 | 6 | 2-layer tanh (residual rz=0.001) | 3.40 | 0% | 0% |
 | 7 | 2-layer tanh (residual rz=1.0) | 3.34 | 0% | 0% |
 
+### Phase 9: Auxiliary Loss on 1-Layer Baseline (N=35, 1×27h tanh, aux=0.1)
+
+Testing whether auxiliary loss as additional regularizer improves the single-layer DPC config.
+
+| Lambda | N | Mean Depth | D>=8 | D=9 | p-value vs 1.0 |
+|--------|---|-----------|------|-----|----------------|
+| 0.95 | 35 | 7.09 | 26% | 17% | 0.263 |
+| 0.96 | 35 | 6.91 | 20% | 14% | 0.661 |
+| 0.97 | 35 | 7.40 | 29% | 17% | 0.003 \*\* |
+| 0.98 | 35 | 7.37 | 37% | 29% | 0.044 \* |
+| **0.99** | **35** | **7.57** | **37%** | **29%** | **0.0006 \*\*** |
+| 1.00 | 35 | 6.80 | 11% | 3% | baseline |
+
+#### Comparison: aux=0.1 vs aux=0.0 (lambda=0.99)
+
+| Config | Mean | D>=8 | D=9 |
+|--------|------|------|-----|
+| 1-layer tanh, aux=0.0 | **7.94** | **57%** | **37%** |
+| 1-layer tanh, aux=0.1 | 7.57 | 37% | 29% |
+
+#### Findings
+
+1. **Auxiliary loss degrades single-layer performance** -- mean drops from 7.94 to 7.57, D>=8 from 57% to 37%
+2. **Positive effect on lambda range** -- lambda=0.97 and 0.98 become significant (like softsign), suggesting the aux gradient acts as a smoothing regularizer
+3. **Redundant in single-layer** -- backprop already reaches the hidden layer without attenuation. The aux MSE gradient points in a different direction than the policy gradient, diluting the reward signal instead of reinforcing it
+4. **Aux loss is designed for multi-layer networks** where backprop gradient is attenuated through cascaded activations. The next test should be aux=0.1 with 2-layer softsign
+
 ## Conclusions
 
 1. **Hybrid PC-backprop learning at lambda=0.99 is a statistically significant improvement** over pure backprop for the PC-Actor-Critic architecture on Tic-Tac-Toe
