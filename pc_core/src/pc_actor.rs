@@ -208,7 +208,6 @@ pub struct PcActor {
     /// Auxiliary linear heads for hidden layer gradient injection.
     /// One per hidden layer when `aux_loss_coefficient > 0`. Maps hidden_size → output_size.
     /// Used in `update_weights_hybrid()` for gradient injection.
-    #[allow(dead_code)] // Used in Cycle 3
     pub(crate) aux_heads: Vec<Layer>,
 }
 
@@ -662,6 +661,32 @@ impl PcActor {
                     .map(|(&bp, &pc)| lambda * bp + (1.0 - lambda) * pc)
                     .collect()
             };
+
+            // Auxiliary loss gradient injection: MSE(aux_logits, y_conv)
+            let effective_delta =
+                if self.config.aux_loss_coefficient > 0.0 && i < self.aux_heads.len() {
+                    let aux_logits = self.aux_heads[i].forward(&infer_result.hidden_states[i]);
+                    let coeff = self.config.aux_loss_coefficient;
+                    let scaled_mse_grad: Vec<f64> = aux_logits
+                        .iter()
+                        .zip(infer_result.y_conv.iter())
+                        .map(|(&a, &y)| coeff * (a - y))
+                        .collect();
+                    let propagated_aux = self.aux_heads[i].backward(
+                        &infer_result.hidden_states[i],
+                        &aux_logits,
+                        &scaled_mse_grad,
+                        self.config.lr_weights,
+                        surprise_scale,
+                    );
+                    effective_delta
+                        .iter()
+                        .zip(propagated_aux.iter())
+                        .map(|(&ed, &aux)| ed + aux)
+                        .collect()
+                } else {
+                    effective_delta
+                };
 
             if let Some(alpha_idx) = self.skip_alpha_index(i) {
                 // Skip-eligible layer: use tanh_out for derivative, scale by alpha,
