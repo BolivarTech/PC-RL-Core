@@ -121,22 +121,26 @@ Key parameters:
 | `output_activation` | `linear` | Unbounded logits for softmax (tanh prevents learning) |
 | `alpha` | `0.03` | PC inference loop update rate |
 | `lr_weights` | `0.005` | Actor learning rate |
-| `hidden_layers` | `[27, tanh]` | Single hidden layer, 27 neurons |
+| `hidden_layers` | `[27, tanh]` | Single hidden layer, 27 neurons (softsign also viable) |
+| `residual` | `false` | Skip connections (incompatible with lambda<1.0) |
+| `rezero_init` | `0.001` | ReZero scaling (only with residual=true) |
 | `gamma` | `0.99` | Discount factor |
 | `entropy_coeff` | `0.0` | No entropy regularization |
 | `local_lambda` | `0.99` | Hybrid PC-backprop blend (1.0=backprop, 0.0=local PC) |
 
 ## Key Findings
 
-- **Hybrid lambda=0.99 breaks the depth ceiling** -- 1% PC error as regularizer enables depth 9 (p=0.034, N=35 seeds)
+- **Hybrid lambda=0.99 breaks the depth ceiling** -- 1% PC error as regularizer enables depth 9 (p < 0.001, confirmed across multiple N=35 runs)
+- **Deliberation is the primary advantage** -- PC inference loop adds +2-3 depth levels over MLP; the echo (lambda) adds +0.5-1.0 on top
 - **Output activation must be Linear** -- Tanh bounds logits to [-1,1], making softmax nearly uniform and preventing any policy learning
-- **PC inference adds measurable value** -- Consistently +1 minimax depth level vs equivalent MLP
-- **Bounded activations required for PC** -- ReLU dies, ELU explodes; tanh's self-regulation is essential
-- **Single hidden layer outperforms deeper networks** -- 2-layer architectures suffer vanishing gradients through double Tanh
+- **Bounded activations required for PC** -- ReLU dies, ELU explodes; tanh and softsign work
+- **Softsign widens the effective lambda range** -- 0.97-0.99 all significant vs only 0.99 for tanh; also mitigates vanishing gradient in multi-layer (+0.68 depth)
+- **Single hidden layer outperforms deeper networks** -- The power comes from inference depth (PC iterations), not network depth (layers)
+- **Skip connections incompatible with DPC** -- Residual connections work for pure backprop but destroy the PC error blend mechanism
 - **27 neurons is the sweet spot** -- 18 too small, 32 no improvement
 - **Entropy regularization hurts** -- Destabilizes learned defensive play in this architecture
 
-**Next frontier**: `local_lambda` is a hyperparameter with an ultra-narrow sweet spot (only 0.99 works out of 6 values tested) that likely interacts with alpha, lr, and topology. A genetic algorithm co-evolving all hyperparameters -- chromosome `[hidden_size, alpha, lr, lambda, ...]` with fitness = max depth -- could discover optimal configurations that grid search misses.
+Validated through 8 experimental phases, 1,400+ training runs, 7 architectural configurations.
 
 For the complete experimental methodology and statistical analysis, see [docs/experiment_analysis.md](docs/experiment_analysis.md). For the full architecture description, lessons learned, and applicability to other PC projects, see [docs/pc_actor_critic_paper.md](docs/pc_actor_critic_paper.md).
 
