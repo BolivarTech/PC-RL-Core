@@ -2,10 +2,11 @@
 // Version: 1.0.0
 // Date: 2026-03-26
 
-//! Lambda sweep experiment runner.
+//! Parameter sweep experiment runner.
 //!
-//! Runs training across a range of `local_lambda` values with random seeds,
+//! Runs training across a range of hyperparameter values with random seeds,
 //! collecting max depth and final metrics for each combination.
+//! Supports sweeping `local_lambda` or `aux_loss_coefficient`.
 
 use std::fmt;
 use std::io::Write;
@@ -14,6 +15,33 @@ use crate::training::trainer::Trainer;
 use crate::utils::config::AppConfig;
 use pc_core::pc_actor_critic::PcActorCritic;
 
+/// Which hyperparameter to sweep in the experiment.
+#[derive(Debug, Clone, Copy)]
+pub enum SweepParam {
+    /// Sweep local_lambda [0.95, 0.96, ..., 1.00] (6 values).
+    Lambda,
+    /// Sweep aux_loss_coefficient [0.05, 0.10, ..., 0.50] (10 values).
+    AuxLoss,
+}
+
+impl SweepParam {
+    /// Returns the sweep values for this parameter.
+    pub fn values(&self) -> Vec<f64> {
+        match self {
+            SweepParam::Lambda => vec![0.95, 0.96, 0.97, 0.98, 0.99, 1.00],
+            SweepParam::AuxLoss => (1..=10).map(|i| i as f64 * 0.05).collect(),
+        }
+    }
+
+    /// Returns the parameter name for display.
+    pub fn name(&self) -> &'static str {
+        match self {
+            SweepParam::Lambda => "lambda",
+            SweepParam::AuxLoss => "aux",
+        }
+    }
+}
+
 /// Result of a single training run within an experiment.
 #[derive(Debug, Clone)]
 pub struct RunResult {
@@ -21,6 +49,8 @@ pub struct RunResult {
     pub seed: u64,
     /// local_lambda value used.
     pub lambda: f64,
+    /// aux_loss_coefficient value used.
+    pub aux_coefficient: f64,
     /// Maximum curriculum depth reached.
     pub max_depth: usize,
     /// Final win rate at end of training.
@@ -38,6 +68,7 @@ impl fmt::Display for RunResult {
         writeln!(f, "============")?;
         writeln!(f, "seed={}", self.seed)?;
         writeln!(f, "lambda={:.2}", self.lambda)?;
+        writeln!(f, "aux={:.2}", self.aux_coefficient)?;
         for line in &self.log_lines {
             writeln!(f, "{line}")?;
         }
@@ -107,12 +138,126 @@ pub fn run_single(
     Ok(RunResult {
         seed,
         lambda,
+        aux_coefficient: config.agent.actor.aux_loss_coefficient,
         max_depth: trainer.current_depth(),
         win_rate: trainer.metrics().win_rate(),
         loss_rate: trainer.metrics().loss_rate(),
         draw_rate: trainer.metrics().draw_rate(),
         log_lines,
     })
+}
+
+/// Runs a single training cycle with the given seed and sweep parameter.
+///
+/// # Arguments
+///
+/// * `base_config` - Base configuration.
+/// * `seed` - Random seed.
+/// * `sweep` - Which parameter to sweep.
+/// * `value` - The sweep value to use.
+///
+/// # Errors
+///
+/// Returns an error if agent creation or config conversion fails.
+pub fn run_single_with_sweep(
+    base_config: &AppConfig,
+    seed: u64,
+    sweep: SweepParam,
+    value: f64,
+) -> Result<RunResult, Box<dyn std::error::Error>> {
+    let mut config = base_config.clone();
+    config.training.seed = seed;
+    match sweep {
+        SweepParam::Lambda => config.agent.actor.local_lambda = value,
+        SweepParam::AuxLoss => config.agent.actor.aux_loss_coefficient = value,
+    }
+
+    let agent_config = config.to_agent_config()?;
+    let agent = PcActorCritic::new(agent_config, seed)?;
+
+    let episodes = config.training.episodes;
+    let log_interval = config.training.log_interval;
+    let mut trainer = Trainer::new(agent, &config);
+
+    let mut log_lines = Vec::new();
+    let mut prev_depth = 1;
+
+    for _ in 0..episodes {
+        let trajectory = trainer.run_episode_pub();
+        trainer.agent_mut().learn(&trajectory);
+        trainer.record_and_advance();
+
+        if log_interval > 0 && trainer.episode_count().is_multiple_of(log_interval) {
+            let line = format!(
+                "[ep {:>6}/{total}] win={win:.1}% loss={loss:.1}% draw={draw:.1}% | depth={depth}",
+                trainer.episode_count(),
+                total = episodes,
+                win = trainer.metrics().win_rate() * 100.0,
+                loss = trainer.metrics().loss_rate() * 100.0,
+                draw = trainer.metrics().draw_rate() * 100.0,
+                depth = trainer.current_depth(),
+            );
+            log_lines.push(line);
+        }
+
+        let cur_depth = trainer.current_depth();
+        if prev_depth != cur_depth {
+            log_lines.push(format!(
+                "  >> Curriculum advanced: depth {prev_depth} -> {cur_depth}"
+            ));
+            prev_depth = cur_depth;
+        }
+    }
+
+    Ok(RunResult {
+        seed,
+        lambda: config.agent.actor.local_lambda,
+        aux_coefficient: config.agent.actor.aux_loss_coefficient,
+        max_depth: trainer.current_depth(),
+        win_rate: trainer.metrics().win_rate(),
+        loss_rate: trainer.metrics().loss_rate(),
+        draw_rate: trainer.metrics().draw_rate(),
+        log_lines,
+    })
+}
+
+/// Runs a full experiment: N repetitions × parameter sweep.
+///
+/// For each repetition, generates a random seed and runs training for each
+/// value of the swept parameter.
+///
+/// # Arguments
+///
+/// * `base_config` - Base configuration.
+/// * `n` - Number of repetitions (random seeds).
+/// * `sweep` - Which parameter to sweep.
+/// * `output` - Writer for results.
+///
+/// # Errors
+///
+/// Returns an error on training or I/O failures.
+pub fn run_experiment_sweep<W: Write>(
+    base_config: &AppConfig,
+    n: usize,
+    sweep: SweepParam,
+    output: &mut W,
+) -> Result<Vec<RunResult>, Box<dyn std::error::Error>> {
+    let values = sweep.values();
+    let mut all_results = Vec::new();
+    let mut rng = rand::thread_rng();
+
+    for _ in 0..n {
+        let seed: u64 = rand::Rng::gen(&mut rng);
+
+        for &value in &values {
+            let result = run_single_with_sweep(base_config, seed, sweep, value)?;
+            write!(output, "{result}")?;
+            output.flush()?;
+            all_results.push(result);
+        }
+    }
+
+    Ok(all_results)
 }
 
 /// Runs a full experiment: N repetitions × lambda sweep.
@@ -208,6 +353,7 @@ mod tests {
         let result = RunResult {
             seed: 42,
             lambda: 0.99,
+            aux_coefficient: 0.0,
             max_depth: 8,
             win_rate: 0.0,
             loss_rate: 0.5,

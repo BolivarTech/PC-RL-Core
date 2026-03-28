@@ -122,6 +122,9 @@ pub struct ExperimentArgs {
     /// Path to TOML configuration file.
     #[arg(long, short, default_value = "config.toml")]
     pub config: String,
+    /// Parameter to sweep: "lambda" (default) or "aux".
+    #[arg(long, short, default_value = "lambda")]
+    pub sweep: String,
 }
 
 /// Arguments for the init subcommand.
@@ -536,10 +539,20 @@ impl<A: io::Write, B: io::Write> io::Write for MultiWriter<A, B> {
 ///
 /// Returns an error on config/IO/training failures.
 pub fn run_experiment(args: ExperimentArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::training::experiment;
+    use crate::training::experiment::{self, SweepParam};
 
     let config = AppConfig::load(Path::new(&args.config))?;
     config.validate()?;
+
+    let sweep = match args.sweep.to_lowercase().as_str() {
+        "lambda" => SweepParam::Lambda,
+        "aux" => SweepParam::AuxLoss,
+        other => {
+            return Err(
+                format!("Unknown sweep parameter '{other}'; expected 'lambda' or 'aux'").into(),
+            )
+        }
+    };
 
     let file = std::fs::File::create("experiment.txt")?;
     let stdout = io::stdout();
@@ -548,14 +561,17 @@ pub fn run_experiment(args: ExperimentArgs) -> Result<(), Box<dyn std::error::Er
         b: stdout.lock(),
     };
 
-    let results = experiment::run_experiment(&config, args.n, &mut writer)?;
+    let results = experiment::run_experiment_sweep(&config, args.n, sweep, &mut writer)?;
 
     // Summary table
+    let sweep_col = sweep.name();
     let summary = format!(
-        "\n=== SUMMARY ({} runs) ===\n{:<8} {:<8} {:<10} {:<10} {:<10} {:<10}\n{}\n",
+        "\n=== SUMMARY ({} runs, sweep={}) ===\n{:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10}\n{}\n",
         results.len(),
+        sweep_col,
         "seed",
         "lambda",
+        "aux",
         "max_depth",
         "win%",
         "loss%",
@@ -563,9 +579,10 @@ pub fn run_experiment(args: ExperimentArgs) -> Result<(), Box<dyn std::error::Er
         results
             .iter()
             .map(|r| format!(
-                "{:<8} {:<8.2} {:<10} {:<10.1} {:<10.1} {:<10.1}",
+                "{:<8} {:<8.2} {:<8.2} {:<10} {:<10.1} {:<10.1} {:<10.1}",
                 r.seed,
                 r.lambda,
+                r.aux_coefficient,
                 r.max_depth,
                 r.win_rate * 100.0,
                 r.loss_rate * 100.0,
