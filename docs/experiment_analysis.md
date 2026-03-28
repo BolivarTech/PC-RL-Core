@@ -296,6 +296,39 @@ Testing whether auxiliary loss as additional regularizer improves the single-lay
 3. **Redundant in single-layer** -- backprop already reaches the hidden layer without attenuation. The aux MSE gradient points in a different direction than the policy gradient, diluting the reward signal instead of reinforcing it
 4. **Aux loss is designed for multi-layer networks** where backprop gradient is attenuated through cascaded activations. The next test should be aux=0.1 with 2-layer softsign
 
+### Phase 10: Auxiliary Loss on 2-Layer Softsign (N=35, 2×27h softsign, aux=0.1)
+
+Testing whether auxiliary loss can inject fresh gradient into the first hidden layer of a 2-layer network, compensating for vanishing gradient.
+
+| Lambda | N | Mean Depth | D>=7 | D>=8 | D=9 | p-value vs 1.0 |
+|--------|---|-----------|------|------|-----|----------------|
+| 0.95 | 35 | 6.60 | 63% | 0% | 0% | 0.822 |
+| 0.96 | 35 | 6.54 | 54% | 0% | 0% | 0.813 |
+| 0.97 | 35 | 6.31 | 37% | 0% | 0% | 0.052 |
+| 0.98 | 35 | 6.74 | 69% | 3% | 3% | 0.204 |
+| 0.99 | 35 | 6.77 | 71% | 3% | 3% | 0.134 |
+| 1.00 | 35 | 6.57 | 57% | 0% | 0% | baseline |
+
+#### Comparison: aux=0.1 vs aux=0.0 on 2-layer softsign (lambda=0.99)
+
+| Config | Mean | D>=8 | D=9 |
+|--------|------|------|-----|
+| 2-layer softsign, aux=0.0 | **7.31** | **20%** | **17%** |
+| 2-layer softsign, aux=0.1 | 6.77 | 3% | 3% |
+
+#### Findings
+
+1. **Auxiliary loss degrades 2-layer performance** -- mean drops from 7.31 to 6.77, D>=8 from 20% to 3%
+2. **No lambda value is significant** -- the DPC effect (lambda<1.0) disappears entirely with aux=0.1
+3. **MSE auxiliary loss is fundamentally flawed for RL** -- the gradient from predicting output logits (MSE) carries reconstruction information, not reward information. Hidden layers optimize for "predict what the output says" instead of "learn representations that maximize reward"
+4. **Aux loss fails in both topologies** -- degrades 1-layer (Phase 9: 7.94→7.57) and 2-layer (7.31→6.77). The MSE against y_conv is not a valid proxy for the policy gradient
+
+#### Why MSE Auxiliary Loss Fails
+
+The auxiliary head computes `aux_logits = W_aux × h[i]` and minimizes `||aux_logits - y_conv||²`. The gradient `W_aux^T × (aux_logits - y_conv)` tells the hidden layer "adjust your representation so I can better predict the output logits." But the output logits are shaped by the policy gradient which changes every episode. The aux head chases a moving target while injecting a gradient that conflicts with the policy optimization direction.
+
+A better auxiliary loss would need to carry reward information directly (e.g., auxiliary policy head with advantage weighting), but this requires passing action/advantage data into the backward pass, which is a more invasive change.
+
 ## Conclusions
 
 1. **Hybrid PC-backprop learning at lambda=0.99 is a statistically significant improvement** over pure backprop for the PC-Actor-Critic architecture on Tic-Tac-Toe
@@ -309,6 +342,7 @@ Testing whether auxiliary loss as additional regularizer improves the single-lay
 9. **Softsign is a viable alternative to tanh** -- equivalent performance at lambda=0.99, with the bonus of widening the effective lambda range (0.97-0.99 vs only 0.99)
 10. **Softsign mitigates vanishing gradient in 2-layer networks** -- 2-layer softsign (mean 7.31, 17% D=9) significantly outperforms 2-layer tanh (mean 6.63, 0% D=9), confirming the gradient preservation hypothesis
 11. **Residual skip connections are incompatible with DPC (lambda<1.0)** across all tested configurations -- tanh/softsign, rezero 0.001/0.1/1.0. The identity path creates structural misalignment with PC prediction errors. Without residual, 2-layer softsign is the best multi-layer option
+12. **MSE auxiliary loss degrades performance in all topologies** -- the reconstruction gradient (predict output logits) conflicts with the policy gradient direction, diluting reward signal instead of reinforcing it
 
 ## Reproduction
 
