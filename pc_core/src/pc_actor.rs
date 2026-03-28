@@ -1089,6 +1089,36 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── Auxiliary Loss Config Tests ────────────────────────────
+
+    #[test]
+    fn test_default_config_aux_loss_zero() {
+        let config = default_config();
+        assert!(config.aux_loss_coefficient.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_new_negative_aux_loss_returns_error() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            aux_loss_coefficient: -0.1,
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_positive_aux_loss_accepted() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            aux_loss_coefficient: 0.5,
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_ok());
+    }
+
     // ── Residual / ReZero Config Tests ────────────────────────
 
     #[test]
