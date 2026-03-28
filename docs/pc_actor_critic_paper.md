@@ -559,6 +559,27 @@ Different weight initializations place the optimizer in different basins of attr
 
 **Invest in inference depth, not network depth.** A small network that thinks deeply (5 PC iterations over 550 parameters) outperforms a large network that reacts instantly. The DPC architecture achieves near-optimal play with 4-330x fewer parameters than published alternatives by trading compute for parameters through iterative deliberation.
 
+## 8. Future Work
+
+### Pending Experiments on Standard TTT
+
+- **Auxiliary loss on 1-layer baseline**: Test `aux_loss_coefficient` values (0.01-0.5) with the optimal 1-layer config (27h, tanh, lambda=0.99). The aux head injects direct gradient into the hidden layer via MSE against output logits — may act as complementary regularizer to the PC error echo.
+- **Auxiliary loss on 2-layer softsign**: Test whether aux loss can close the gap between 2-layer softsign (mean 7.31) and 1-layer tanh (mean 7.94) by providing fresh gradient to the first hidden layer.
+- **Combined softsign + aux loss sweep**: Explore the interaction between activation function, lambda, and aux coefficient across multiple seeds.
+- **Per-layer lambda**: Different lambda values per hidden layer — more PC error where backprop is weakest (deeper layers).
+
+### 4×4×4 3D Tic-Tac-Toe
+
+Once the optimal DPC configuration is established on standard TTT, validate on 4×4×4 3D Tic-Tac-Toe:
+
+- **Input**: 64 positions (vs 9) — tests whether DPC parameter efficiency scales
+- **State space**: ~10²⁰ states (comparable to Othello) — tabular methods fail, neural function approximation required
+- **Minimax**: Impractical at full depth — curriculum learning against bounded-depth minimax becomes essential
+- **Hypothesis**: PC deliberation should be even more valuable with complex spatial patterns across 3 dimensions
+- **Reference**: Van De Steeg et al. (IEEE 2015) used structured MLP with TD-learning; DPC could match or exceed with fewer parameters
+
+The standard TTT experiments serve as a fast, cheap testbed to identify what works before investing in the longer training cycles of 4×4×4.
+
 ---
 
 *Author: Julian Bolivar -- BolivarTech*
