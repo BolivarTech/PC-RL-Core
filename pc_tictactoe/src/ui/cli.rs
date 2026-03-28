@@ -52,6 +52,8 @@ pub enum Command {
     Benchmark(BenchmarkArgs),
     /// Run lambda sweep experiment with random seeds.
     Experiment(ExperimentArgs),
+    /// Generate default config.toml with optimal parameters.
+    Init(InitArgs),
 }
 
 /// Arguments for the train subcommand.
@@ -111,6 +113,14 @@ pub struct ExperimentArgs {
     /// Path to TOML configuration file.
     #[arg(long, short, default_value = "config.toml")]
     pub config: String,
+}
+
+/// Arguments for the init subcommand.
+#[derive(Parser)]
+pub struct InitArgs {
+    /// Output path for the generated config file.
+    #[arg(long, short, default_value = "config.toml")]
+    pub output: String,
 }
 
 /// Arguments for the benchmark subcommand.
@@ -393,6 +403,79 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+/// Generates a default config.toml with optimal parameters.
+///
+/// # Errors
+///
+/// Returns an error if the output file cannot be written.
+pub fn run_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let config = DEFAULT_CONFIG_TOML;
+
+    if Path::new(&args.output).exists() {
+        eprintln!("Warning: {} already exists. Overwriting.", args.output);
+    }
+
+    std::fs::write(&args.output, config)?;
+    println!("Config written to {}", args.output);
+    Ok(())
+}
+
+/// Default configuration TOML with optimal parameters.
+const DEFAULT_CONFIG_TOML: &str = r#"[agent]
+gamma = 0.99
+surprise_low = 0.02
+surprise_high = 0.15
+adaptive_surprise = false
+entropy_coeff = 0.0
+
+[agent.actor]
+input_size = 9
+output_size = 9
+output_activation = "linear"
+alpha = 0.03
+tol = 0.01
+min_steps = 1
+max_steps = 5
+lr_weights = 0.005
+synchronous = true
+temperature = 1.0
+local_lambda = 0.99
+
+[[agent.actor.hidden_layers]]
+size = 27
+activation = "tanh"
+
+[agent.critic]
+# input_size = actor.input_size + sum(hidden layer sizes)
+# 9 + 27 = 36
+input_size = 36
+output_activation = "linear"
+lr = 0.005
+
+[[agent.critic.hidden_layers]]
+size = 36
+activation = "tanh"
+
+[training]
+episodes = 50000
+checkpoint_interval = 5000
+log_interval = 500
+seed = 42
+
+[curriculum]
+advance_threshold = 0.95
+window_size = 1000
+
+[continuous]
+max_episodes = 50000
+surprise_threshold = 0.1
+
+[logger]
+level = "info"
+max_backups = 3
+max_size = 10485760
+"#;
+
 /// Writer that duplicates output to two writers (file + stdout).
 struct MultiWriter<A: io::Write, B: io::Write> {
     a: A,
@@ -492,5 +575,25 @@ mod tests {
         assert!(subs.contains(&"play"));
         assert!(subs.contains(&"evaluate"));
         assert!(subs.contains(&"benchmark"));
+        assert!(subs.contains(&"init"));
+    }
+
+    #[test]
+    fn test_default_config_toml_is_valid() {
+        let config: crate::utils::config::AppConfig = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
+        assert!(config.validate().is_ok());
+        assert!(config.to_agent_config().is_ok());
+    }
+
+    #[test]
+    fn test_default_config_toml_has_optimal_values() {
+        let config: crate::utils::config::AppConfig = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
+        assert_eq!(config.agent.actor.output_activation, "linear");
+        assert!((config.agent.actor.alpha - 0.03).abs() < 1e-12);
+        assert!((config.agent.actor.lr_weights - 0.005).abs() < 1e-12);
+        assert!((config.agent.actor.local_lambda - 0.99).abs() < 1e-12);
+        assert_eq!(config.agent.actor.hidden_layers.len(), 1);
+        assert_eq!(config.agent.actor.hidden_layers[0].size, 27);
+        assert_eq!(config.agent.critic.input_size, 36);
     }
 }

@@ -2,9 +2,9 @@
 // Version: 1.0.0
 // Date: 2026-03-26
 
-//! Lambda sweep experiment runner.
+//! Parameter sweep experiment runner.
 //!
-//! Runs training across a range of `local_lambda` values with random seeds,
+//! Runs training across a range of hyperparameter values with random seeds,
 //! collecting max depth and final metrics for each combination.
 
 use std::fmt;
@@ -13,6 +13,29 @@ use std::io::Write;
 use crate::training::trainer::Trainer;
 use crate::utils::config::AppConfig;
 use pc_core::pc_actor_critic::PcActorCritic;
+
+/// Which hyperparameter to sweep in the experiment.
+#[derive(Debug, Clone, Copy)]
+pub enum SweepParam {
+    /// Sweep local_lambda [0.95, 0.96, ..., 1.00] (6 values).
+    Lambda,
+}
+
+impl SweepParam {
+    /// Returns the sweep values for this parameter.
+    pub fn values(&self) -> Vec<f64> {
+        match self {
+            SweepParam::Lambda => vec![0.95, 0.96, 0.97, 0.98, 0.99, 1.00],
+        }
+    }
+
+    /// Returns the parameter name for display.
+    pub fn name(&self) -> &'static str {
+        match self {
+            SweepParam::Lambda => "lambda",
+        }
+    }
+}
 
 /// Result of a single training run within an experiment.
 #[derive(Debug, Clone)]
@@ -63,9 +86,32 @@ pub fn run_single(
     seed: u64,
     lambda: f64,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
+    run_single_with_sweep(base_config, seed, SweepParam::Lambda, lambda)
+}
+
+/// Runs a single training cycle with the given seed and sweep parameter.
+///
+/// # Arguments
+///
+/// * `base_config` - Base configuration.
+/// * `seed` - Random seed.
+/// * `sweep` - Which parameter to sweep.
+/// * `value` - The sweep value to use.
+///
+/// # Errors
+///
+/// Returns an error if agent creation or config conversion fails.
+pub fn run_single_with_sweep(
+    base_config: &AppConfig,
+    seed: u64,
+    sweep: SweepParam,
+    value: f64,
+) -> Result<RunResult, Box<dyn std::error::Error>> {
     let mut config = base_config.clone();
     config.training.seed = seed;
-    config.agent.actor.local_lambda = lambda;
+    match sweep {
+        SweepParam::Lambda => config.agent.actor.local_lambda = value,
+    }
 
     let agent_config = config.to_agent_config()?;
     let agent = PcActorCritic::new(agent_config, seed)?;
@@ -106,13 +152,52 @@ pub fn run_single(
 
     Ok(RunResult {
         seed,
-        lambda,
+        lambda: config.agent.actor.local_lambda,
         max_depth: trainer.current_depth(),
         win_rate: trainer.metrics().win_rate(),
         loss_rate: trainer.metrics().loss_rate(),
         draw_rate: trainer.metrics().draw_rate(),
         log_lines,
     })
+}
+
+/// Runs a full experiment: N repetitions × parameter sweep.
+///
+/// For each repetition, generates a random seed and runs training for each
+/// value of the swept parameter.
+///
+/// # Arguments
+///
+/// * `base_config` - Base configuration.
+/// * `n` - Number of repetitions (random seeds).
+/// * `sweep` - Which parameter to sweep.
+/// * `output` - Writer for results.
+///
+/// # Errors
+///
+/// Returns an error on training or I/O failures.
+pub fn run_experiment_sweep<W: Write>(
+    base_config: &AppConfig,
+    n: usize,
+    sweep: SweepParam,
+    output: &mut W,
+) -> Result<Vec<RunResult>, Box<dyn std::error::Error>> {
+    let values = sweep.values();
+    let mut all_results = Vec::new();
+    let mut rng = rand::thread_rng();
+
+    for _ in 0..n {
+        let seed: u64 = rand::Rng::gen(&mut rng);
+
+        for &value in &values {
+            let result = run_single_with_sweep(base_config, seed, sweep, value)?;
+            write!(output, "{result}")?;
+            output.flush()?;
+            all_results.push(result);
+        }
+    }
+
+    Ok(all_results)
 }
 
 /// Runs a full experiment: N repetitions × lambda sweep.
@@ -134,22 +219,7 @@ pub fn run_experiment<W: Write>(
     n: usize,
     output: &mut W,
 ) -> Result<Vec<RunResult>, Box<dyn std::error::Error>> {
-    let lambdas = [0.95, 0.96, 0.97, 0.98, 0.99, 1.00];
-    let mut all_results = Vec::new();
-    let mut rng = rand::thread_rng();
-
-    for _ in 0..n {
-        let seed: u64 = rand::Rng::gen(&mut rng);
-
-        for &lambda in &lambdas {
-            let result = run_single(base_config, seed, lambda)?;
-            write!(output, "{result}")?;
-            output.flush()?;
-            all_results.push(result);
-        }
-    }
-
-    Ok(all_results)
+    run_experiment_sweep(base_config, n, SweepParam::Lambda, output)
 }
 
 #[cfg(test)]
@@ -227,6 +297,22 @@ mod tests {
         let config = test_config();
         let mut buf = Vec::new();
         let results = run_experiment(&config, 1, &mut buf).unwrap();
+        assert_eq!(results.len(), 6); // 1 seed × 6 lambdas
+    }
+
+    #[test]
+    fn test_sweep_param_lambda_values() {
+        let values = SweepParam::Lambda.values();
+        assert_eq!(values.len(), 6);
+        assert!((values[0] - 0.95).abs() < 1e-12);
+        assert!((values[5] - 1.00).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_run_experiment_lambda_sweep_backward_compat() {
+        let config = test_config();
+        let mut buf = Vec::new();
+        let results = run_experiment_sweep(&config, 1, SweepParam::Lambda, &mut buf).unwrap();
         assert_eq!(results.len(), 6); // 1 seed × 6 lambdas
     }
 

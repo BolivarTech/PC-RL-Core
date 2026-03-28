@@ -34,6 +34,9 @@ pub enum Activation {
     Sigmoid,
     /// Exponential linear unit: smooth in negatives, avoids dying neurons.
     Elu,
+    /// Softsign: bounded in (-1, 1) with slower saturation than tanh.
+    /// Preserves more gradient in high-saturation regions.
+    Softsign,
     /// Identity function: output equals input.
     Linear,
 }
@@ -60,6 +63,7 @@ impl Activation {
                     x.exp() - 1.0
                 }
             }
+            Activation::Softsign => x / (1.0 + x.abs()),
             Activation::Linear => x,
         }
     }
@@ -90,6 +94,11 @@ impl Activation {
                 } else {
                     fx + 1.0
                 }
+            }
+            Activation::Softsign => {
+                // fx = x/(1+|x|), so (1-|fx|) = 1/(1+|x|), derivative = (1-|fx|)^2
+                let t = 1.0 - fx.abs();
+                t * t
             }
             Activation::Linear => 1.0,
         }
@@ -193,6 +202,32 @@ mod tests {
     }
 
     #[test]
+    fn test_softsign_apply_positive() {
+        // softsign(2.0) = 2.0 / (1 + 2.0) = 2/3
+        let result = Activation::Softsign.apply(2.0);
+        assert!((result - 2.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_apply_zero() {
+        assert!((Activation::Softsign.apply(0.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_apply_negative() {
+        // softsign(-3.0) = -3.0 / (1 + 3.0) = -0.75
+        let result = Activation::Softsign.apply(-3.0);
+        assert!((result - (-0.75)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_apply_bounded() {
+        // Output must be in (-1, 1) for any input
+        assert!(Activation::Softsign.apply(100.0) < 1.0);
+        assert!(Activation::Softsign.apply(-100.0) > -1.0);
+    }
+
+    #[test]
     fn test_linear_apply_is_identity() {
         assert_eq!(Activation::Linear.apply(42.0), 42.0);
     }
@@ -253,6 +288,43 @@ mod tests {
     }
 
     #[test]
+    fn test_softsign_derivative_at_zero() {
+        // derivative(softsign(0)) = 1 / (1 + 0)^2 = 1.0
+        assert!((Activation::Softsign.derivative(0.0) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_derivative_positive() {
+        // softsign(2) = 2/3 ≈ 0.6667, |x| = 2, derivative = 1/(1+2)^2 = 1/9
+        // But derivative takes fx (post-activation), so we need to recover |x|
+        // fx = x/(1+|x|), so |x| = |fx|/(1-|fx|)
+        // For fx=0.5: |x| = 0.5/0.5 = 1.0, derivative = 1/(1+1)^2 = 0.25
+        let result = Activation::Softsign.derivative(0.5);
+        assert!((result - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_derivative_negative() {
+        // For fx=-0.5: |x| = 0.5/0.5 = 1.0, derivative = 1/(1+1)^2 = 0.25
+        let result = Activation::Softsign.derivative(-0.5);
+        assert!((result - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_derivative_high_saturation() {
+        // For fx=0.9: |x| = 0.9/0.1 = 9, derivative = 1/(1+9)^2 = 0.01
+        let result = Activation::Softsign.derivative(0.9);
+        assert!((result - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_softsign_derivative_always_positive() {
+        for &fx in &[-0.9, -0.5, 0.0, 0.5, 0.9] {
+            assert!(Activation::Softsign.derivative(fx) > 0.0);
+        }
+    }
+
+    #[test]
     fn test_linear_derivative_always_one() {
         assert_eq!(Activation::Linear.derivative(999.0), 1.0);
         assert_eq!(Activation::Linear.derivative(-42.0), 1.0);
@@ -289,6 +361,7 @@ mod tests {
             Activation::Relu,
             Activation::Sigmoid,
             Activation::Elu,
+            Activation::Softsign,
             Activation::Linear,
         ];
         for act in &variants {
@@ -301,11 +374,12 @@ mod tests {
 
     #[test]
     fn test_all_derivatives_finite_for_typical_post_activation_values() {
-        let cases: [(Activation, f64); 5] = [
+        let cases: [(Activation, f64); 6] = [
             (Activation::Tanh, 0.5),
             (Activation::Relu, 1.0),
             (Activation::Sigmoid, 0.5),
             (Activation::Elu, -0.5),
+            (Activation::Softsign, 0.5),
             (Activation::Linear, 0.0),
         ];
         for (act, fx) in &cases {
@@ -323,6 +397,7 @@ mod tests {
             Activation::Relu,
             Activation::Sigmoid,
             Activation::Elu,
+            Activation::Softsign,
             Activation::Linear,
         ];
         for act in &variants {

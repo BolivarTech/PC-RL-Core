@@ -429,10 +429,11 @@ fn parse_activation(s: &str) -> Result<Activation, ConfigError> {
         "relu" => Ok(Activation::Relu),
         "sigmoid" => Ok(Activation::Sigmoid),
         "elu" => Ok(Activation::Elu),
+        "softsign" => Ok(Activation::Softsign),
         "linear" => Ok(Activation::Linear),
         other => Err(ConfigError {
             message: format!(
-                "unknown activation '{other}'; expected tanh, relu, sigmoid, elu, or linear"
+                "unknown activation '{other}'; expected tanh, relu, sigmoid, elu, softsign, or linear"
             ),
         }),
     }
