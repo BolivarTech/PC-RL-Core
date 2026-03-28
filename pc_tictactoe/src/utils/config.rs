@@ -543,6 +543,7 @@ impl AppConfig {
                 local_lambda: self.agent.actor.local_lambda,
                 residual: self.agent.actor.residual,
                 rezero_init: self.agent.actor.rezero_init,
+                aux_loss_coefficient: 0.0,
             },
             critic: MlpCriticConfig {
                 input_size: self.agent.critic.input_size,
