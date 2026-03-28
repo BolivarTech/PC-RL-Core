@@ -74,7 +74,7 @@ Input (9) ──> [Hidden 27, Tanh] ──> [Output 9, Linear] ──> Softmax �
 PC-TicTacToe/
 ├── pc_core/                    # Reusable RL library (publishable)
 │   └── src/
-│       ├── activation.rs       # Tanh, ReLU, Sigmoid, ELU, Linear
+│       ├── activation.rs       # Tanh, ReLU, Sigmoid, ELU, Softsign, Linear
 │       ├── error.rs            # PcError crate-wide error type
 │       ├── matrix.rs           # Dense matrix ops, softmax, sampling
 │       ├── layer.rs            # Dense layer with PC top-down support
@@ -97,8 +97,11 @@ PC-TicTacToe/
 # Build
 cargo build --release
 
-# Train (uses pc_tictactoe/config.toml)
-cargo run --release -- train -c pc_tictactoe/config.toml
+# Generate default config with optimal parameters
+cargo run --release -- init
+
+# Train (uses config.toml)
+cargo run --release -- train -c config.toml
 
 # Play against the trained agent
 cargo run --release -- play --model model.json
@@ -108,11 +111,14 @@ cargo run --release -- play --model model.json --first
 
 # Evaluate against minimax
 cargo run --release -- evaluate --model model.json --games 100 --depth 9
+
+# Run statistical experiment (N seeds × 6 lambda values)
+cargo run --release -- experiment -n 35 -c config.toml
 ```
 
 ## Configuration
 
-All hyperparameters are configured via TOML. See [`pc_tictactoe/config.toml`](pc_tictactoe/config.toml) for the full configuration with the optimal parameters.
+All hyperparameters are configured via TOML. Generate a default config with `cargo run -- init`, or see [`pc_tictactoe/config.toml`](pc_tictactoe/config.toml) for the full configuration with optimal parameters.
 
 Key parameters:
 
@@ -131,7 +137,8 @@ Key parameters:
 - **Hybrid lambda=0.99 breaks the depth ceiling** -- 1% PC error as regularizer enables depth 9 (p=0.034, N=35 seeds)
 - **Output activation must be Linear** -- Tanh bounds logits to [-1,1], making softmax nearly uniform and preventing any policy learning
 - **PC inference adds measurable value** -- Consistently +1 minimax depth level vs equivalent MLP
-- **Bounded activations required for PC** -- ReLU dies, ELU explodes; tanh's self-regulation is essential
+- **Bounded activations required for PC** -- ReLU dies, ELU explodes; tanh and softsign work
+- **Softsign widens the effective lambda range** -- 0.97-0.99 all significant vs only 0.99 for tanh
 - **Single hidden layer outperforms deeper networks** -- 2-layer architectures suffer vanishing gradients through double Tanh
 - **27 neurons is the sweet spot** -- 18 too small, 32 no improvement
 - **Entropy regularization hurts** -- Destabilizes learned defensive play in this architecture
@@ -156,7 +163,7 @@ No PyTorch, TensorFlow, or any ML framework. Pure Rust from scratch.
 
 ## Testing
 
-268 tests covering all modules:
+281 tests covering all modules:
 
 ```bash
 # Run all tests

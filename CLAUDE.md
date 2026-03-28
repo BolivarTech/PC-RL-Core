@@ -30,6 +30,12 @@ cargo check
 
 # Lint
 cargo clippy -- -D warnings
+
+# Generate default config
+cargo run -- init
+
+# Run experiment (N seeds × 6 lambda values)
+cargo run --release -- experiment -n 35 -c config.toml
 ```
 
 ## Architecture
@@ -37,7 +43,7 @@ cargo clippy -- -D warnings
 The project is planned as a **Cargo workspace** with two crates:
 
 - **`pc_core`** — Library crate (publishable). Contains the PC-Actor-Critic framework:
-  - `activation.rs` — Activation functions enum (Tanh, Relu, Sigmoid, Elu, Linear) with apply/derivative
+  - `activation.rs` — Activation functions enum (Tanh, Relu, Sigmoid, Elu, Softsign, Linear) with apply/derivative
   - `error.rs` — Crate-wide `PcError` enum (ConfigValidation, DimensionMismatch, Serialization, Io)
   - `matrix.rs` — Dense matrix ops, softmax, argmax, RMS error, weight/gradient clipping (WEIGHT_CLIP=5.0, GRAD_CLIP=5.0)
   - `layer.rs` — Single dense layer with forward, transpose_forward (PC top-down), and backward
@@ -51,7 +57,8 @@ The project is planned as a **Cargo workspace** with two crates:
   - `env/minimax.rs` — Minimax baseline opponent
   - `training/trainer.rs` — Episode-based training loop
   - `training/continuous.rs` — Continuous learning with surprise scheduling
-  - `ui/cli.rs` — CLI interface (clap)
+  - `training/experiment.rs` — Lambda sweep experiment runner with SweepParam
+  - `ui/cli.rs` — CLI interface (clap): train, play, evaluate, benchmark, experiment, init
   - `utils/` — Config (TOML), logger, metrics
 
 ### Key Concepts
@@ -134,11 +141,12 @@ Hybrid blend: `delta = λ * backprop_grad + (1-λ) * pc_prediction_error`
 | 27→18h | 0.25 | depth 6 | — |
 | 27→18h | 0.0 | depth 6 | — |
 
-### Activation Experiments (test branch, seed=42, 27h)
+### Activation Experiments (27h, N=35 seeds where noted)
 
 | Activation | Depth | Notes |
 |------------|-------|-------|
 | tanh | 8 | Baseline. Bounded output stabilizes PC loop |
+| softsign | — | Equivalent to tanh (mean 7.89 vs 7.94, N=35). Widens effective lambda range (0.97-0.99 vs only 0.99) |
 | relu | 4 | Dying neurons: PC loop pushes activations negative permanently |
 | elu | 6 | Unbounded positives: PC loop creates unstable feedback → policy collapse |
 
