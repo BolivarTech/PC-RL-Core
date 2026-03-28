@@ -128,6 +128,233 @@ Different random seeds create different initial weight configurations, placing t
 
 This explains both the statistical improvement (more seeds reach depth 9) and the remaining variance (not all seeds benefit equally).
 
+### Phase 5: Residual Skip Connections + ReZero (N=35 random seeds)
+
+Residual skip connections were implemented to address vanishing gradients in multi-layer networks: `h[i] = rezero_alpha * tanh(W*h[i-1]+b) + h[i-1]`. The identity path (`+h[i-1]`) guarantees gradients never vanish completely. Two configurations were tested with 2 hidden layers of 27 neurons each.
+
+#### Experiment 5a: ReZero near-identity (rezero_init=0.001, min_steps=1, max_steps=5)
+
+| Lambda | N | Mean Depth | Max | D>=7 | p-value vs 1.0 |
+|--------|---|-----------|-----|------|----------------|
+| 0.95 | 35 | 1.91 | 7 | 3% | 0.0000 \*\* |
+| 0.96 | 35 | 1.51 | 4 | 0% | 0.0000 \*\* |
+| 0.97 | 35 | 1.63 | 6 | 0% | 0.0000 \*\* |
+| 0.98 | 35 | 2.57 | 7 | 6% | 0.0000 \*\* |
+| 0.99 | 35 | 3.40 | 6 | 0% | 0.0000 \*\* |
+| **1.00** | **35** | **6.94** | **8** | **86%** | **baseline** |
+
+#### Experiment 5b: Standard ResNet residual (rezero_init=1.0, min_steps=3, max_steps=10)
+
+| Lambda | N | Mean Depth | Max | D>=7 | p-value vs 1.0 |
+|--------|---|-----------|-----|------|----------------|
+| 0.95 | 29 | 1.90 | 5 | 0% | 0.0000 \*\* |
+| 0.96 | 29 | 2.03 | 6 | 0% | 0.0000 \*\* |
+| 0.97 | 29 | 2.55 | 7 | 7% | 0.0000 \*\* |
+| 0.98 | 29 | 2.55 | 7 | 3% | 0.0000 \*\* |
+| 0.99 | 29 | 3.34 | 7 | 7% | 0.0000 \*\* |
+| **1.00** | **29** | **6.45** | **9** | **52%** | **baseline** |
+
+#### Residual Findings
+
+1. **Only lambda=1.0 (pure backprop) works with residual** -- all other lambdas collapse to depth 1-4
+2. **The PC error blend is fundamentally incompatible with multi-layer networks** -- prediction errors point in directions that interfere with the policy gradient, regardless of network depth, ReZero init value, or PC iteration count
+3. **Residual with backprop (lambda=1.0) reaches depth 9** in some seeds -- the skip connection successfully addresses vanishing gradients for pure backprop
+4. **Residual lambda=1.0 (mean 6.45-6.94) is worse than single-layer lambda=0.99 (mean 7.57)** -- the DPC mechanism (eco residual) with 1 layer outperforms the architectural solution (skip connections) with 2 layers
+5. **rezero_init value does not matter** -- both 0.001 (near-identity) and 1.0 (standard ResNet) produce the same pattern of lambda<1.0 failure
+6. **More PC iterations (min_steps=3, max_steps=10) do not help** -- the incompatibility is structural, not about insufficient deliberation
+
+#### Why PC Errors Fail with Multi-Layer Networks
+
+With ReZero near-identity (0.001): PC loop converges in 1 step because the second layer barely modifies representations. Prediction errors are near-zero. Blending near-zero errors with backprop dilutes the gradient to nothing.
+
+With standard ResNet (1.0): PC prediction errors are meaningful in magnitude, but they point in the direction of **representational consistency between layers** -- not in the direction of **reward maximization**. In single-layer networks, these directions happen to correlate enough that 1% PC error acts as useful regularization. In multi-layer networks, the correlation breaks down: the PC error for layer 1 optimizes for consistency with the output layer, while the backprop gradient optimizes for policy quality. Blending these conflicting signals destroys learning.
+
+### Phase 6: Softsign Activation (N=35 random seeds, 1×27h)
+
+Softsign (`x/(1+|x|)`) is bounded in (-1,1) like tanh but with slower saturation. At high saturation (|fx|>0.9), softsign preserves 3.8x more gradient than tanh. Tested as drop-in replacement for tanh in both actor and critic hidden layers.
+
+#### Softsign results
+
+| Lambda | N | Mean Depth | D>=8 | D=9 | p-value vs 1.0 |
+|--------|---|-----------|------|-----|----------------|
+| 0.95 | 35 | 7.09 | 26% | 14% | 0.201 |
+| 0.96 | 35 | 6.94 | 14% | 9% | 0.458 |
+| 0.97 | 35 | 7.23 | 26% | 9% | 0.013 \* |
+| 0.98 | 35 | 7.29 | 37% | 14% | 0.017 \* |
+| **0.99** | **35** | **7.89** | **63%** | **31%** | **0.0000 \*\*** |
+| 1.00 | 35 | 6.80 | 11% | 0% | baseline |
+
+#### Softsign vs Tanh comparison (lambda=0.99)
+
+| Metric | Tanh | Softsign |
+|--------|------|----------|
+| Mean depth | 7.94 | 7.89 |
+| D>=8 | 57% | 63% |
+| D=9 | 37% | 31% |
+| Min depth | 7 | 6 |
+| Significant lambdas | 0.99 only | 0.97, 0.98, 0.99 |
+
+#### Softsign Findings
+
+1. **Performance is equivalent to tanh** at lambda=0.99 (mean 7.89 vs 7.94, not significantly different)
+2. **Softsign widens the effective lambda range** -- lambda=0.97 and 0.98 become significant (p<0.02), whereas with tanh only 0.99 was significant. The smoother gradient profile of softsign tolerates more PC error without collapsing
+3. **More consistent at D>=8** (63% vs 57%) but **fewer D=9** (31% vs 37%) -- softsign is more reliable at reaching high performance but less likely to reach the absolute maximum
+4. **Pure backprop (lambda=1.0) is slightly worse** with softsign (mean 6.80, 0% D=9) than with tanh (mean 6.91, 3% D=9)
+5. **Practical implication**: softsign makes the architecture more robust to hyperparameter choice, reducing the sensitivity to the exact lambda value
+
+### Phase 7: Two-Layer Softsign without Residual (N=35 random seeds, 2×27h)
+
+Testing whether softsign's gradient preservation enables 2-layer networks to work better than tanh.
+
+| Lambda | N | Mean Depth | D>=7 | D>=8 | D=9 | p-value vs 1.0 |
+|--------|---|-----------|------|------|-----|----------------|
+| 0.95 | 35 | 6.31 | 43% | 0% | 0% | 0.020 \* (worse) |
+| 0.96 | 35 | 6.49 | 57% | 0% | 0% | 0.199 |
+| 0.97 | 35 | 6.86 | 74% | 6% | 6% | 0.283 |
+| 0.98 | 35 | 6.89 | 77% | 6% | 6% | 0.205 |
+| **0.99** | **35** | **7.31** | **94%** | **20%** | **17%** | **0.0007 \*\*** |
+| 1.00 | 35 | 6.69 | 63% | 3% | 3% | baseline |
+
+#### 2-Layer Activation Comparison (lambda=0.99, no residual)
+
+| Activation | Mean Depth | D>=8 | D=9 |
+|------------|-----------|------|-----|
+| tanh | 6.63 | 3% | 0% |
+| **softsign** | **7.31** | **20%** | **17%** |
+
+#### Findings
+
+1. **Softsign significantly mitigates vanishing gradient in 2-layer networks** -- +0.68 mean depth vs tanh, D=9 goes from 0% to 17%
+2. **lambda=0.99 remains the only significant improvement** with 2-layer softsign (p=0.0007)
+3. **94% of seeds reach D>=7** with lambda=0.99 -- very consistent
+4. **Still inferior to 1-layer** (mean 7.31 vs 7.89-7.94) -- depth penalty from 2 layers persists but is reduced
+5. **Confirms the vanishing gradient analysis**: softsign preserves more gradient at high saturation, directly translating to better multi-layer performance
+
+### Phase 8: Two-Layer Softsign with Residual (N=35, 2×27h, rezero_init=0.1)
+
+Testing whether softsign + moderate residual (rezero_init=0.1) can combine gradient preservation from both mechanisms.
+
+| Lambda | N | Mean Depth | D>=7 | D>=8 | D=9 | p-value vs 1.0 |
+|--------|---|-----------|------|------|-----|----------------|
+| 0.95 | 35 | 2.11 | 0% | 0% | 0% | 0.0000 \*\* |
+| 0.96 | 35 | 1.83 | 0% | 0% | 0% | 0.0000 \*\* |
+| 0.97 | 35 | 2.20 | 0% | 0% | 0% | 0.0000 \*\* |
+| 0.98 | 35 | 3.03 | 9% | 0% | 0% | 0.0000 \*\* |
+| 0.99 | 35 | 3.94 | 3% | 0% | 0% | 0.0000 \*\* |
+| **1.00** | **35** | **6.66** | **60%** | **17%** | **0%** | **baseline** |
+
+#### Finding
+
+**Residual connections destroy the DPC mechanism regardless of activation function or rezero_init value.** Softsign does not rescue the residual + lambda<1.0 combination. The pattern is consistent across all 4 residual experiments:
+
+| Config (2 layers, lambda=0.99) | Mean | D>=8 |
+|-------------------------------|------|------|
+| softsign, no residual | 7.31 | 20% |
+| tanh, no residual | 6.63 | 3% |
+| softsign, residual rz=0.1 | 3.94 | 0% |
+| tanh, residual rz=0.001 | 3.40 | 0% |
+| tanh, residual rz=1.0 | 3.34 | 0% |
+
+The skip connection identity path creates a structural incompatibility with the PC error blend. When gradients flow through both the nonlinear path (scaled by rezero_alpha) and the identity path simultaneously, the PC prediction errors -- which target only the nonlinear component -- become misaligned with the composite gradient signal. This misalignment worsens with any lambda < 1.0, regardless of how the residual is scaled.
+
+### Global Results Summary (lambda=0.99)
+
+| Rank | Config | Mean Depth | D>=8 | D=9 |
+|------|--------|-----------|------|-----|
+| 1 | 1-layer tanh | 7.94 | 57% | 37% |
+| 2 | 1-layer softsign | 7.89 | 63% | 31% |
+| 3 | 2-layer softsign (no residual) | 7.31 | 20% | 17% |
+| 4 | 2-layer tanh (no residual) | 6.63 | 3% | 0% |
+| 5 | 2-layer softsign (residual rz=0.1) | 3.94 | 0% | 0% |
+| 6 | 2-layer tanh (residual rz=0.001) | 3.40 | 0% | 0% |
+| 7 | 2-layer tanh (residual rz=1.0) | 3.34 | 0% | 0% |
+
+### Phase 9: Auxiliary Loss on 1-Layer Baseline (N=35, 1×27h tanh, aux=0.1)
+
+Testing whether auxiliary loss as additional regularizer improves the single-layer DPC config.
+
+| Lambda | N | Mean Depth | D>=8 | D=9 | p-value vs 1.0 |
+|--------|---|-----------|------|-----|----------------|
+| 0.95 | 35 | 7.09 | 26% | 17% | 0.263 |
+| 0.96 | 35 | 6.91 | 20% | 14% | 0.661 |
+| 0.97 | 35 | 7.40 | 29% | 17% | 0.003 \*\* |
+| 0.98 | 35 | 7.37 | 37% | 29% | 0.044 \* |
+| **0.99** | **35** | **7.57** | **37%** | **29%** | **0.0006 \*\*** |
+| 1.00 | 35 | 6.80 | 11% | 3% | baseline |
+
+#### Comparison: aux=0.1 vs aux=0.0 (lambda=0.99)
+
+| Config | Mean | D>=8 | D=9 |
+|--------|------|------|-----|
+| 1-layer tanh, aux=0.0 | **7.94** | **57%** | **37%** |
+| 1-layer tanh, aux=0.1 | 7.57 | 37% | 29% |
+
+#### Findings
+
+1. **Auxiliary loss degrades single-layer performance** -- mean drops from 7.94 to 7.57, D>=8 from 57% to 37%
+2. **Positive effect on lambda range** -- lambda=0.97 and 0.98 become significant (like softsign), suggesting the aux gradient acts as a smoothing regularizer
+3. **Redundant in single-layer** -- backprop already reaches the hidden layer without attenuation. The aux MSE gradient points in a different direction than the policy gradient, diluting the reward signal instead of reinforcing it
+4. **Aux loss is designed for multi-layer networks** where backprop gradient is attenuated through cascaded activations. The next test should be aux=0.1 with 2-layer softsign
+
+### Phase 10: Auxiliary Loss on 2-Layer Softsign (N=35, 2×27h softsign, aux=0.1)
+
+Testing whether auxiliary loss can inject fresh gradient into the first hidden layer of a 2-layer network, compensating for vanishing gradient.
+
+| Lambda | N | Mean Depth | D>=7 | D>=8 | D=9 | p-value vs 1.0 |
+|--------|---|-----------|------|------|-----|----------------|
+| 0.95 | 35 | 6.60 | 63% | 0% | 0% | 0.822 |
+| 0.96 | 35 | 6.54 | 54% | 0% | 0% | 0.813 |
+| 0.97 | 35 | 6.31 | 37% | 0% | 0% | 0.052 |
+| 0.98 | 35 | 6.74 | 69% | 3% | 3% | 0.204 |
+| 0.99 | 35 | 6.77 | 71% | 3% | 3% | 0.134 |
+| 1.00 | 35 | 6.57 | 57% | 0% | 0% | baseline |
+
+#### Comparison: aux=0.1 vs aux=0.0 on 2-layer softsign (lambda=0.99)
+
+| Config | Mean | D>=8 | D=9 |
+|--------|------|------|-----|
+| 2-layer softsign, aux=0.0 | **7.31** | **20%** | **17%** |
+| 2-layer softsign, aux=0.1 | 6.77 | 3% | 3% |
+
+#### Findings
+
+1. **Auxiliary loss degrades 2-layer performance** -- mean drops from 7.31 to 6.77, D>=8 from 20% to 3%
+2. **No lambda value is significant** -- the DPC effect (lambda<1.0) disappears entirely with aux=0.1
+3. **MSE auxiliary loss is fundamentally flawed for RL** -- the gradient from predicting output logits (MSE) carries reconstruction information, not reward information. Hidden layers optimize for "predict what the output says" instead of "learn representations that maximize reward"
+4. **Aux loss fails in both topologies** -- degrades 1-layer (Phase 9: 7.94→7.57) and 2-layer (7.31→6.77). The MSE against y_conv is not a valid proxy for the policy gradient
+
+#### Why MSE Auxiliary Loss Fails
+
+The auxiliary head computes `aux_logits = W_aux × h[i]` and minimizes `||aux_logits - y_conv||²`. The gradient `W_aux^T × (aux_logits - y_conv)` tells the hidden layer "adjust your representation so I can better predict the output logits." But the output logits are shaped by the policy gradient which changes every episode. The aux head chases a moving target while injecting a gradient that conflicts with the policy optimization direction.
+
+A better auxiliary loss would need to carry reward information directly (e.g., auxiliary policy head with advantage weighting), but this requires passing action/advantage data into the backward pass, which is a more invasive change.
+
+### Phase 11: Auxiliary Loss Coefficient Sweep (N=35, 2×27h softsign, λ=0.99)
+
+Full sweep of aux_loss_coefficient from 0.05 to 0.50 in steps of 0.05, with lambda fixed at 0.99.
+
+| Aux Coeff | N | Mean Depth | D>=7 | D>=8 | D=9 |
+|-----------|---|-----------|------|------|-----|
+| 0.05 | 35 | 6.57 | 57% | 0% | 0% |
+| 0.10 | 35 | 6.74 | 71% | 3% | 0% |
+| 0.15 | 35 | 6.66 | 66% | 0% | 0% |
+| 0.20 | 35 | 6.71 | 66% | 6% | 3% |
+| 0.25 | 35 | 6.69 | 63% | 3% | 3% |
+| 0.30 | 35 | 6.71 | 63% | 6% | 3% |
+| 0.35 | 35 | 6.77 | 74% | 3% | 0% |
+| 0.40 | 35 | 6.74 | 69% | 6% | 0% |
+| 0.45 | 35 | 6.60 | 60% | 0% | 0% |
+| 0.50 | 35 | 6.77 | 71% | 6% | 0% |
+
+No value is statistically significant vs aux=0.05 (all p > 0.09).
+
+#### Findings
+
+1. **No sweet spot exists** -- the entire range 0.05-0.50 produces uniformly mediocre results (mean 6.57-6.77)
+2. **All aux values degrade vs no-aux baseline** -- mean ~6.7 vs 7.31 without aux. A consistent ~0.5 depth loss
+3. **Flat response** -- no aux value differentiates from any other. The problem is the mechanism itself, not the coefficient
+4. **MSE auxiliary loss definitively ruled out** -- tested across 10 coefficient values × 35 seeds (350 runs), confirming the reconstruction gradient fundamentally conflicts with policy optimization
+
 ## Conclusions
 
 1. **Hybrid PC-backprop learning at lambda=0.99 is a statistically significant improvement** over pure backprop for the PC-Actor-Critic architecture on Tic-Tac-Toe
@@ -136,6 +363,12 @@ This explains both the statistical improvement (more seeds reach depth 9) and th
 4. Pure local PC learning (lambda=0) is inferior to backprop -- PC errors lack reward information
 5. The PC inference loop remains valuable regardless of lambda -- it contributes +1 depth level vs MLP
 6. Bounded activations (tanh) are required for PC loop stability
+7. **The DPC mechanism (lambda=0.99) is specific to single-layer topologies** -- multi-layer networks with residual skip connections cannot benefit from PC error blending
+8. **Optimal architecture: 1 hidden layer (27 neurons) + lambda=0.99** -- outperforms all multi-layer variants tested
+9. **Softsign is a viable alternative to tanh** -- equivalent performance at lambda=0.99, with the bonus of widening the effective lambda range (0.97-0.99 vs only 0.99)
+10. **Softsign mitigates vanishing gradient in 2-layer networks** -- 2-layer softsign (mean 7.31, 17% D=9) significantly outperforms 2-layer tanh (mean 6.63, 0% D=9), confirming the gradient preservation hypothesis
+11. **Residual skip connections are incompatible with DPC (lambda<1.0)** across all tested configurations -- tanh/softsign, rezero 0.001/0.1/1.0. The identity path creates structural misalignment with PC prediction errors. Without residual, 2-layer softsign is the best multi-layer option
+12. **MSE auxiliary loss degrades performance in all topologies** -- the reconstruction gradient (predict output logits) conflicts with the policy gradient direction, diluting reward signal instead of reinforcing it
 
 ## Reproduction
 
