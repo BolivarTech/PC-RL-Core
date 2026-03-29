@@ -254,18 +254,6 @@ impl PcActor {
                 config.rezero_init
             )));
         }
-        if config.residual && config.hidden_layers.len() >= 2 {
-            for i in 1..config.hidden_layers.len() {
-                if config.hidden_layers[i].size != config.hidden_layers[i - 1].size {
-                    return Err(PcError::ConfigValidation(format!(
-                        "residual requires same-size hidden layers, but layer {} has size {} and layer {} has size {}",
-                        i - 1, config.hidden_layers[i - 1].size,
-                        i, config.hidden_layers[i].size
-                    )));
-                }
-            }
-        }
-
         let mut layers = Vec::new();
         let mut prev_size = config.input_size;
 
