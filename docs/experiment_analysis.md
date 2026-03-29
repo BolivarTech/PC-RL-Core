@@ -555,6 +555,51 @@ cargo run --release -- experiment -n 35 -c pc_tictactoe/config.toml
 
 A candidate chromosome: `[hidden_size, alpha, lr, lambda, temperature, ...]` with fitness = max depth reached in N episodes.
 
+## Hypothesis: Depth-Lambda Scaling Law
+
+Based on the experimental evidence across Phases 12-15, we propose the following hypothesis:
+
+**The optimal PC error component scales inversely with network depth following `lambda ≈ 1 - 10^(-L)` where L is the number of hidden layers.**
+
+### Evidence
+
+| Hidden Layers | Optimal λ | PC Error | Backprop | Source |
+|---------------|-----------|----------|----------|--------|
+| 1 (no residual) | 0.99 | 1% | 99% | Phase 4 (p=0.034, N=35) |
+| 3 (residual) | 0.999 | 0.1% | 99.9% | Phase 15 (best of 3 values, N=35) |
+
+Supporting data:
+- 1 layer: λ=0.99 → depth 7.94; λ=0.975 → depth 7 (too much PC error)
+- 3 layers: λ=0.999 → depth 7.20; λ=0.99 → depth 3.14 (collapse); λ=0.9999 → depth 7.00 (too little PC error)
+
+### Interpretation
+
+Each residual skip connection creates a composite gradient path (identity + nonlinear). The PC prediction errors target only the nonlinear component, creating a directional misalignment with the composite gradient. This misalignment **compounds multiplicatively** through each skip connection layer:
+
+```
+Effective misalignment ∝ (1 - lambda) × number_of_skip_layers
+```
+
+For the misalignment to remain below a critical threshold, the PC error component `(1 - lambda)` must decrease proportionally to the number of layers. The exponential relationship `1 - 10^(-L)` keeps the product approximately constant:
+
+- 1 layer: 0.01 × 1 = 0.01
+- 3 layers: 0.001 × 3 = 0.003
+- 10 layers: 0.0000000001 × 10 ≈ 0
+
+### Implications
+
+1. **PC inference remains fully active at all depths** -- the deliberation loop (alpha, max_steps) is independent of lambda. The network "thinks" equally deeply regardless of how the learning signal is composed.
+
+2. **The PC error echo becomes a vanishingly small regularizer in deep networks** -- its structural benefit (escaping local minima) diminishes as depth increases, while its cost (gradient misalignment) compounds.
+
+3. **Deep DPC networks converge toward pure backprop for learning but retain full PC inference** -- the architecture separates "how to think" (PC loop, always active) from "how to learn" (backprop-dominated, depth-dependent).
+
+4. **Prediction**: For a 10-layer DPC network with residual, λ ≈ 0.9999999999 would be optimal -- effectively pure backprop with an infinitesimal PC error trace.
+
+### Status
+
+**Hypothesis** -- supported by 2 data points (1 and 3 layers) with N=35 seeds each. Requires validation at additional depths (2, 4, 5+ layers) to confirm the exponential scaling relationship.
+
 ## References
 
 - Millidge, B., Seth, A., & Buckley, C. L. (2022). [Predictive Coding Approximates Backprop Along Arbitrary Computation Graphs](https://direct.mit.edu/neco/article/34/6/1329/107068). *Neural Computation*, 34(6), 1329-1368.
