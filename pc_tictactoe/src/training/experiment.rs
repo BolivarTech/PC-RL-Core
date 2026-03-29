@@ -6,7 +6,7 @@
 //!
 //! Runs training across a range of hyperparameter values with random seeds,
 //! collecting max depth and final metrics for each combination.
-//! Supports sweeping `local_lambda` or `aux_loss_coefficient`.
+//! Supports sweeping `local_lambda`.
 
 use std::fmt;
 use std::io::Write;
@@ -20,8 +20,6 @@ use pc_core::pc_actor_critic::PcActorCritic;
 pub enum SweepParam {
     /// Sweep local_lambda [0.95, 0.96, ..., 1.00] (6 values).
     Lambda,
-    /// Sweep aux_loss_coefficient [0.05, 0.10, ..., 0.50] (10 values).
-    AuxLoss,
 }
 
 impl SweepParam {
@@ -29,7 +27,6 @@ impl SweepParam {
     pub fn values(&self) -> Vec<f64> {
         match self {
             SweepParam::Lambda => vec![0.95, 0.96, 0.97, 0.98, 0.99, 1.00],
-            SweepParam::AuxLoss => (1..=10).map(|i| i as f64 * 0.05).collect(),
         }
     }
 
@@ -37,7 +34,6 @@ impl SweepParam {
     pub fn name(&self) -> &'static str {
         match self {
             SweepParam::Lambda => "lambda",
-            SweepParam::AuxLoss => "aux",
         }
     }
 }
@@ -49,8 +45,6 @@ pub struct RunResult {
     pub seed: u64,
     /// local_lambda value used.
     pub lambda: f64,
-    /// aux_loss_coefficient value used.
-    pub aux_coefficient: f64,
     /// Maximum curriculum depth reached.
     pub max_depth: usize,
     /// Final win rate at end of training.
@@ -68,7 +62,6 @@ impl fmt::Display for RunResult {
         writeln!(f, "============")?;
         writeln!(f, "seed={}", self.seed)?;
         writeln!(f, "lambda={:.8}", self.lambda)?;
-        writeln!(f, "aux={:.8}", self.aux_coefficient)?;
         for line in &self.log_lines {
             writeln!(f, "{line}")?;
         }
@@ -138,7 +131,6 @@ pub fn run_single(
     Ok(RunResult {
         seed,
         lambda,
-        aux_coefficient: config.agent.actor.aux_loss_coefficient,
         max_depth: trainer.current_depth(),
         win_rate: trainer.metrics().win_rate(),
         loss_rate: trainer.metrics().loss_rate(),
@@ -169,7 +161,6 @@ pub fn run_single_with_sweep(
     config.training.seed = seed;
     match sweep {
         SweepParam::Lambda => config.agent.actor.local_lambda = value,
-        SweepParam::AuxLoss => config.agent.actor.aux_loss_coefficient = value,
     }
 
     let agent_config = config.to_agent_config()?;
@@ -212,7 +203,6 @@ pub fn run_single_with_sweep(
     Ok(RunResult {
         seed,
         lambda: config.agent.actor.local_lambda,
-        aux_coefficient: config.agent.actor.aux_loss_coefficient,
         max_depth: trainer.current_depth(),
         win_rate: trainer.metrics().win_rate(),
         loss_rate: trainer.metrics().loss_rate(),
@@ -366,7 +356,6 @@ pub fn run_seed_test<W: Write>(
         let result = RunResult {
             seed,
             lambda: config.agent.actor.local_lambda,
-            aux_coefficient: config.agent.actor.aux_loss_coefficient,
             max_depth: trainer.current_depth(),
             win_rate: trainer.metrics().win_rate(),
             loss_rate: trainer.metrics().loss_rate(),
@@ -437,7 +426,6 @@ mod tests {
         let result = RunResult {
             seed: 42,
             lambda: 0.99,
-            aux_coefficient: 0.0,
             max_depth: 8,
             win_rate: 0.0,
             loss_rate: 0.5,

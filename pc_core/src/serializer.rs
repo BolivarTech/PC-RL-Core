@@ -60,9 +60,6 @@ pub struct PcActorWeights {
     /// Projection matrices for heterogeneous skip connections.
     #[serde(default)]
     pub skip_projections: Vec<Option<crate::matrix::Matrix>>,
-    /// Auxiliary linear heads for hidden layer gradient injection.
-    #[serde(default)]
-    pub aux_heads: Vec<Layer>,
 }
 
 /// Complete save file containing agent state and metadata.
@@ -113,7 +110,6 @@ pub fn save_agent(
             layers: agent.actor.layers.clone(),
             rezero_alpha: agent.actor.rezero_alpha.clone(),
             skip_projections: agent.actor.skip_projections.clone(),
-            aux_heads: agent.actor.aux_heads.clone(),
         },
         critic_weights: crate::mlp_critic::MlpCriticWeights {
             layers: agent.critic.layers.clone(),
@@ -177,7 +173,6 @@ pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError>
         config: save_file.config.actor.clone(),
         rezero_alpha: save_file.actor_weights.rezero_alpha,
         skip_projections: save_file.actor_weights.skip_projections,
-        aux_heads: save_file.actor_weights.aux_heads,
     };
 
     let critic = MlpCritic::from_weights(
@@ -276,7 +271,6 @@ mod tests {
                 local_lambda: 1.0,
                 residual: false,
                 rezero_init: 0.001,
-                aux_loss_coefficient: 0.0,
             },
             critic: MlpCriticConfig {
                 input_size: 27,
@@ -589,5 +583,4 @@ mod tests {
         assert!(loaded.actor.rezero_alpha.is_empty());
         let _ = fs::remove_file(&path);
     }
-
 }

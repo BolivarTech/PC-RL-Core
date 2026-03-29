@@ -43,7 +43,6 @@ use crate::matrix::{
 ///     local_lambda: 1.0,
 ///     residual: false,
 ///     rezero_init: 0.001,
-///     aux_loss_coefficient: 0.0,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,16 +107,6 @@ pub struct PcActorConfig {
     /// Ignored when `residual = false`.
     #[serde(default = "default_rezero_init")]
     pub rezero_init: f64,
-    /// Auxiliary loss coefficient for hidden layer gradient injection.
-    /// Each hidden layer gets a linear auxiliary head that predicts the output
-    /// logits. The MSE gradient is scaled by this coefficient and added to the
-    /// hidden layer's effective delta, providing a direct reward signal that
-    /// bypasses upper-layer tanh attenuation.
-    ///
-    /// - `0.0` — Disabled (default). No auxiliary heads created.
-    /// - `> 0.0` — Enabled. One auxiliary head per hidden layer.
-    #[serde(default)]
-    pub aux_loss_coefficient: f64,
 }
 
 /// Default rezero_init: 0.001 (near-identity at start).
@@ -190,7 +179,6 @@ pub enum SelectionMode {
 ///     local_lambda: 1.0,
 ///     residual: false,
 ///     rezero_init: 0.001,
-///     aux_loss_coefficient: 0.0,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
 /// let actor = PcActor::new(config, &mut rng).unwrap();
@@ -208,10 +196,6 @@ pub struct PcActor {
     /// Projection matrices for skip connections between layers of different sizes.
     /// One entry per skip layer: `None` for identity (same size), `Some(Matrix)` for projection.
     pub(crate) skip_projections: Vec<Option<Matrix>>,
-    /// Auxiliary linear heads for hidden layer gradient injection.
-    /// One per hidden layer when `aux_loss_coefficient > 0`. Maps hidden_size → output_size.
-    /// Used in `update_weights_hybrid()` for gradient injection.
-    pub(crate) aux_heads: Vec<Layer>,
 }
 
 impl PcActor {
@@ -243,12 +227,6 @@ impl PcActor {
             return Err(PcError::ConfigValidation(format!(
                 "local_lambda must be in [0.0, 1.0], got {}",
                 config.local_lambda
-            )));
-        }
-        if config.aux_loss_coefficient < 0.0 {
-            return Err(PcError::ConfigValidation(format!(
-                "aux_loss_coefficient must be >= 0, got {}",
-                config.aux_loss_coefficient
             )));
         }
         if config.rezero_init < 0.0 {
@@ -294,23 +272,11 @@ impl PcActor {
             (Vec::new(), Vec::new())
         };
 
-        // Create auxiliary heads: one linear projection per hidden layer
-        let aux_heads = if config.aux_loss_coefficient > 0.0 {
-            config
-                .hidden_layers
-                .iter()
-                .map(|def| Layer::new(def.size, config.output_size, Activation::Linear, rng))
-                .collect()
-        } else {
-            Vec::new()
-        };
-
         Ok(Self {
             layers,
             config,
             rezero_alpha,
             skip_projections,
-            aux_heads,
         })
     }
 
@@ -668,32 +634,6 @@ impl PcActor {
                     .collect()
             };
 
-            // Auxiliary loss gradient injection: MSE(aux_logits, y_conv)
-            let effective_delta =
-                if self.config.aux_loss_coefficient > 0.0 && i < self.aux_heads.len() {
-                    let aux_logits = self.aux_heads[i].forward(&infer_result.hidden_states[i]);
-                    let coeff = self.config.aux_loss_coefficient;
-                    let scaled_mse_grad: Vec<f64> = aux_logits
-                        .iter()
-                        .zip(infer_result.y_conv.iter())
-                        .map(|(&a, &y)| coeff * (a - y))
-                        .collect();
-                    let propagated_aux = self.aux_heads[i].backward(
-                        &infer_result.hidden_states[i],
-                        &aux_logits,
-                        &scaled_mse_grad,
-                        self.config.lr_weights,
-                        surprise_scale,
-                    );
-                    effective_delta
-                        .iter()
-                        .zip(propagated_aux.iter())
-                        .map(|(&ed, &aux)| ed + aux)
-                        .collect()
-                } else {
-                    effective_delta
-                };
-
             if let Some(alpha_idx) = self.skip_alpha_index(i) {
                 // Skip-eligible layer: use tanh_out for derivative, scale by alpha,
                 // add identity path to propagated gradient, update alpha.
@@ -781,7 +721,6 @@ mod tests {
             local_lambda: 1.0,
             residual: false,
             rezero_init: 0.001,
-            aux_loss_coefficient: 0.0,
         }
     }
 

@@ -123,9 +123,6 @@ pub struct ActorSection {
     /// Initial value for ReZero scaling factors on residual connections.
     #[serde(default = "default_rezero_init")]
     pub rezero_init: f64,
-    /// Auxiliary loss coefficient for hidden layer gradient injection.
-    #[serde(default)]
-    pub aux_loss_coefficient: f64,
 }
 
 /// Default rezero_init: 0.001.
@@ -372,7 +369,6 @@ impl Default for ActorSection {
             local_lambda: default_local_lambda(),
             residual: false,
             rezero_init: default_rezero_init(),
-            aux_loss_coefficient: 0.0,
         }
     }
 }
@@ -547,7 +543,6 @@ impl AppConfig {
                 local_lambda: self.agent.actor.local_lambda,
                 residual: self.agent.actor.residual,
                 rezero_init: self.agent.actor.rezero_init,
-                aux_loss_coefficient: self.agent.actor.aux_loss_coefficient,
             },
             critic: MlpCriticConfig {
                 input_size: self.agent.critic.input_size,

@@ -85,9 +85,6 @@ pub struct TrainArgs {
     /// Initial ReZero scaling factor for residual connections.
     #[arg(long)]
     pub rezero_init: Option<f64>,
-    /// Auxiliary loss coefficient for hidden layer gradient injection.
-    #[arg(long)]
-    pub aux_loss_coefficient: Option<f64>,
 }
 
 /// Arguments for the play subcommand.
@@ -124,7 +121,7 @@ pub struct ExperimentArgs {
     /// Path to TOML configuration file.
     #[arg(long, short, default_value = "config.toml")]
     pub config: String,
-    /// Parameter to sweep: "lambda" (default) or "aux".
+    /// Parameter to sweep: "lambda" (default).
     #[arg(long, short, default_value = "lambda")]
     pub sweep: String,
 }
@@ -188,10 +185,6 @@ pub fn run_train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(ri) = args.rezero_init {
         config.agent.actor.rezero_init = ri;
-    }
-
-    if let Some(aux) = args.aux_loss_coefficient {
-        config.agent.actor.aux_loss_coefficient = aux;
     }
 
     config.validate()?;
@@ -483,7 +476,6 @@ temperature = 1.0
 local_lambda = 0.99
 residual = false
 rezero_init = 0.001
-aux_loss_coefficient = 0.0
 
 [[agent.actor.hidden_layers]]
 size = 27
@@ -611,11 +603,8 @@ pub fn run_experiment(args: ExperimentArgs) -> Result<(), Box<dyn std::error::Er
 
     let sweep = match args.sweep.to_lowercase().as_str() {
         "lambda" => SweepParam::Lambda,
-        "aux" => SweepParam::AuxLoss,
         other => {
-            return Err(
-                format!("Unknown sweep parameter '{other}'; expected 'lambda' or 'aux'").into(),
-            )
+            return Err(format!("Unknown sweep parameter '{other}'; expected 'lambda'").into())
         }
     };
 
@@ -631,12 +620,11 @@ pub fn run_experiment(args: ExperimentArgs) -> Result<(), Box<dyn std::error::Er
     // Summary table
     let sweep_col = sweep.name();
     let summary = format!(
-        "\n=== SUMMARY ({} runs, sweep={}) ===\n{:<8} {:<8} {:<8} {:<10} {:<10} {:<10} {:<10}\n{}\n",
+        "\n=== SUMMARY ({} runs, sweep={}) ===\n{:<8} {:<8} {:<10} {:<10} {:<10} {:<10}\n{}\n",
         results.len(),
         sweep_col,
         "seed",
         "lambda",
-        "aux",
         "max_depth",
         "win%",
         "loss%",
@@ -644,10 +632,9 @@ pub fn run_experiment(args: ExperimentArgs) -> Result<(), Box<dyn std::error::Er
         results
             .iter()
             .map(|r| format!(
-                "{:<8} {:<8.2} {:<8.2} {:<10} {:<10.1} {:<10.1} {:<10.1}",
+                "{:<8} {:<8.2} {:<10} {:<10.1} {:<10.1} {:<10.1}",
                 r.seed,
                 r.lambda,
-                r.aux_coefficient,
                 r.max_depth,
                 r.win_rate * 100.0,
                 r.loss_rate * 100.0,
