@@ -67,8 +67,8 @@ impl fmt::Display for RunResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "============")?;
         writeln!(f, "seed={}", self.seed)?;
-        writeln!(f, "lambda={:.6}", self.lambda)?;
-        writeln!(f, "aux={:.2}", self.aux_coefficient)?;
+        writeln!(f, "lambda={:.8}", self.lambda)?;
+        writeln!(f, "aux={:.8}", self.aux_coefficient)?;
         for line in &self.log_lines {
             writeln!(f, "{line}")?;
         }

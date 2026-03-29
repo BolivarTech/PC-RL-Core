@@ -543,7 +543,7 @@ pub fn run_seed_test(args: SeedTestArgs) -> Result<(), Box<dyn std::error::Error
     let results = experiment::run_seed_test(&config, args.n, &mut writer)?;
 
     let summary = format!(
-        "\n=== SEED TEST ({} runs, lambda={:.4}) ===\n{:<24} {:<10} {:<10} {:<10} {:<10}\n{}\n",
+        "\n=== SEED TEST ({} runs, lambda={:.8}) ===\n{:<24} {:<10} {:<10} {:<10} {:<10}\n{}\n",
         results.len(),
         results.first().map(|r| r.lambda).unwrap_or(0.0),
         "seed",
