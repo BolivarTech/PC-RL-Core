@@ -533,7 +533,7 @@ pub fn run_seed_test(args: SeedTestArgs) -> Result<(), Box<dyn std::error::Error
     let config = AppConfig::load(Path::new(&args.config))?;
     config.validate()?;
 
-    let file = std::fs::File::create("seed_test.txt")?;
+    let file = std::fs::File::create("experiment.txt")?;
     let stdout = io::stdout();
     let mut writer = MultiWriter {
         a: io::BufWriter::new(file),
@@ -568,7 +568,7 @@ pub fn run_seed_test(args: SeedTestArgs) -> Result<(), Box<dyn std::error::Error
     write!(writer, "{summary}")?;
     writer.flush()?;
 
-    println!("\nResults saved to seed_test.txt");
+    println!("\nResults saved to experiment.txt");
     Ok(())
 }
 
