@@ -397,6 +397,49 @@ Config: 2 hidden layers (27 softsign), residual=true, rezero_init=0.1, local_lam
 4. **Three mechanisms cooperate**: softsign (gradient preservation) + residual (identity path) + micro-PC-error (structured regularization) enable multi-layer learning that none achieves alone
 5. **Implications for scaling**: this is the first multi-layer configuration to reach depth 9. While still inferior to single-layer DPC (mean 6.89 vs 7.94), the ability to train deeper networks is critical for complex domains where single-layer capacity is insufficient
 
+### Phase 13: Three-Layer Network (N=35, 3×27h softsign, residual, λ=0.9999)
+
+Scaling to 3 hidden layers to test whether the DPC framework degrades with additional depth.
+
+Config: 3 hidden layers (27 softsign each), residual=true, rezero_init=0.1, local_lambda=0.9999, critic input=90.
+
+| Metric | Value |
+|--------|-------|
+| Mean depth | 7.00 |
+| Median | 7.0 |
+| StdDev | 0.73 |
+| Min / Max | 6 / 9 |
+| D>=7 | 80% |
+| D>=8 | 14% |
+| D=9 | 6% (2 seeds) |
+
+#### Depth distribution
+
+| Depth | Count | % |
+|-------|-------|---|
+| 6 | 7 | 20% |
+| 7 | 23 | 66% |
+| 8 | 3 | 9% |
+| 9 | 2 | 6% |
+
+#### Multi-layer comparison (all configs with lambda ≈ 0.99-0.9999)
+
+| Config | Layers | Mean | D>=7 | D>=8 | D=9 |
+|--------|--------|------|------|------|-----|
+| 1-layer tanh, λ=0.99 | 1 | 7.94 | — | 57% | 37% |
+| 2-layer softsign, no residual, λ=0.99 | 2 | 7.31 | — | 20% | 17% |
+| 3-layer softsign, residual, λ=0.9999 | 3 | 7.00 | 80% | 14% | 6% |
+| 2-layer softsign, residual, λ=0.9999 | 2 | 6.89 | 63% | 20% | 6% |
+| 2-layer softsign, residual, λ=0.99 | 2 | 6.77 | — | 3% | 3% |
+
+#### Findings
+
+1. **3 layers does not degrade vs 2 layers** -- mean improves from 6.89 to 7.00, D>=7 jumps from 63% to 80%. The third layer integrates cleanly
+2. **Most consistent multi-layer config** -- 80% reach depth 7+, only 20% stuck at depth 6. More stable than any previous multi-layer experiment
+3. **Two seeds reached depth 9 again** -- the deeper network maintains the ability to find near-optimal solutions
+4. **The DPC framework scales to 3+ layers** without collapsing, using softsign + residual + λ=0.9999. This is critical validation for future application to complex domains
+5. **Diminishing returns on depth for TTT** -- each additional layer slightly reduces peak performance (D>=8: 20%→14%) while improving consistency (D>=7: 63%→80%). For TTT's small state space, 1 layer remains optimal; deeper networks will show their advantage on larger problems
+
 ## Conclusions
 
 1. **Hybrid PC-backprop learning at lambda=0.99 is a statistically significant improvement** over pure backprop for the PC-Actor-Critic architecture on Tic-Tac-Toe
