@@ -1388,8 +1388,8 @@ mod tests {
     }
 
     #[test]
-    fn test_residual_mixed_sizes_selective_skip() {
-        // [27, 27, 18]: skip between 27→27, no skip between 27→18
+    fn test_residual_mixed_sizes_all_skip() {
+        // [27, 27, 18]: ALL layers i>=1 get skip — identity for 27→27, projection for 27→18
         let mut rng = make_rng();
         let config = PcActorConfig {
             residual: true,
@@ -1410,8 +1410,44 @@ mod tests {
             ..default_config()
         };
         let actor = PcActor::new(config, &mut rng).unwrap();
-        // Only 1 skip (between layers 0 and 1), not 2
+        // 2 skips: layer 1 (identity) + layer 2 (projection)
+        assert_eq!(actor.rezero_alpha.len(), 2);
+    }
+
+    #[test]
+    fn test_residual_heterogeneous_has_projection() {
+        // [27, 18]: different sizes → projection matrix created
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
         assert_eq!(actor.rezero_alpha.len(), 1);
+        assert_eq!(actor.skip_projections.len(), 1);
+        assert!(actor.skip_projections[0].is_some());
+        let proj = actor.skip_projections[0].as_ref().unwrap();
+        assert_eq!(proj.rows, 18); // output dim
+        assert_eq!(proj.cols, 27); // input dim
+    }
+
+    #[test]
+    fn test_residual_homogeneous_no_projection() {
+        // [27, 27]: same sizes → no projection needed
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        assert_eq!(actor.skip_projections.len(), 1);
+        assert!(actor.skip_projections[0].is_none());
     }
 
     #[test]
