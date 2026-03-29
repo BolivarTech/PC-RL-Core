@@ -551,6 +551,34 @@ Config: hidden layers [27, 27, 18] softsign, residual=true, rezero_init=0.1, loc
 4. **Fewer parameters, better performance** -- [27,27,18] has fewer hidden neurons than [27,27,27] but reaches depth 9 more often. The projection matrix adds parameters but they serve a more useful purpose than an extra 9 neurons of uniform width
 5. **Best 3-layer configuration overall** -- matches 2-layer softsign without residual in D=9 rate (20% vs 17%) while using a deeper, more expressive architecture
 
+### Phase 17: Heterogeneous Layers Lambda=0.9999 (N=35, [27,27,18] softsign, residual)
+
+Comparing λ=0.9999 vs λ=0.999 for the heterogeneous projection config.
+
+| Metric | λ=0.999 | λ=0.9999 |
+|--------|---------|----------|
+| Mean depth | **7.20** | 7.14 |
+| D>=7 | 74% | **83%** |
+| D>=8 | 26% | 26% |
+| D=9 | **20% (7 seeds)** | 6% (2 seeds) |
+| Min / Max | 6 / 9 | 6 / 9 |
+
+#### Depth distribution (λ=0.9999)
+
+| Depth | Count | % |
+|-------|-------|---|
+| 6 | 6 | 17% |
+| 7 | 20 | 57% |
+| 8 | 7 | 20% |
+| 9 | 2 | 6% |
+
+#### Findings
+
+1. **λ=0.999 confirmed as optimal for [27,27,18]** -- D=9 triples (20% vs 6%) compared to λ=0.9999
+2. **λ=0.9999 is more consistent but less breakthrough** -- 83% reach D>=7 (best consistency) but only 6% reach D=9. The ultra-low PC error prevents escaping local minima
+3. **D>=8 identical** (26%) -- the difference is in the tail: λ=0.999 pushes more seeds past depth 8 into depth 9
+4. **Confirms depth-lambda relationship is topology-dependent** -- for [27,27,18] with projection, λ=0.999 (0.1% PC error) is optimal, same as homogeneous [27,27,27]. The projection does not change the lambda sweet spot
+
 ## Conclusions
 
 1. **Hybrid PC-backprop learning at lambda=0.99 is a statistically significant improvement** over pure backprop for the PC-Actor-Critic architecture on Tic-Tac-Toe
