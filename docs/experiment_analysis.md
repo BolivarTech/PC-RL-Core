@@ -579,20 +579,44 @@ Comparing λ=0.9999 vs λ=0.999 for the heterogeneous projection config.
 3. **D>=8 identical** (26%) -- the difference is in the tail: λ=0.999 pushes more seeds past depth 8 into depth 9
 4. **Confirms depth-lambda relationship is topology-dependent** -- for [27,27,18] with projection, λ=0.999 (0.1% PC error) is optimal, same as homogeneous [27,27,27]. The projection does not change the lambda sweet spot
 
-## Conclusions
+## Conclusions (17 phases, ~3,000+ training runs)
 
-1. **Hybrid PC-backprop learning at lambda=0.99 is a statistically significant improvement** over pure backprop for the PC-Actor-Critic architecture on Tic-Tac-Toe
-2. The effect is modest but consistent: +0.43 average depth, 2x rate of optimal play (depth 9)
-3. The optimal lambda is extremely narrow -- only 0.99 shows improvement out of 6 values tested
-4. Pure local PC learning (lambda=0) is inferior to backprop -- PC errors lack reward information
-5. The PC inference loop remains valuable regardless of lambda -- it contributes +1 depth level vs MLP
-6. Bounded activations (tanh) are required for PC loop stability
-7. **The DPC mechanism (lambda=0.99) is specific to single-layer topologies** -- multi-layer networks with residual skip connections cannot benefit from PC error blending
-8. **Optimal architecture: 1 hidden layer (27 neurons) + lambda=0.99** -- outperforms all multi-layer variants tested
-9. **Softsign is a viable alternative to tanh** -- equivalent performance at lambda=0.99, with the bonus of widening the effective lambda range (0.97-0.99 vs only 0.99)
-10. **Softsign mitigates vanishing gradient in 2-layer networks** -- 2-layer softsign (mean 7.31, 17% D=9) significantly outperforms 2-layer tanh (mean 6.63, 0% D=9), confirming the gradient preservation hypothesis
-11. **Residual skip connections are incompatible with DPC (lambda<1.0)** across all tested configurations -- tanh/softsign, rezero 0.001/0.1/1.0. The identity path creates structural misalignment with PC prediction errors. Without residual, 2-layer softsign is the best multi-layer option
-12. **MSE auxiliary loss degrades performance in all topologies** -- the reconstruction gradient (predict output logits) conflicts with the policy gradient direction, diluting reward signal instead of reinforcing it
+### What Works
+
+1. **PC inference (deliberation) is the dominant factor** -- +2-3 depth levels over equivalent MLP. The actor "thinks" before acting via free energy minimization.
+2. **Lambda=0.99 with single layer** -- statistically significant (p<0.001). Mean 7.94, 37% D=9. The 1% PC error acts as structured micro-regularizer.
+3. **Softsign activation** -- equivalent to tanh but widens effective lambda range (0.97-0.99 vs only 0.99). Mitigates vanishing gradient in multi-layer (+0.68 depth vs tanh).
+4. **Residual + near-pure backprop enables deep networks** -- with lambda sufficiently close to 1.0, skip connections allow 2-3 layer networks to train without collapsing.
+5. **Lambda=0.999 for 3-layer networks** -- sweet spot for deep residual configs. Mean 7.20, up to 20% D=9 with projection.
+6. **Skip projection for heterogeneous layers** -- [27,27,18] with projection outperforms homogeneous [27,27,27] in D=9 rate (20% vs 6%). Dimensionality reduction acts as implicit regularizer.
+
+### What Doesn't Work
+
+7. **Unbounded activations (ReLU, ELU)** -- incompatible with PC inference loop. Dying neurons or unbounded explosion.
+8. **Lambda < 0.975 with any topology** -- too much PC error overwhelms reward signal. All degrade vs baseline.
+9. **Residual + lambda=0.99 with multi-layer** -- PC error amplifies through skip connections. 2 layers: degraded. 3 layers: catastrophic collapse (mean 3.14).
+10. **MSE auxiliary loss** -- degrades performance in all topologies. Reconstruction gradient conflicts with policy gradient. Sweep 0.05-0.50: uniformly harmful.
+11. **Entropy regularization** -- any coefficient destabilizes learned defensive play.
+
+### Discovered Rules
+
+12. **Depth-Lambda Scaling Law: `lambda ≈ 1 - 10^(-L)`** -- 1 layer: 0.99, 3 layers: 0.999. PC error must decrease exponentially with network depth.
+13. **PC inference and learning are independent** -- inference (alpha, max_steps) always active regardless of lambda. Deep networks converge to pure backprop for learning while retaining full deliberation.
+14. **Output activation must be linear** -- tanh on output collapses policy to uniform.
+
+### Optimal Configurations
+
+| Topology | Lambda | Activation | Residual | Mean | D=9 |
+|----------|--------|------------|----------|------|-----|
+| **1×27** | **0.99** | **tanh** | **no** | **7.94** | **37%** |
+| 1×27 | 0.99 | softsign | no | 7.89 | 31% |
+| 2×27 | 0.99 | softsign | no | 7.31 | 17% |
+| **[27,27,18]** | **0.999** | **softsign** | **yes (proj)** | **7.20** | **20%** |
+| 3×27 | 0.999 | softsign | yes | 7.20 | 17% |
+
+### Scaling Implications
+
+For TTT 3×3, single-layer is optimal. But the DPC framework demonstrates trainability of 3-layer networks reaching depth 9 in 20% of seeds — validating the approach for complex domains (e.g., 4×4×4 Qubic) where single-layer capacity is insufficient.
 
 ## Reproduction
 
