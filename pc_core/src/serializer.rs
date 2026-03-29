@@ -172,6 +172,7 @@ pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError>
         layers: save_file.actor_weights.layers,
         config: save_file.config.actor.clone(),
         rezero_alpha: save_file.actor_weights.rezero_alpha,
+        skip_projections: Vec::new(), // Reconstructed from save in serialization cycle
         aux_heads: save_file.actor_weights.aux_heads,
     };
 

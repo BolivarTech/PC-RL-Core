@@ -16,6 +16,7 @@ use crate::error::PcError;
 use crate::layer::{Layer, LayerDef};
 use crate::matrix::{
     argmax_masked, rms_error, sample_from_probs, softmax_masked, vec_add, vec_scale, vec_sub,
+    Matrix,
 };
 
 /// Configuration for the predictive coding actor network.
@@ -202,9 +203,12 @@ pub struct PcActor {
     pub(crate) layers: Vec<Layer>,
     /// Actor configuration.
     pub config: PcActorConfig,
-    /// ReZero scaling factors for eligible skip connections.
-    /// One entry per hidden layer that has a skip connection (index >= 1, same size as previous).
+    /// ReZero scaling factors for skip connections. One per skip layer (all i >= 1 when residual=true).
     pub(crate) rezero_alpha: Vec<f64>,
+    /// Projection matrices for skip connections between layers of different sizes.
+    /// One entry per skip layer: `None` for identity (same size), `Some(Matrix)` for projection.
+    #[allow(dead_code)] // Used in Cycle 2
+    pub(crate) skip_projections: Vec<Option<Matrix>>,
     /// Auxiliary linear heads for hidden layer gradient injection.
     /// One per hidden layer when `aux_loss_coefficient > 0`. Maps hidden_size → output_size.
     /// Used in `update_weights_hybrid()` for gradient injection.
@@ -270,17 +274,25 @@ impl PcActor {
             rng,
         ));
 
-        // Compute rezero_alpha: one entry per eligible skip layer
-        let rezero_alpha = if config.residual {
+        // Compute rezero_alpha and skip_projections: one per skip layer (all i >= 1)
+        let (rezero_alpha, skip_projections) = if config.residual {
             let mut alphas = Vec::new();
+            let mut projs = Vec::new();
             for i in 1..config.hidden_layers.len() {
-                if config.hidden_layers[i].size == config.hidden_layers[i - 1].size {
-                    alphas.push(config.rezero_init);
+                alphas.push(config.rezero_init);
+                if config.hidden_layers[i].size != config.hidden_layers[i - 1].size {
+                    projs.push(Some(Matrix::xavier(
+                        config.hidden_layers[i].size,
+                        config.hidden_layers[i - 1].size,
+                        rng,
+                    )));
+                } else {
+                    projs.push(None);
                 }
             }
-            alphas
+            (alphas, projs)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         // Create auxiliary heads: one linear projection per hidden layer
@@ -298,6 +310,7 @@ impl PcActor {
             layers,
             config,
             rezero_alpha,
+            skip_projections,
             aux_heads,
         })
     }
@@ -318,25 +331,24 @@ impl PcActor {
     /// # Panics
     ///
     /// Panics if `input.len() != config.input_size`.
-    /// Returns whether hidden layer `i` has a skip connection.
+    /// Returns whether hidden layer `i` has a skip connection (identity or projection).
     fn is_skip_layer(&self, i: usize) -> bool {
-        self.config.residual
-            && i >= 1
-            && self.config.hidden_layers[i].size == self.config.hidden_layers[i - 1].size
+        self.config.residual && i >= 1
     }
 
-    /// Returns the rezero_alpha index for hidden layer `i`, if it is a skip layer.
+    /// Returns the rezero_alpha/skip_projections index for hidden layer `i`.
     fn skip_alpha_index(&self, i: usize) -> Option<usize> {
         if !self.is_skip_layer(i) {
             return None;
         }
-        let mut idx = 0;
-        for j in 1..i {
-            if self.config.hidden_layers[j].size == self.config.hidden_layers[j - 1].size {
-                idx += 1;
-            }
-        }
-        Some(idx)
+        Some(i - 1)
+    }
+
+    /// Returns whether skip layer `i` needs a projection matrix (different sizes).
+    #[allow(dead_code)] // Used in Cycle 2
+    fn needs_projection(&self, i: usize) -> bool {
+        self.is_skip_layer(i)
+            && self.config.hidden_layers[i].size != self.config.hidden_layers[i - 1].size
     }
 
     pub fn infer(&self, input: &[f64]) -> InferResult {
