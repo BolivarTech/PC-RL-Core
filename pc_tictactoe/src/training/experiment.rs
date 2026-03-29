@@ -259,7 +259,7 @@ pub fn run_experiment_sweep<W: Write>(
 ///
 /// * `base_config` - Base configuration.
 /// * `n` - Number of repetitions (random seeds).
-/// * `output` - Writer for results (file + stdout via [`MultiWriter`]).
+/// * `output` - Writer for results (file + stdout).
 ///
 /// # Errors
 ///

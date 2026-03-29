@@ -142,7 +142,7 @@ pub struct InferResult {
     pub converged: bool,
     /// Per-layer tanh components for residual layers.
     /// `None` for non-skip layers, `Some(tanh_out)` for skip-eligible layers.
-    /// Needed for correct backward pass (derivative on tanh_out, not full h[i]).
+    /// Needed for correct backward pass (derivative on tanh_out, not full h\[i\]).
     pub tanh_components: Vec<Option<Vec<f64>>>,
 }
 
