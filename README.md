@@ -8,7 +8,7 @@ A **Deliberative Predictive Coding (DPC)** reinforcement learning agent that lea
 
 The actor **deliberates before acting** by running an iterative free energy minimization loop (predictive coding inference), and a **residual echo of that deliberation** feeds back into weight updates as a structured micro-regularizer. These two mechanisms form a coupled system: deliberation generates the signal, the signal improves learning, and better learning improves future deliberation. The agent trains via REINFORCE with baseline against minimax opponents with curriculum learning.
 
-The core library (`pc_core`) is **backend-agnostic**: all linear algebra operations are abstracted behind a `LinAlg` trait, enabling future GPU backends (wgpu, CUDA) without changing the RL logic.
+The core library (`pc-rl-core`) is **backend-agnostic**: all linear algebra operations are abstracted behind a `LinAlg` trait, enabling future GPU backends (wgpu, CUDA) without changing the RL logic.
 
 ## Results
 
@@ -58,7 +58,7 @@ All core structs are generic over `L: LinAlg` (default `CpuLinAlg`), enabling fu
 
 ```
 PC-TicTacToe/
-├── pc_core/                    # Reusable RL library (v1.0.0)
+├── pc-rl-core/                    # Reusable RL library (v1.0.0)
 │   └── src/
 │       ├── linalg/
 │       │   ├── mod.rs          # LinAlg trait (26 methods, backend-agnostic)
@@ -134,7 +134,7 @@ For the complete experimental methodology and statistical analysis, see [docs/ex
 
 ## Dependencies
 
-The `pc_core` library uses only:
+The `pc-rl-core` library uses only:
 - `serde` / `serde_json` -- Serialization
 - `rand` -- Random number generation
 - `chrono` -- Timestamps
@@ -155,7 +155,7 @@ No PyTorch, TensorFlow, or any ML framework. Pure Rust from scratch.
 cargo nextest run --workspace
 
 # Run specific crate
-cargo nextest run -p pc_core
+cargo nextest run -p pc-rl-core
 cargo nextest run -p pc_tictactoe
 
 # Lint

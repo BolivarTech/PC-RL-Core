@@ -16,7 +16,7 @@ Key contributions:
 5. **Topology constraint**: The DPC mechanism is specific to single-layer architectures -- multi-layer networks and residual skip connections are incompatible with the PC error blend
 6. **Softsign as PC-compatible activation**: Softsign widens the effective lambda range (0.97-0.99 vs only 0.99 for tanh) and mitigates vanishing gradient in multi-layer networks
 
-Validated through 8 experimental phases comprising over 1,400 training runs across 7 architectural configurations. Implementation is in pure Rust with ~1,900 total parameters. Published as `pc_core` v0.2.0 on crates.io.
+Validated through 8 experimental phases comprising over 1,400 training runs across 7 architectural configurations. Implementation is in pure Rust with ~1,900 total parameters. Published as `pc-rl-core` v1.0.0 on crates.io.
 
 ---
 
@@ -440,7 +440,7 @@ PC inference as a mechanism for parameter efficiency in RL is not well documente
 ### 5.1 Technology
 
 - **Language**: Rust (pure, no ML framework dependencies)
-- **Library crate**: `pc_core` v1.0.0 (published on crates.io)
+- **Library crate**: `pc-rl-core` v1.0.0 (published on crates.io)
 - **Architecture**: Backend-agnostic via `LinAlg` trait (26 methods). All structs generic over `L: LinAlg` with `CpuLinAlg` default. Type aliases: `PcActorCpu`, `MlpCriticCpu`, `PcActorCriticCpu`, `LayerCpu`.
 - **Dependencies**: serde, serde_json, rand, chrono (core); toml, clap, ctrlc (binary)
 - **Tests**: 357 unit tests + 12 doctests, TDD methodology throughout
@@ -608,7 +608,7 @@ The DPC architecture exhibits properties that make it a strong candidate for evo
 2. **Ultra-narrow sweet spots** -- out of 6 lambda values tested per topology, only one produces statistically significant improvement. The optimal region is too small for random search and too non-linear for Bayesian optimization. Gaussian mutation in a GA provides fine-grained local exploration around promising candidates.
 3. **Natural chromosome representation** -- the DPC hyperparameter space maps directly to a GA chromosome: `[hidden_sizes, num_layers, activation, alpha, lr_weights, lr_critic, lambda, residual, rezero_init, temperature, episodes, gamma]`. Each gene has clear bounds and meaningful mutation operators.
 4. **Parallelizable fitness evaluation** -- each individual's training run is independent, enabling linear speedup across cores or machines. Tournament selection (k=3) with elitism (top 5%) preserves good configurations while maintaining population diversity.
-5. **Domain-agnostic fitness** -- `pc_core` is environment-independent, so a GA optimizing DPC hyperparameters can transfer across domains. Fitness on a fast proxy task (e.g., TTT) can pre-filter configurations before expensive evaluation on complex domains.
+5. **Domain-agnostic fitness** -- `pc-rl-core` is environment-independent, so a GA optimizing DPC hyperparameters can transfer across domains. Fitness on a fast proxy task (e.g., TTT) can pre-filter configurations before expensive evaluation on complex domains.
 
 The key insight from 19 experimental phases is that DPC's optimal configuration space is **sparse, non-convex, and interaction-dominated** -- precisely the landscape where evolutionary methods outperform gradient-free alternatives.
 
@@ -639,4 +639,4 @@ The current architecture uses PC inference only in the actor. A natural question
 *Author: Julian Bolivar -- BolivarTech*
 *Date: March 2026*
 *Repository: https://github.com/BolivarTech/PC-TicTacToe*
-*Crate: https://crates.io/crates/pc_core*
+*Crate: https://crates.io/crates/pc-rl-core*
