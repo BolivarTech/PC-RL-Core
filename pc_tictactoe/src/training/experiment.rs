@@ -424,6 +424,46 @@ mod tests {
     }
 
     #[test]
+    fn test_run_seed_test_produces_n_results() {
+        let config = test_config();
+        let mut buf = Vec::new();
+        let results = run_seed_test(&config, 3, &mut buf).unwrap();
+        assert_eq!(results.len(), 3); // 3 seeds × 1 config
+    }
+
+    #[test]
+    fn test_run_seed_test_uses_config_lambda() {
+        let mut config = test_config();
+        config.agent.actor.local_lambda = 0.9999;
+        let mut buf = Vec::new();
+        let results = run_seed_test(&config, 2, &mut buf).unwrap();
+        for r in &results {
+            assert!((r.lambda - 0.9999).abs() < 1e-12, "Should use config lambda");
+        }
+    }
+
+    #[test]
+    fn test_run_seed_test_different_seeds() {
+        let config = test_config();
+        let mut buf = Vec::new();
+        let results = run_seed_test(&config, 3, &mut buf).unwrap();
+        let seeds: Vec<u64> = results.iter().map(|r| r.seed).collect();
+        assert_ne!(seeds[0], seeds[1], "Seeds should differ");
+        assert_ne!(seeds[1], seeds[2], "Seeds should differ");
+    }
+
+    #[test]
+    fn test_run_seed_test_writes_output() {
+        let config = test_config();
+        let mut buf = Vec::new();
+        let _ = run_seed_test(&config, 1, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("============"));
+        assert!(output.contains("seed="));
+        assert!(output.contains("------------"));
+    }
+
+    #[test]
     fn test_run_experiment_writes_output() {
         let config = test_config();
         let mut buf = Vec::new();
