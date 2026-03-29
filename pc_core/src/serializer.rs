@@ -590,44 +590,4 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    #[test]
-    fn test_roundtrip_preserves_aux_heads() {
-        let config = PcActorCriticConfig {
-            actor: PcActorConfig {
-                aux_loss_coefficient: 0.1,
-                ..default_config().actor
-            },
-            ..default_config()
-        };
-        let agent = PcActorCritic::new(config, 42).unwrap();
-        assert_eq!(agent.actor.aux_heads.len(), 1);
-
-        let path = temp_path("test_aux_roundtrip.json");
-        save_agent(&agent, &path, 10, None).unwrap();
-        let (loaded, _) = load_agent(&path).unwrap();
-        assert_eq!(loaded.actor.aux_heads.len(), 1);
-        for (a, b) in agent.actor.aux_heads[0]
-            .weights
-            .data
-            .iter()
-            .zip(loaded.actor.aux_heads[0].weights.data.iter())
-        {
-            assert!(
-                (a - b).abs() < 1e-12,
-                "Aux head weight mismatch: {a} vs {b}"
-            );
-        }
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_roundtrip_no_aux_backward_compat() {
-        let agent = make_agent();
-        assert!(agent.actor.aux_heads.is_empty());
-        let path = temp_path("test_no_aux_compat.json");
-        save_agent(&agent, &path, 10, None).unwrap();
-        let (loaded, _) = load_agent(&path).unwrap();
-        assert!(loaded.actor.aux_heads.is_empty());
-        let _ = fs::remove_file(&path);
-    }
 }

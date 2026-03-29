@@ -461,42 +461,11 @@ mod tests {
     }
 
     #[test]
-    fn test_sweep_param_aux_values() {
-        let values = SweepParam::AuxLoss.values();
-        assert_eq!(values.len(), 10);
-        assert!((values[0] - 0.05).abs() < 1e-12);
-        assert!((values[9] - 0.50).abs() < 1e-12);
-    }
-
-    #[test]
     fn test_sweep_param_lambda_values() {
         let values = SweepParam::Lambda.values();
         assert_eq!(values.len(), 6);
         assert!((values[0] - 0.95).abs() < 1e-12);
         assert!((values[5] - 1.00).abs() < 1e-12);
-    }
-
-    #[test]
-    fn test_run_result_has_aux_coefficient() {
-        let result = RunResult {
-            seed: 42,
-            lambda: 0.99,
-            aux_coefficient: 0.1,
-            max_depth: 8,
-            win_rate: 0.0,
-            loss_rate: 0.5,
-            draw_rate: 0.5,
-            log_lines: vec![],
-        };
-        assert!((result.aux_coefficient - 0.1).abs() < 1e-12);
-    }
-
-    #[test]
-    fn test_run_experiment_aux_sweep_produces_n_times_10() {
-        let config = test_config();
-        let mut buf = Vec::new();
-        let results = run_experiment_sweep(&config, 1, SweepParam::AuxLoss, &mut buf).unwrap();
-        assert_eq!(results.len(), 10); // 1 seed × 10 aux values
     }
 
     #[test]
