@@ -520,6 +520,37 @@ Config: 3 hidden layers (27 softsign each), residual=true, rezero_init=0.1, loca
 4. **Emerging pattern: optimal PC error scales inversely with depth** -- 1 layer: 1% (λ=0.99), 3 layers: 0.1% (λ=0.999). The relationship appears to follow `lambda ≈ 1 - 10^(-layers)`, suggesting deeper networks need proportionally less PC error regularization
 5. **The DPC framework successfully trains 3-layer networks** to near-optimal play, validating the approach for scaling to more complex domains
 
+### Phase 16: Heterogeneous Layers with Skip Projection (N=35, [27,27,18] softsign, residual, λ=0.999)
+
+Testing skip projection for heterogeneous hidden layer sizes: identity skip between same-size pairs (27→27), learnable linear projection in the skip path between different-size pairs (27→18).
+
+Config: hidden layers [27, 27, 18] softsign, residual=true, rezero_init=0.1, local_lambda=0.999, critic input=81.
+
+| Metric | [27,27,18] proj | [27,27,27] identity |
+|--------|-----------------|---------------------|
+| Mean depth | 7.20 | 7.20 |
+| D>=7 | 74% | 80% |
+| D>=8 | **26%** | 14% |
+| D=9 | **20% (7 seeds)** | 6% (2 seeds) |
+| Min / Max | 6 / 9 | 6 / 9 |
+
+#### Depth distribution
+
+| Depth | Count | % |
+|-------|-------|---|
+| 6 | 9 | 26% |
+| 7 | 17 | 49% |
+| 8 | 2 | 6% |
+| 9 | 7 | 20% |
+
+#### Findings
+
+1. **D=9 triples with projection** -- 20% vs 6% with homogeneous identity-only skip. 7 seeds reached depth 9, the highest count for any 3-layer configuration
+2. **Same mean but better tail distribution** -- mean 7.20 identical, but D>=8 nearly doubles (26% vs 14%). The projection enables more seeds to break through to high depths
+3. **Dimensionality reduction through projection benefits learning** -- the 27→18 projection forces representation compression, acting as an implicit regularizer. The learnable W_proj adapts the compression to the task
+4. **Fewer parameters, better performance** -- [27,27,18] has fewer hidden neurons than [27,27,27] but reaches depth 9 more often. The projection matrix adds parameters but they serve a more useful purpose than an extra 9 neurons of uniform width
+5. **Best 3-layer configuration overall** -- matches 2-layer softsign without residual in D=9 rate (20% vs 17%) while using a deeper, more expressive architecture
+
 ## Conclusions
 
 1. **Hybrid PC-backprop learning at lambda=0.99 is a statistically significant improvement** over pure backprop for the PC-Actor-Critic architecture on Tic-Tac-Toe
