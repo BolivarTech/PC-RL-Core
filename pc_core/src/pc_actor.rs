@@ -207,7 +207,6 @@ pub struct PcActor {
     pub(crate) rezero_alpha: Vec<f64>,
     /// Projection matrices for skip connections between layers of different sizes.
     /// One entry per skip layer: `None` for identity (same size), `Some(Matrix)` for projection.
-    #[allow(dead_code)] // Used in Cycle 2
     pub(crate) skip_projections: Vec<Option<Matrix>>,
     /// Auxiliary linear heads for hidden layer gradient injection.
     /// One per hidden layer when `aux_loss_coefficient > 0`. Maps hidden_size → output_size.
@@ -344,13 +343,6 @@ impl PcActor {
         Some(i - 1)
     }
 
-    /// Returns whether skip layer `i` needs a projection matrix (different sizes).
-    #[allow(dead_code)] // Used in Cycle 2
-    fn needs_projection(&self, i: usize) -> bool {
-        self.is_skip_layer(i)
-            && self.config.hidden_layers[i].size != self.config.hidden_layers[i - 1].size
-    }
-
     pub fn infer(&self, input: &[f64]) -> InferResult {
         assert_eq!(
             input.len(),
@@ -369,10 +361,14 @@ impl PcActor {
         for (i, layer) in self.layers[..n_hidden].iter().enumerate() {
             let tanh_out = layer.forward(&prev);
             if let Some(alpha_idx) = self.skip_alpha_index(i) {
-                // Residual: h[i] = rezero_alpha * tanh_out + h[i-1]
                 let alpha = self.rezero_alpha[alpha_idx];
                 let scaled = vec_scale(&tanh_out, alpha);
-                prev = vec_add(&prev, &scaled);
+                let skip_path = if let Some(ref proj) = self.skip_projections[alpha_idx] {
+                    proj.mul_vec(&prev)
+                } else {
+                    prev.clone()
+                };
+                prev = vec_add(&skip_path, &scaled);
                 tanh_components.push(Some(tanh_out));
             } else {
                 prev = tanh_out;
@@ -434,7 +430,12 @@ impl PcActor {
                         tanh_components[i] = Some(updated_target.clone());
                         let alpha = self.rezero_alpha[alpha_idx];
                         let prev_h = if i > 0 { &hidden_states[i - 1] } else { input };
-                        hidden_states[i] = vec_add(prev_h, &vec_scale(&updated_target, alpha));
+                        let skip_path = if let Some(ref proj) = self.skip_projections[alpha_idx] {
+                            proj.mul_vec(prev_h)
+                        } else {
+                            prev_h.to_vec()
+                        };
+                        hidden_states[i] = vec_add(&skip_path, &vec_scale(&updated_target, alpha));
                     } else {
                         hidden_states[i] = updated_target;
                     }
@@ -482,7 +483,12 @@ impl PcActor {
                         tanh_components[i] = Some(updated_target.clone());
                         let alpha = self.rezero_alpha[alpha_idx];
                         let prev_h = if i > 0 { &hidden_states[i - 1] } else { input };
-                        hidden_states[i] = vec_add(prev_h, &vec_scale(&updated_target, alpha));
+                        let skip_path = if let Some(ref proj) = self.skip_projections[alpha_idx] {
+                            proj.mul_vec(prev_h)
+                        } else {
+                            prev_h.to_vec()
+                        };
+                        hidden_states[i] = vec_add(&skip_path, &vec_scale(&updated_target, alpha));
                     } else {
                         hidden_states[i] = updated_target;
                     }
@@ -715,8 +721,19 @@ impl PcActor {
                     .sum();
                 self.rezero_alpha[alpha_idx] -= effective_lr * grad_alpha;
 
-                // Propagated delta = nonlinear path + identity path
-                bp_delta = vec_add(&propagated, &effective_delta);
+                // Propagated delta = nonlinear path + skip path (identity or projection)
+                if let Some(ref mut proj) = self.skip_projections[alpha_idx] {
+                    // Projection path: W_proj^T × delta
+                    let proj_t = proj.transpose();
+                    let skip_delta = proj_t.mul_vec(&effective_delta);
+                    // Update projection: W_proj -= lr × outer(delta, layer_input)
+                    let dw_proj = Matrix::outer(&effective_delta, layer_input);
+                    proj.scale_add(&dw_proj, -effective_lr);
+                    bp_delta = vec_add(&propagated, &skip_delta);
+                } else {
+                    // Identity path: + delta
+                    bp_delta = vec_add(&propagated, &effective_delta);
+                }
             } else {
                 // Standard layer: use hidden_states[i] as output
                 let layer_output = &infer_result.hidden_states[i];
