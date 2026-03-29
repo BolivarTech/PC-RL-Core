@@ -30,12 +30,6 @@ cargo check
 
 # Lint
 cargo clippy -- -D warnings
-
-# Generate default config
-cargo run -- init
-
-# Run experiment (N seeds × 6 lambda values)
-cargo run --release -- experiment -n 35 -c config.toml
 ```
 
 ## Architecture
@@ -43,7 +37,7 @@ cargo run --release -- experiment -n 35 -c config.toml
 The project is planned as a **Cargo workspace** with two crates:
 
 - **`pc_core`** — Library crate (publishable). Contains the PC-Actor-Critic framework:
-  - `activation.rs` — Activation functions enum (Tanh, Relu, Sigmoid, Elu, Softsign, Linear) with apply/derivative
+  - `activation.rs` — Activation functions enum (Tanh, Relu, Sigmoid, Elu, Linear) with apply/derivative
   - `error.rs` — Crate-wide `PcError` enum (ConfigValidation, DimensionMismatch, Serialization, Io)
   - `matrix.rs` — Dense matrix ops, softmax, argmax, RMS error, weight/gradient clipping (WEIGHT_CLIP=5.0, GRAD_CLIP=5.0)
   - `layer.rs` — Single dense layer with forward, transpose_forward (PC top-down), and backward
@@ -57,8 +51,7 @@ The project is planned as a **Cargo workspace** with two crates:
   - `env/minimax.rs` — Minimax baseline opponent
   - `training/trainer.rs` — Episode-based training loop
   - `training/continuous.rs` — Continuous learning with surprise scheduling
-  - `training/experiment.rs` — Lambda sweep experiment runner with SweepParam
-  - `ui/cli.rs` — CLI interface (clap): train, play, evaluate, benchmark, experiment, init
+  - `ui/cli.rs` — CLI interface (clap)
   - `utils/` — Config (TOML), logger, metrics
 
 ### Key Concepts
@@ -141,12 +134,12 @@ Hybrid blend: `delta = λ * backprop_grad + (1-λ) * pc_prediction_error`
 | 27→18h | 0.25 | depth 6 | — |
 | 27→18h | 0.0 | depth 6 | — |
 
-### Activation Experiments (27h, N=35 seeds where noted)
+### Activation Experiments (test branch, seed=42, 27h)
 
 | Activation | Depth | Notes |
 |------------|-------|-------|
 | tanh | 8 | Baseline. Bounded output stabilizes PC loop |
-| softsign | — | Equivalent to tanh (mean 7.89 vs 7.94, N=35). Widens effective lambda range (0.97-0.99 vs only 0.99) |
+| softsign | — | Equivalent to tanh (mean 7.89 vs 7.94 at λ=0.99, N=35). Widens effective lambda range (0.97-0.99 vs only 0.99) |
 | relu | 4 | Dying neurons: PC loop pushes activations negative permanently |
 | elu | 6 | Unbounded positives: PC loop creates unstable feedback → policy collapse |
 
@@ -183,6 +176,17 @@ Hybrid blend: `delta = λ * backprop_grad + (1-λ) * pc_prediction_error`
 ### Seed Dependency Analysis
 
 Seed-dependence is expected: different seeds place the optimizer in different basins of attraction in the loss landscape. The λ=0.99 perturbation (1% PC error) increases the probability of escaping to deeper basins but cannot guarantee it for all starting points. This explains both the statistical improvement (more seeds reach depth 9) and the remaining variance.
+
+### Residual Skip Connection Experiments (N=35 seeds, 2×27h)
+
+Residual connections (`h[i] = α_rz * tanh(...) + h[i-1]`) were tested to address vanishing gradients in multi-layer networks.
+
+| Config | λ=1.0 Mean | λ=0.99 Mean | Result |
+|--------|-----------|-------------|--------|
+| ReZero 0.001, steps 1-5 | 6.94 | 3.40 | λ<1.0 collapses to depth 1-4 |
+| ResNet 1.0, steps 3-10 | 6.45 | 3.34 | Same pattern, λ<1.0 collapses |
+
+**Residual + backprop (λ=1.0) works** (depth 6-9) but **residual + DPC (λ<1.0) fails catastrophically**. The PC error blend is incompatible with multi-layer networks — prediction errors conflict with policy gradient direction. **Optimal config remains: 1 layer (27h) + λ=0.99 (mean 7.57)**.
 
 ### Evolutionary Optimization Potential
 

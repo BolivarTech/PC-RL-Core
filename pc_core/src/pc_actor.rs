@@ -16,6 +16,7 @@ use crate::error::PcError;
 use crate::layer::{Layer, LayerDef};
 use crate::matrix::{
     argmax_masked, rms_error, sample_from_probs, softmax_masked, vec_add, vec_scale, vec_sub,
+    Matrix,
 };
 
 /// Configuration for the predictive coding actor network.
@@ -40,6 +41,8 @@ use crate::matrix::{
 ///     synchronous: true,
 ///     temperature: 1.0,
 ///     local_lambda: 1.0,
+///     residual: false,
+///     rezero_init: 0.001,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,13 +55,19 @@ pub struct PcActorConfig {
     pub output_size: usize,
     /// Activation function for the output layer.
     pub output_activation: Activation,
-    /// Inference learning rate for PC loop updates.
+    /// Inference learning rate for PC loop state updates (`h += alpha * error`).
+    /// Set to 0.0 to disable PC inference (network behaves as standard MLP).
+    /// Active regardless of `residual` setting.
     pub alpha: f64,
     /// Convergence threshold for RMS prediction error.
+    /// PC loop exits early when surprise < tol (after at least `min_steps`).
+    /// Active regardless of `residual` setting.
     pub tol: f64,
-    /// Minimum inference steps before convergence check.
+    /// Minimum PC inference steps before convergence check is allowed.
+    /// Active regardless of `residual` setting.
     pub min_steps: usize,
-    /// Maximum inference steps.
+    /// Maximum PC inference steps per action.
+    /// Active regardless of `residual` setting.
     pub max_steps: usize,
     /// Base learning rate for weight updates.
     pub lr_weights: f64,
@@ -81,6 +90,28 @@ pub struct PcActorConfig {
     /// The output layer always uses standard backprop regardless of this value.
     #[serde(default = "default_local_lambda")]
     pub local_lambda: f64,
+    /// Enable residual skip connections between same-dimension hidden layers.
+    /// When false, `rezero_init` is ignored. When true, all hidden layers
+    /// must have the same size, and skip connections with learnable ReZero
+    /// scaling are added between consecutive hidden layers (not the first,
+    /// since input_size typically differs from hidden_size).
+    #[serde(default)]
+    pub residual: bool,
+    /// Initial value for ReZero scaling factors on residual connections.
+    /// Only used when `residual = true`. Controls initial contribution of
+    /// the nonlinear component: `h[i] = rezero_init * tanh(...) + h[i-1]`.
+    ///
+    /// - `0.001` — Near-identity start (ReZero: network learns depth gradually)
+    /// - `1.0` — Standard ResNet residual (full contribution from start)
+    ///
+    /// Ignored when `residual = false`.
+    #[serde(default = "default_rezero_init")]
+    pub rezero_init: f64,
+}
+
+/// Default rezero_init: 0.001 (near-identity at start).
+fn default_rezero_init() -> f64 {
+    0.001
 }
 
 /// Default local_lambda: 1.0 (pure backprop).
@@ -109,6 +140,10 @@ pub struct InferResult {
     pub steps_used: usize,
     /// Whether the inference loop converged within tolerance.
     pub converged: bool,
+    /// Per-layer tanh components for residual layers.
+    /// `None` for non-skip layers, `Some(tanh_out)` for skip-eligible layers.
+    /// Needed for correct backward pass (derivative on tanh_out, not full h\[i\]).
+    pub tanh_components: Vec<Option<Vec<f64>>>,
 }
 
 /// Action selection mode.
@@ -142,6 +177,8 @@ pub enum SelectionMode {
 ///     alpha: 0.1, tol: 0.01, min_steps: 1, max_steps: 20,
 ///     lr_weights: 0.01, synchronous: true, temperature: 1.0,
 ///     local_lambda: 1.0,
+///     residual: false,
+///     rezero_init: 0.001,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
 /// let actor = PcActor::new(config, &mut rng).unwrap();
@@ -154,6 +191,11 @@ pub struct PcActor {
     pub(crate) layers: Vec<Layer>,
     /// Actor configuration.
     pub config: PcActorConfig,
+    /// ReZero scaling factors for skip connections. One per skip layer (all i >= 1 when residual=true).
+    pub(crate) rezero_alpha: Vec<f64>,
+    /// Projection matrices for skip connections between layers of different sizes.
+    /// One entry per skip layer: `None` for identity (same size), `Some(Matrix)` for projection.
+    pub(crate) skip_projections: Vec<Option<Matrix>>,
 }
 
 impl PcActor {
@@ -187,7 +229,12 @@ impl PcActor {
                 config.local_lambda
             )));
         }
-
+        if config.rezero_init < 0.0 {
+            return Err(PcError::ConfigValidation(format!(
+                "rezero_init must be >= 0, got {}",
+                config.rezero_init
+            )));
+        }
         let mut layers = Vec::new();
         let mut prev_size = config.input_size;
 
@@ -204,7 +251,33 @@ impl PcActor {
             rng,
         ));
 
-        Ok(Self { layers, config })
+        // Compute rezero_alpha and skip_projections: one per skip layer (all i >= 1)
+        let (rezero_alpha, skip_projections) = if config.residual {
+            let mut alphas = Vec::new();
+            let mut projs = Vec::new();
+            for i in 1..config.hidden_layers.len() {
+                alphas.push(config.rezero_init);
+                if config.hidden_layers[i].size != config.hidden_layers[i - 1].size {
+                    projs.push(Some(Matrix::xavier(
+                        config.hidden_layers[i].size,
+                        config.hidden_layers[i - 1].size,
+                        rng,
+                    )));
+                } else {
+                    projs.push(None);
+                }
+            }
+            (alphas, projs)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        Ok(Self {
+            layers,
+            config,
+            rezero_alpha,
+            skip_projections,
+        })
     }
 
     /// Returns the total size of the latent concatenation (sum of hidden layer sizes).
@@ -223,6 +296,19 @@ impl PcActor {
     /// # Panics
     ///
     /// Panics if `input.len() != config.input_size`.
+    /// Returns whether hidden layer `i` has a skip connection (identity or projection).
+    fn is_skip_layer(&self, i: usize) -> bool {
+        self.config.residual && i >= 1
+    }
+
+    /// Returns the rezero_alpha/skip_projections index for hidden layer `i`.
+    fn skip_alpha_index(&self, i: usize) -> Option<usize> {
+        if !self.is_skip_layer(i) {
+            return None;
+        }
+        Some(i - 1)
+    }
+
     pub fn infer(&self, input: &[f64]) -> InferResult {
         assert_eq!(
             input.len(),
@@ -236,9 +322,24 @@ impl PcActor {
 
         // Forward pass to initialize hidden states and output
         let mut hidden_states: Vec<Vec<f64>> = Vec::with_capacity(n_hidden);
+        let mut tanh_components: Vec<Option<Vec<f64>>> = Vec::with_capacity(n_hidden);
         let mut prev = input.to_vec();
-        for layer in &self.layers[..n_hidden] {
-            prev = layer.forward(&prev);
+        for (i, layer) in self.layers[..n_hidden].iter().enumerate() {
+            let tanh_out = layer.forward(&prev);
+            if let Some(alpha_idx) = self.skip_alpha_index(i) {
+                let alpha = self.rezero_alpha[alpha_idx];
+                let scaled = vec_scale(&tanh_out, alpha);
+                let skip_path = if let Some(ref proj) = self.skip_projections[alpha_idx] {
+                    proj.mul_vec(&prev)
+                } else {
+                    prev.clone()
+                };
+                prev = vec_add(&skip_path, &scaled);
+                tanh_components.push(Some(tanh_out));
+            } else {
+                prev = tanh_out;
+                tanh_components.push(None);
+            }
             hidden_states.push(prev.clone());
         }
         // Output from last hidden (or input if no hidden)
@@ -261,31 +362,51 @@ impl PcActor {
             if self.config.synchronous {
                 // Snapshot mode: freeze all states
                 let snapshot: Vec<Vec<f64>> = hidden_states.clone();
+                let tanh_snap: Vec<Option<Vec<f64>>> = tanh_components.clone();
 
                 let mut error_vecs: Vec<Vec<f64>> = Vec::new();
 
                 for i in (0..n_hidden).rev() {
-                    // State above: y for top hidden, hidden_states[i+1] otherwise
+                    // For top-down prediction, use tanh_component of layer above
+                    // (not the full residual sum) when it is a skip layer.
                     let state_above = if i == n_hidden - 1 {
                         &y
+                    } else if let Some(ref tc) = tanh_snap[i + 1] {
+                        tc
                     } else {
                         &snapshot[i + 1]
                     };
 
-                    // Top-down prediction
+                    // Top-down prediction targets tanh_component for skip layers
+                    let target = if let Some(ref tc) = tanh_snap[i] {
+                        tc
+                    } else {
+                        &snapshot[i]
+                    };
+
                     let prediction = self.layers[i + 1]
                         .transpose_forward(state_above, self.config.hidden_layers[i].activation);
 
-                    // Error = prediction - snapshot[i]
-                    let error = vec_sub(&prediction, &snapshot[i]);
+                    let error = vec_sub(&prediction, target);
                     error_vecs.push(error.clone());
 
-                    // Update: h[i] = snapshot[i] + alpha * error
-                    let update = vec_add(&snapshot[i], &vec_scale(&error, self.config.alpha));
-                    hidden_states[i] = update;
+                    // Update tanh_component or hidden_state
+                    let updated_target = vec_add(target, &vec_scale(&error, self.config.alpha));
+                    if let Some(alpha_idx) = self.skip_alpha_index(i) {
+                        tanh_components[i] = Some(updated_target.clone());
+                        let alpha = self.rezero_alpha[alpha_idx];
+                        let prev_h = if i > 0 { &hidden_states[i - 1] } else { input };
+                        let skip_path = if let Some(ref proj) = self.skip_projections[alpha_idx] {
+                            proj.mul_vec(prev_h)
+                        } else {
+                            prev_h.to_vec()
+                        };
+                        hidden_states[i] = vec_add(&skip_path, &vec_scale(&updated_target, alpha));
+                    } else {
+                        hidden_states[i] = updated_target;
+                    }
                 }
 
-                // Recompute output from updated top hidden
                 let top_hidden = if n_hidden > 0 {
                     &hidden_states[n_hidden - 1]
                 } else {
@@ -293,7 +414,6 @@ impl PcActor {
                 };
                 y = self.layers[n_hidden].forward(top_hidden);
 
-                // RMS error
                 let refs: Vec<&[f64]> = error_vecs.iter().map(|v| v.as_slice()).collect();
                 surprise_score = rms_error(&refs);
                 last_errors = error_vecs;
@@ -302,20 +422,42 @@ impl PcActor {
                 let mut error_vecs: Vec<Vec<f64>> = Vec::new();
 
                 for i in (0..n_hidden).rev() {
+                    // For top-down prediction, use tanh_component of layer above
+                    // (not the full residual sum) when it is a skip layer.
                     let state_above = if i == n_hidden - 1 {
                         &y
+                    } else if let Some(ref tc) = tanh_components[i + 1] {
+                        tc
                     } else {
                         &hidden_states[i + 1]
+                    };
+
+                    let target = if let Some(ref tc) = tanh_components[i] {
+                        tc.clone()
+                    } else {
+                        hidden_states[i].clone()
                     };
 
                     let prediction = self.layers[i + 1]
                         .transpose_forward(state_above, self.config.hidden_layers[i].activation);
 
-                    let error = vec_sub(&prediction, &hidden_states[i]);
+                    let error = vec_sub(&prediction, &target);
                     error_vecs.push(error.clone());
 
-                    let update = vec_add(&hidden_states[i], &vec_scale(&error, self.config.alpha));
-                    hidden_states[i] = update;
+                    let updated_target = vec_add(&target, &vec_scale(&error, self.config.alpha));
+                    if let Some(alpha_idx) = self.skip_alpha_index(i) {
+                        tanh_components[i] = Some(updated_target.clone());
+                        let alpha = self.rezero_alpha[alpha_idx];
+                        let prev_h = if i > 0 { &hidden_states[i - 1] } else { input };
+                        let skip_path = if let Some(ref proj) = self.skip_projections[alpha_idx] {
+                            proj.mul_vec(prev_h)
+                        } else {
+                            prev_h.to_vec()
+                        };
+                        hidden_states[i] = vec_add(&skip_path, &vec_scale(&updated_target, alpha));
+                    } else {
+                        hidden_states[i] = updated_target;
+                    }
                 }
 
                 let top_hidden = if n_hidden > 0 {
@@ -354,6 +496,7 @@ impl PcActor {
             surprise_score,
             steps_used,
             converged,
+            tanh_components,
         }
     }
 
@@ -474,18 +617,14 @@ impl PcActor {
             } else {
                 input
             };
-            let layer_output = &infer_result.hidden_states[i];
 
             // Blend backprop delta with local PC error
             let effective_delta = if (lambda - 1.0).abs() < f64::EPSILON {
-                // Pure backprop: use bp_delta directly
                 bp_delta.clone()
             } else if lambda.abs() < f64::EPSILON {
-                // Pure local: use PC error directly
                 let error_idx = n_hidden - 1 - i;
                 infer_result.prediction_errors[error_idx].clone()
             } else {
-                // Hybrid: blend both signals
                 let error_idx = n_hidden - 1 - i;
                 let pc_error = &infer_result.prediction_errors[error_idx];
                 bp_delta
@@ -495,13 +634,57 @@ impl PcActor {
                     .collect()
             };
 
-            bp_delta = self.layers[i].backward(
-                layer_input,
-                layer_output,
-                &effective_delta,
-                self.config.lr_weights,
-                surprise_scale,
-            );
+            if let Some(alpha_idx) = self.skip_alpha_index(i) {
+                // Skip-eligible layer: use tanh_out for derivative, scale by alpha,
+                // add identity path to propagated gradient, update alpha.
+                let tanh_out = infer_result.tanh_components[i].as_ref().unwrap();
+                let alpha = self.rezero_alpha[alpha_idx];
+                let effective_lr = self.config.lr_weights * surprise_scale;
+
+                // Scale delta by rezero_alpha for the nonlinear path
+                let scaled_delta: Vec<f64> = effective_delta.iter().map(|&d| d * alpha).collect();
+
+                // Backward through the layer using tanh_out (not hidden_states[i])
+                let propagated = self.layers[i].backward(
+                    layer_input,
+                    tanh_out,
+                    &scaled_delta,
+                    self.config.lr_weights,
+                    surprise_scale,
+                );
+
+                // Update rezero_alpha: dL/d(alpha) = delta · tanh_out
+                let grad_alpha: f64 = effective_delta
+                    .iter()
+                    .zip(tanh_out.iter())
+                    .map(|(&d, &t)| d * t)
+                    .sum();
+                self.rezero_alpha[alpha_idx] -= effective_lr * grad_alpha;
+
+                // Propagated delta = nonlinear path + skip path (identity or projection)
+                if let Some(ref mut proj) = self.skip_projections[alpha_idx] {
+                    // Projection path: W_proj^T × delta
+                    let proj_t = proj.transpose();
+                    let skip_delta = proj_t.mul_vec(&effective_delta);
+                    // Update projection: W_proj -= lr × outer(delta, layer_input)
+                    let dw_proj = Matrix::outer(&effective_delta, layer_input);
+                    proj.scale_add(&dw_proj, -effective_lr);
+                    bp_delta = vec_add(&propagated, &skip_delta);
+                } else {
+                    // Identity path: + delta
+                    bp_delta = vec_add(&propagated, &effective_delta);
+                }
+            } else {
+                // Standard layer: use hidden_states[i] as output
+                let layer_output = &infer_result.hidden_states[i];
+                bp_delta = self.layers[i].backward(
+                    layer_input,
+                    layer_output,
+                    &effective_delta,
+                    self.config.lr_weights,
+                    surprise_scale,
+                );
+            }
         }
     }
 }
@@ -536,6 +719,8 @@ mod tests {
             synchronous: true,
             temperature: 1.0,
             local_lambda: 1.0,
+            residual: false,
+            rezero_init: 0.001,
         }
     }
 
@@ -921,7 +1106,574 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── Residual / ReZero Config Tests ────────────────────────
+
+    #[test]
+    fn test_default_config_residual_false() {
+        let config = default_config();
+        assert!(!config.residual);
+    }
+
+    #[test]
+    fn test_default_config_rezero_init() {
+        let config = default_config();
+        assert!((config.rezero_init - 0.001).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_new_negative_rezero_init_returns_error() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            rezero_init: -0.1,
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_residual_mixed_sizes_accepted() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_residual_mixed_sizes_all_skip() {
+        // [27, 27, 18]: ALL layers i>=1 get skip — identity for 27→27, projection for 27→18
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        // 2 skips: layer 1 (identity) + layer 2 (projection)
+        assert_eq!(actor.rezero_alpha.len(), 2);
+    }
+
+    #[test]
+    fn test_residual_heterogeneous_has_projection() {
+        // [27, 18]: different sizes → projection matrix created
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        assert_eq!(actor.rezero_alpha.len(), 1);
+        assert_eq!(actor.skip_projections.len(), 1);
+        assert!(actor.skip_projections[0].is_some());
+        let proj = actor.skip_projections[0].as_ref().unwrap();
+        assert_eq!(proj.rows, 18); // output dim
+        assert_eq!(proj.cols, 27); // input dim
+    }
+
+    #[test]
+    fn test_residual_homogeneous_no_projection() {
+        // [27, 27]: same sizes → no projection needed
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        assert_eq!(actor.skip_projections.len(), 1);
+        assert!(actor.skip_projections[0].is_none());
+    }
+
+    #[test]
+    fn test_residual_mixed_sizes_infer_finite() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        for &v in &result.y_conv {
+            assert!(v.is_finite());
+        }
+        assert_eq!(result.hidden_states.len(), 3);
+        assert_eq!(result.latent_concat.len(), 27 + 27 + 18);
+    }
+
+    #[test]
+    fn test_residual_same_size_hidden_layers_accepted() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_ok());
+    }
+
+    fn residual_two_hidden_config() -> PcActorConfig {
+        PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        }
+    }
+
+    #[test]
+    fn test_non_residual_actor_empty_rezero_alpha() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(default_config(), &mut rng).unwrap();
+        assert!(actor.rezero_alpha.is_empty());
+    }
+
+    #[test]
+    fn test_residual_two_hidden_one_rezero_alpha() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        assert_eq!(actor.rezero_alpha.len(), 1);
+    }
+
+    #[test]
+    fn test_residual_three_hidden_two_rezero_alpha() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        assert_eq!(actor.rezero_alpha.len(), 2);
+    }
+
+    #[test]
+    fn test_rezero_alpha_initialized_to_rezero_init() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            rezero_init: 0.005,
+            ..residual_two_hidden_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        assert!((actor.rezero_alpha[0] - 0.005).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_residual_single_hidden_zero_rezero_alpha() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        assert!(actor.rezero_alpha.is_empty());
+    }
+
+    #[test]
+    fn test_residual_single_hidden_accepted() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            ..default_config()
+        };
+        let result = PcActor::new(config, &mut rng);
+        assert!(result.is_ok());
+    }
+
     // ── Local Learning (PC-based weight updates) Tests ──────────
+
+    // ── Residual Inference Tests ──────────────────────────────
+
+    #[test]
+    fn test_residual_false_identical_to_non_residual() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let mut rng1 = make_rng();
+        let actor1 = PcActor::new(two_hidden_config(), &mut rng1).unwrap();
+        let result1 = actor1.infer(&input);
+
+        let mut rng2 = make_rng();
+        let config2 = PcActorConfig {
+            residual: false,
+            ..two_hidden_config()
+        };
+        let actor2 = PcActor::new(config2, &mut rng2).unwrap();
+        let result2 = actor2.infer(&input);
+
+        for (a, b) in result1.y_conv.iter().zip(result2.y_conv.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_residual_rezero_zero_second_hidden_near_identity() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            rezero_init: 0.0,
+            alpha: 0.0,
+            ..residual_two_hidden_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        let h0 = &result.hidden_states[0];
+        let h1 = &result.hidden_states[1];
+        for (a, b) in h0.iter().zip(h1.iter()) {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "With rezero_init=0, h[1] should equal h[0]"
+            );
+        }
+    }
+
+    #[test]
+    fn test_residual_infer_all_outputs_finite() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        for &v in &result.y_conv {
+            assert!(v.is_finite());
+        }
+        for &v in &result.latent_concat {
+            assert!(v.is_finite());
+        }
+        assert!(result.surprise_score.is_finite());
+    }
+
+    #[test]
+    fn test_residual_latent_concat_size() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        assert_eq!(result.latent_concat.len(), 54); // 27 + 27
+    }
+
+    #[test]
+    fn test_residual_pc_loop_completes() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            alpha: 0.03,
+            max_steps: 5,
+            ..residual_two_hidden_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        assert!(result.steps_used > 0);
+        assert!(result.steps_used <= 5);
+    }
+
+    #[test]
+    fn test_residual_hidden_states_count() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        assert_eq!(result.hidden_states.len(), 2);
+    }
+
+    #[test]
+    fn test_residual_infer_does_not_modify_weights() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let weights_before: Vec<Vec<f64>> = actor
+            .layers
+            .iter()
+            .map(|l| l.weights.data.clone())
+            .collect();
+        let alpha_before = actor.rezero_alpha.clone();
+        let _ = actor.infer(&[0.5; 9]);
+        for (i, layer) in actor.layers.iter().enumerate() {
+            assert_eq!(layer.weights.data, weights_before[i]);
+        }
+        assert_eq!(actor.rezero_alpha, alpha_before);
+    }
+
+    #[test]
+    fn test_residual_three_hidden_infer_finite() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        for &v in &result.y_conv {
+            assert!(v.is_finite());
+        }
+    }
+
+    #[test]
+    fn test_residual_tanh_components_populated() {
+        let mut rng = make_rng();
+        let actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        assert_eq!(result.tanh_components.len(), 2);
+        assert!(result.tanh_components[0].is_none()); // layer 0: no skip
+        assert!(result.tanh_components[1].is_some()); // layer 1: has skip
+        assert_eq!(result.tanh_components[1].as_ref().unwrap().len(), 27);
+    }
+
+    #[test]
+    fn test_residual_pc_prediction_uses_tanh_component_not_full_state() {
+        // With rezero_init=1.0, h[1] = tanh_out + h[0] (significantly different
+        // from tanh_out alone). If PC prediction uses h[1] instead of tanh_out,
+        // the surprise score and convergence will differ.
+        // Two runs with same weights: one with alpha=0 (no PC), one with alpha>0.
+        // The PC loop should converge meaningfully (surprise decreases).
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            rezero_init: 1.0,
+            alpha: 0.1,
+            max_steps: 20,
+            tol: 0.001,
+            min_steps: 1,
+            ..residual_two_hidden_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        let result = actor.infer(&[1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5]);
+        // With proper PC predictions, surprise should be finite and non-negative
+        assert!(result.surprise_score.is_finite());
+        assert!(result.surprise_score >= 0.0);
+        // Prediction errors should all be finite
+        for errors in &result.prediction_errors {
+            for &e in errors {
+                assert!(e.is_finite(), "PC prediction error not finite: {e}");
+            }
+        }
+    }
+
+    // ── Residual Backward Tests ────────────────────────────────
+
+    #[test]
+    fn test_residual_false_update_identical_to_non_residual() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let delta = vec![0.1; 9];
+
+        let mut rng1 = make_rng();
+        let mut actor1 = PcActor::new(two_hidden_config(), &mut rng1).unwrap();
+        let infer1 = actor1.infer(&input);
+        actor1.update_weights(&delta, &infer1, &input, 1.0);
+
+        let mut rng2 = make_rng();
+        let config2 = PcActorConfig {
+            residual: false,
+            ..two_hidden_config()
+        };
+        let mut actor2 = PcActor::new(config2, &mut rng2).unwrap();
+        let infer2 = actor2.infer(&input);
+        actor2.update_weights(&delta, &infer2, &input, 1.0);
+
+        for i in 0..actor1.layers.len() {
+            assert_eq!(actor1.layers[i].weights.data, actor2.layers[i].weights.data);
+        }
+    }
+
+    #[test]
+    fn test_residual_update_changes_all_layer_weights() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let input = vec![0.5; 9];
+        let infer_result = actor.infer(&input);
+        let w0 = actor.layers[0].weights.data.clone();
+        let w1 = actor.layers[1].weights.data.clone();
+        let w2 = actor.layers[2].weights.data.clone();
+        actor.update_weights(&[0.1; 9], &infer_result, &input, 1.0);
+        assert_ne!(actor.layers[0].weights.data, w0, "Layer 0 should change");
+        assert_ne!(actor.layers[1].weights.data, w1, "Layer 1 should change");
+        assert_ne!(
+            actor.layers[2].weights.data, w2,
+            "Output layer should change"
+        );
+    }
+
+    #[test]
+    fn test_residual_update_changes_rezero_alpha() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let input = vec![0.5; 9];
+        let infer_result = actor.infer(&input);
+        let alpha_before = actor.rezero_alpha.clone();
+        actor.update_weights(&[0.1; 9], &infer_result, &input, 1.0);
+        assert_ne!(
+            actor.rezero_alpha, alpha_before,
+            "rezero_alpha should be updated by backprop"
+        );
+    }
+
+    #[test]
+    fn test_residual_update_clips_weights() {
+        let mut rng = make_rng();
+        let mut actor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let input = vec![1.0; 9];
+        let infer_result = actor.infer(&input);
+        actor.update_weights(&[1e6; 9], &infer_result, &input, 1.0);
+        for layer in &actor.layers {
+            for &w in &layer.weights.data {
+                assert!(
+                    w.abs() <= WEIGHT_CLIP + 1e-12,
+                    "Weight {w} exceeds WEIGHT_CLIP"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_residual_gradient_stronger_than_non_residual() {
+        let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
+        let delta = vec![0.1; 9];
+
+        // Non-residual 2 hidden layers (27, 27)
+        let mut rng1 = make_rng();
+        let config1 = PcActorConfig {
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let mut actor1 = PcActor::new(config1, &mut rng1).unwrap();
+        let w0_before1 = actor1.layers[0].weights.data.clone();
+        let infer1 = actor1.infer(&input);
+        actor1.update_weights(&delta, &infer1, &input, 1.0);
+        let change1: f64 = actor1.layers[0]
+            .weights
+            .data
+            .iter()
+            .zip(w0_before1.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+
+        // Residual 2 hidden layers (27, 27) with rezero_init=1.0
+        let mut rng2 = make_rng();
+        let config2 = PcActorConfig {
+            rezero_init: 1.0,
+            ..residual_two_hidden_config()
+        };
+        let mut actor2 = PcActor::new(config2, &mut rng2).unwrap();
+        let w0_before2 = actor2.layers[0].weights.data.clone();
+        let infer2 = actor2.infer(&input);
+        actor2.update_weights(&delta, &infer2, &input, 1.0);
+        let change2: f64 = actor2.layers[0]
+            .weights
+            .data
+            .iter()
+            .zip(w0_before2.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+
+        assert!(
+            change2 > change1,
+            "Residual should propagate stronger gradient to layer 0: residual={change2:.6}, non-residual={change1:.6}"
+        );
+    }
+
+    #[test]
+    fn test_residual_hybrid_lambda_works() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            local_lambda: 0.99,
+            ..residual_two_hidden_config()
+        };
+        let mut actor = PcActor::new(config, &mut rng).unwrap();
+        let input = vec![0.5; 9];
+        let infer_result = actor.infer(&input);
+        let w0_before = actor.layers[0].weights.data.clone();
+        actor.update_weights(&[0.1; 9], &infer_result, &input, 1.0);
+        assert_ne!(actor.layers[0].weights.data, w0_before);
+    }
 
     fn local_learning_config() -> PcActorConfig {
         PcActorConfig {

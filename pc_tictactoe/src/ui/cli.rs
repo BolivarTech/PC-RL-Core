@@ -54,6 +54,8 @@ pub enum Command {
     Experiment(ExperimentArgs),
     /// Generate default config.toml with optimal parameters.
     Init(InitArgs),
+    /// Test a fixed config across N random seeds for statistical stability.
+    SeedTest(SeedTestArgs),
 }
 
 /// Arguments for the train subcommand.
@@ -77,6 +79,12 @@ pub struct TrainArgs {
     /// Blend factor: 1.0 = pure backprop, 0.0 = pure local PC, intermediate = hybrid.
     #[arg(long)]
     pub local_lambda: Option<f64>,
+    /// Enable residual skip connections between same-dimension hidden layers.
+    #[arg(long)]
+    pub residual: bool,
+    /// Initial ReZero scaling factor for residual connections.
+    #[arg(long)]
+    pub rezero_init: Option<f64>,
 }
 
 /// Arguments for the play subcommand.
@@ -108,6 +116,20 @@ pub struct EvaluateArgs {
 #[derive(Parser)]
 pub struct ExperimentArgs {
     /// Number of repetitions (random seeds).
+    #[arg(long, short)]
+    pub n: usize,
+    /// Path to TOML configuration file.
+    #[arg(long, short, default_value = "config.toml")]
+    pub config: String,
+    /// Parameter to sweep: "lambda" (default).
+    #[arg(long, short, default_value = "lambda")]
+    pub sweep: String,
+}
+
+/// Arguments for the seed-test subcommand.
+#[derive(Parser)]
+pub struct SeedTestArgs {
+    /// Number of runs (random seeds).
     #[arg(long, short)]
     pub n: usize,
     /// Path to TOML configuration file.
@@ -155,6 +177,14 @@ pub fn run_train(args: TrainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(lambda) = args.local_lambda {
         config.agent.actor.local_lambda = lambda;
+    }
+
+    if args.residual {
+        config.agent.actor.residual = true;
+    }
+
+    if let Some(ri) = args.rezero_init {
+        config.agent.actor.rezero_init = ri;
     }
 
     config.validate()?;
@@ -405,6 +435,10 @@ pub fn run_benchmark(args: BenchmarkArgs) -> Result<(), Box<dyn std::error::Erro
 
 /// Generates a default config.toml with optimal parameters.
 ///
+/// # Arguments
+///
+/// * `args` - Init arguments from CLI.
+///
 /// # Errors
 ///
 /// Returns an error if the output file cannot be written.
@@ -440,6 +474,8 @@ lr_weights = 0.005
 synchronous = true
 temperature = 1.0
 local_lambda = 0.99
+residual = false
+rezero_init = 0.001
 
 [[agent.actor.hidden_layers]]
 size = 27
@@ -476,6 +512,58 @@ max_backups = 3
 max_size = 10485760
 "#;
 
+/// Runs the seed-test subcommand.
+///
+/// Trains the same config across N random seeds to test statistical stability.
+///
+/// # Errors
+///
+/// Returns an error on config/IO/training failures.
+pub fn run_seed_test(args: SeedTestArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::training::experiment;
+
+    let config = AppConfig::load(Path::new(&args.config))?;
+    config.validate()?;
+
+    let file = std::fs::File::create("experiment.txt")?;
+    let stdout = io::stdout();
+    let mut writer = MultiWriter {
+        a: io::BufWriter::new(file),
+        b: stdout.lock(),
+    };
+
+    let results = experiment::run_seed_test(&config, args.n, &mut writer)?;
+
+    let summary = format!(
+        "\n=== SEED TEST ({} runs, lambda={:.8}) ===\n{:<24} {:<10} {:<10} {:<10} {:<10}\n{}\n",
+        results.len(),
+        results.first().map(|r| r.lambda).unwrap_or(0.0),
+        "seed",
+        "max_depth",
+        "win%",
+        "loss%",
+        "draw%",
+        results
+            .iter()
+            .map(|r| format!(
+                "{:<24} {:<10} {:<10.1} {:<10.1} {:<10.1}",
+                r.seed,
+                r.max_depth,
+                r.win_rate * 100.0,
+                r.loss_rate * 100.0,
+                r.draw_rate * 100.0,
+            ))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
+    write!(writer, "{summary}")?;
+    writer.flush()?;
+
+    println!("\nResults saved to experiment.txt");
+    Ok(())
+}
+
 /// Writer that duplicates output to two writers (file + stdout).
 struct MultiWriter<A: io::Write, B: io::Write> {
     a: A,
@@ -508,10 +596,17 @@ impl<A: io::Write, B: io::Write> io::Write for MultiWriter<A, B> {
 ///
 /// Returns an error on config/IO/training failures.
 pub fn run_experiment(args: ExperimentArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::training::experiment;
+    use crate::training::experiment::{self, SweepParam};
 
     let config = AppConfig::load(Path::new(&args.config))?;
     config.validate()?;
+
+    let sweep = match args.sweep.to_lowercase().as_str() {
+        "lambda" => SweepParam::Lambda,
+        other => {
+            return Err(format!("Unknown sweep parameter '{other}'; expected 'lambda'").into())
+        }
+    };
 
     let file = std::fs::File::create("experiment.txt")?;
     let stdout = io::stdout();
@@ -520,12 +615,14 @@ pub fn run_experiment(args: ExperimentArgs) -> Result<(), Box<dyn std::error::Er
         b: stdout.lock(),
     };
 
-    let results = experiment::run_experiment(&config, args.n, &mut writer)?;
+    let results = experiment::run_experiment_sweep(&config, args.n, sweep, &mut writer)?;
 
     // Summary table
+    let sweep_col = sweep.name();
     let summary = format!(
-        "\n=== SUMMARY ({} runs) ===\n{:<8} {:<8} {:<10} {:<10} {:<10} {:<10}\n{}\n",
+        "\n=== SUMMARY ({} runs, sweep={}) ===\n{:<8} {:<8} {:<10} {:<10} {:<10} {:<10}\n{}\n",
         results.len(),
+        sweep_col,
         "seed",
         "lambda",
         "max_depth",
@@ -582,7 +679,8 @@ mod tests {
     fn test_default_config_toml_is_valid() {
         let config: crate::utils::config::AppConfig = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
         assert!(config.validate().is_ok());
-        assert!(config.to_agent_config().is_ok());
+        let agent_config = config.to_agent_config();
+        assert!(agent_config.is_ok());
     }
 
     #[test]
@@ -592,6 +690,8 @@ mod tests {
         assert!((config.agent.actor.alpha - 0.03).abs() < 1e-12);
         assert!((config.agent.actor.lr_weights - 0.005).abs() < 1e-12);
         assert!((config.agent.actor.local_lambda - 0.99).abs() < 1e-12);
+        assert!(!config.agent.actor.residual);
+        assert!((config.agent.actor.rezero_init - 0.001).abs() < 1e-12);
         assert_eq!(config.agent.actor.hidden_layers.len(), 1);
         assert_eq!(config.agent.actor.hidden_layers[0].size, 27);
         assert_eq!(config.agent.critic.input_size, 36);

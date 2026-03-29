@@ -54,6 +54,12 @@ pub struct TrainingMetrics {
 pub struct PcActorWeights {
     /// Layer snapshots in order (hidden layers + output layer).
     pub layers: Vec<Layer>,
+    /// ReZero scaling factors for residual skip connections.
+    #[serde(default)]
+    pub rezero_alpha: Vec<f64>,
+    /// Projection matrices for heterogeneous skip connections.
+    #[serde(default)]
+    pub skip_projections: Vec<Option<crate::matrix::Matrix>>,
 }
 
 /// Complete save file containing agent state and metadata.
@@ -102,6 +108,8 @@ pub fn save_agent(
         config: agent.config.clone(),
         actor_weights: PcActorWeights {
             layers: agent.actor.layers.clone(),
+            rezero_alpha: agent.actor.rezero_alpha.clone(),
+            skip_projections: agent.actor.skip_projections.clone(),
         },
         critic_weights: crate::mlp_critic::MlpCriticWeights {
             layers: agent.critic.layers.clone(),
@@ -163,6 +171,8 @@ pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError>
     let actor = PcActor {
         layers: save_file.actor_weights.layers,
         config: save_file.config.actor.clone(),
+        rezero_alpha: save_file.actor_weights.rezero_alpha,
+        skip_projections: save_file.actor_weights.skip_projections,
     };
 
     let critic = MlpCritic::from_weights(
@@ -259,6 +269,8 @@ mod tests {
                 synchronous: true,
                 temperature: 1.0,
                 local_lambda: 1.0,
+                residual: false,
+                rezero_init: 0.001,
             },
             critic: MlpCriticConfig {
                 input_size: 27,
@@ -500,5 +512,75 @@ mod tests {
 
         // Cleanup
         let _ = fs::remove_dir_all(std::env::temp_dir().join("pc_core_tests").join("nested"));
+    }
+
+    #[test]
+    fn test_roundtrip_preserves_modified_rezero_alpha() {
+        use crate::pc_actor::SelectionMode;
+        let config = PcActorCriticConfig {
+            actor: PcActorConfig {
+                residual: true,
+                rezero_init: 0.005,
+                hidden_layers: vec![
+                    LayerDef {
+                        size: 27,
+                        activation: Activation::Tanh,
+                    },
+                    LayerDef {
+                        size: 27,
+                        activation: Activation::Tanh,
+                    },
+                ],
+                ..default_config().actor
+            },
+            critic: MlpCriticConfig {
+                input_size: 63,
+                ..default_config().critic
+            },
+            ..default_config()
+        };
+        let mut agent = PcActorCritic::new(config, 42).unwrap();
+        // Train one step to modify rezero_alpha
+        let input = vec![0.5; 9];
+        let valid: Vec<usize> = (0..9).collect();
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let trajectory = vec![crate::pc_actor_critic::TrajectoryStep {
+            input: input.clone(),
+            latent_concat: infer.latent_concat,
+            y_conv: infer.y_conv,
+            hidden_states: infer.hidden_states,
+            prediction_errors: infer.prediction_errors,
+            tanh_components: infer.tanh_components,
+            action,
+            valid_actions: valid,
+            reward: 1.0,
+            surprise_score: infer.surprise_score,
+            steps_used: infer.steps_used,
+        }];
+        agent.learn(&trajectory);
+        let alpha_after_train = agent.actor.rezero_alpha.clone();
+        // Alpha should have changed from init
+        assert_ne!(alpha_after_train, vec![0.005]);
+
+        let path = temp_path("test_rezero_roundtrip.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+        let (loaded, _) = load_agent(&path).unwrap();
+        assert_eq!(
+            loaded.actor.rezero_alpha, alpha_after_train,
+            "Loaded rezero_alpha should match trained value, not rezero_init"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_roundtrip_non_residual_backward_compat() {
+        let agent = make_agent();
+        assert!(agent.actor.rezero_alpha.is_empty());
+
+        let path = temp_path("test_nonresidual_compat.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+        let (loaded, _) = load_agent(&path).unwrap();
+        assert!(loaded.actor.rezero_alpha.is_empty());
+        let _ = fs::remove_file(&path);
     }
 }

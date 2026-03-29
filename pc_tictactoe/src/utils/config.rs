@@ -117,6 +117,17 @@ pub struct ActorSection {
     /// Blend factor: 1.0 = pure backprop, 0.0 = pure local PC, intermediate = hybrid.
     #[serde(default = "default_local_lambda")]
     pub local_lambda: f64,
+    /// Enable residual skip connections between same-dimension hidden layers.
+    #[serde(default)]
+    pub residual: bool,
+    /// Initial value for ReZero scaling factors on residual connections.
+    #[serde(default = "default_rezero_init")]
+    pub rezero_init: f64,
+}
+
+/// Default rezero_init: 0.001.
+fn default_rezero_init() -> f64 {
+    0.001
 }
 
 /// Default local_lambda: 1.0 (pure backprop).
@@ -356,6 +367,8 @@ impl Default for ActorSection {
             synchronous: default_true(),
             temperature: default_temperature(),
             local_lambda: default_local_lambda(),
+            residual: false,
+            rezero_init: default_rezero_init(),
         }
     }
 }
@@ -528,6 +541,8 @@ impl AppConfig {
                 synchronous: self.agent.actor.synchronous,
                 temperature: self.agent.actor.temperature,
                 local_lambda: self.agent.actor.local_lambda,
+                residual: self.agent.actor.residual,
+                rezero_init: self.agent.actor.rezero_init,
             },
             critic: MlpCriticConfig {
                 input_size: self.agent.critic.input_size,
@@ -672,5 +687,33 @@ episodes = 5000
         let original = config.training.episodes;
         config.apply_cli_overrides(None, None);
         assert_eq!(config.training.episodes, original);
+    }
+
+    #[test]
+    fn test_default_actor_section_residual_false() {
+        let config = AppConfig::default();
+        assert!(!config.agent.actor.residual);
+        assert!((config.agent.actor.rezero_init - 0.001).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_to_agent_config_passes_residual_fields() {
+        let mut config = AppConfig::default();
+        config.agent.actor.residual = true;
+        config.agent.actor.rezero_init = 0.01;
+        config.agent.actor.hidden_layers = vec![
+            HiddenLayerDef {
+                size: 27,
+                activation: "tanh".to_string(),
+            },
+            HiddenLayerDef {
+                size: 27,
+                activation: "tanh".to_string(),
+            },
+        ];
+        config.agent.critic.input_size = 63; // 9 + 27 + 27
+        let ac = config.to_agent_config().unwrap();
+        assert!(ac.actor.residual);
+        assert!((ac.actor.rezero_init - 0.01).abs() < 1e-12);
     }
 }

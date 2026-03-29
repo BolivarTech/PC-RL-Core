@@ -6,6 +6,7 @@
 //!
 //! Runs training across a range of hyperparameter values with random seeds,
 //! collecting max depth and final metrics for each combination.
+//! Supports sweeping `local_lambda`.
 
 use std::fmt;
 use std::io::Write;
@@ -60,7 +61,7 @@ impl fmt::Display for RunResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "============")?;
         writeln!(f, "seed={}", self.seed)?;
-        writeln!(f, "lambda={:.2}", self.lambda)?;
+        writeln!(f, "lambda={:.8}", self.lambda)?;
         for line in &self.log_lines {
             writeln!(f, "{line}")?;
         }
@@ -86,7 +87,56 @@ pub fn run_single(
     seed: u64,
     lambda: f64,
 ) -> Result<RunResult, Box<dyn std::error::Error>> {
-    run_single_with_sweep(base_config, seed, SweepParam::Lambda, lambda)
+    let mut config = base_config.clone();
+    config.training.seed = seed;
+    config.agent.actor.local_lambda = lambda;
+
+    let agent_config = config.to_agent_config()?;
+    let agent = PcActorCritic::new(agent_config, seed)?;
+
+    let episodes = config.training.episodes;
+    let log_interval = config.training.log_interval;
+    let mut trainer = Trainer::new(agent, &config);
+
+    let mut log_lines = Vec::new();
+    let mut prev_depth = 1;
+
+    for _ in 0..episodes {
+        let trajectory = trainer.run_episode_pub();
+        trainer.agent_mut().learn(&trajectory);
+        trainer.record_and_advance();
+
+        if log_interval > 0 && trainer.episode_count().is_multiple_of(log_interval) {
+            let line = format!(
+                "[ep {:>6}/{total}] win={win:.1}% loss={loss:.1}% draw={draw:.1}% | depth={depth}",
+                trainer.episode_count(),
+                total = episodes,
+                win = trainer.metrics().win_rate() * 100.0,
+                loss = trainer.metrics().loss_rate() * 100.0,
+                draw = trainer.metrics().draw_rate() * 100.0,
+                depth = trainer.current_depth(),
+            );
+            log_lines.push(line);
+        }
+
+        let cur_depth = trainer.current_depth();
+        if prev_depth != cur_depth {
+            log_lines.push(format!(
+                "  >> Curriculum advanced: depth {prev_depth} -> {cur_depth}"
+            ));
+            prev_depth = cur_depth;
+        }
+    }
+
+    Ok(RunResult {
+        seed,
+        lambda,
+        max_depth: trainer.current_depth(),
+        win_rate: trainer.metrics().win_rate(),
+        loss_rate: trainer.metrics().loss_rate(),
+        draw_rate: trainer.metrics().draw_rate(),
+        log_lines,
+    })
 }
 
 /// Runs a single training cycle with the given seed and sweep parameter.
@@ -209,7 +259,7 @@ pub fn run_experiment_sweep<W: Write>(
 ///
 /// * `base_config` - Base configuration.
 /// * `n` - Number of repetitions (random seeds).
-/// * `output` - Writer for results (file + stdout via [`MultiWriter`]).
+/// * `output` - Writer for results (file + stdout).
 ///
 /// # Errors
 ///
@@ -219,7 +269,105 @@ pub fn run_experiment<W: Write>(
     n: usize,
     output: &mut W,
 ) -> Result<Vec<RunResult>, Box<dyn std::error::Error>> {
-    run_experiment_sweep(base_config, n, SweepParam::Lambda, output)
+    let lambdas = [0.95, 0.96, 0.97, 0.98, 0.99, 1.00];
+    let mut all_results = Vec::new();
+    let mut rng = rand::thread_rng();
+
+    for _ in 0..n {
+        let seed: u64 = rand::Rng::gen(&mut rng);
+
+        for &lambda in &lambdas {
+            let result = run_single(base_config, seed, lambda)?;
+            write!(output, "{result}")?;
+            output.flush()?;
+            all_results.push(result);
+        }
+    }
+
+    Ok(all_results)
+}
+
+/// Runs N training runs with fixed config, varying only the seed.
+///
+/// Uses the config as-is (no parameter overrides). Each run gets a
+/// unique random seed. Use this to test statistical stability of a
+/// specific configuration across different weight initializations.
+///
+/// # Arguments
+///
+/// * `base_config` - Configuration to use for all runs.
+/// * `n` - Number of runs (random seeds).
+/// * `output` - Writer for results.
+///
+/// # Errors
+///
+/// Returns an error on training or I/O failures.
+pub fn run_seed_test<W: Write>(
+    base_config: &AppConfig,
+    n: usize,
+    output: &mut W,
+) -> Result<Vec<RunResult>, Box<dyn std::error::Error>> {
+    let mut all_results = Vec::new();
+    let mut rng = rand::thread_rng();
+
+    for _ in 0..n {
+        let seed: u64 = rand::Rng::gen(&mut rng);
+
+        let mut config = base_config.clone();
+        config.training.seed = seed;
+
+        let agent_config = config.to_agent_config()?;
+        let agent = PcActorCritic::new(agent_config, seed)?;
+
+        let episodes = config.training.episodes;
+        let log_interval = config.training.log_interval;
+        let mut trainer = Trainer::new(agent, &config);
+
+        let mut log_lines = Vec::new();
+        let mut prev_depth = 1;
+
+        for _ in 0..episodes {
+            let trajectory = trainer.run_episode_pub();
+            trainer.agent_mut().learn(&trajectory);
+            trainer.record_and_advance();
+
+            if log_interval > 0 && trainer.episode_count().is_multiple_of(log_interval) {
+                let line = format!(
+                    "[ep {:>6}/{total}] win={win:.1}% loss={loss:.1}% draw={draw:.1}% | depth={depth}",
+                    trainer.episode_count(),
+                    total = episodes,
+                    win = trainer.metrics().win_rate() * 100.0,
+                    loss = trainer.metrics().loss_rate() * 100.0,
+                    draw = trainer.metrics().draw_rate() * 100.0,
+                    depth = trainer.current_depth(),
+                );
+                log_lines.push(line);
+            }
+
+            let cur_depth = trainer.current_depth();
+            if prev_depth != cur_depth {
+                log_lines.push(format!(
+                    "  >> Curriculum advanced: depth {prev_depth} -> {cur_depth}"
+                ));
+                prev_depth = cur_depth;
+            }
+        }
+
+        let result = RunResult {
+            seed,
+            lambda: config.agent.actor.local_lambda,
+            max_depth: trainer.current_depth(),
+            win_rate: trainer.metrics().win_rate(),
+            loss_rate: trainer.metrics().loss_rate(),
+            draw_rate: trainer.metrics().draw_rate(),
+            log_lines,
+        };
+        write!(output, "{result}")?;
+        output.flush()?;
+        all_results.push(result);
+    }
+
+    Ok(all_results)
 }
 
 #[cfg(test)]
@@ -314,6 +462,49 @@ mod tests {
         let mut buf = Vec::new();
         let results = run_experiment_sweep(&config, 1, SweepParam::Lambda, &mut buf).unwrap();
         assert_eq!(results.len(), 6); // 1 seed × 6 lambdas
+    }
+
+    #[test]
+    fn test_run_seed_test_produces_n_results() {
+        let config = test_config();
+        let mut buf = Vec::new();
+        let results = run_seed_test(&config, 3, &mut buf).unwrap();
+        assert_eq!(results.len(), 3); // 3 seeds × 1 config
+    }
+
+    #[test]
+    fn test_run_seed_test_uses_config_lambda() {
+        let mut config = test_config();
+        config.agent.actor.local_lambda = 0.9999;
+        let mut buf = Vec::new();
+        let results = run_seed_test(&config, 2, &mut buf).unwrap();
+        for r in &results {
+            assert!(
+                (r.lambda - 0.9999).abs() < 1e-12,
+                "Should use config lambda"
+            );
+        }
+    }
+
+    #[test]
+    fn test_run_seed_test_different_seeds() {
+        let config = test_config();
+        let mut buf = Vec::new();
+        let results = run_seed_test(&config, 3, &mut buf).unwrap();
+        let seeds: Vec<u64> = results.iter().map(|r| r.seed).collect();
+        assert_ne!(seeds[0], seeds[1], "Seeds should differ");
+        assert_ne!(seeds[1], seeds[2], "Seeds should differ");
+    }
+
+    #[test]
+    fn test_run_seed_test_writes_output() {
+        let config = test_config();
+        let mut buf = Vec::new();
+        let _ = run_seed_test(&config, 1, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("============"));
+        assert!(output.contains("seed="));
+        assert!(output.contains("------------"));
     }
 
     #[test]

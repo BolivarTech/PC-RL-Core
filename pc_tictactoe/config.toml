@@ -16,24 +16,34 @@ max_steps = 5
 lr_weights = 0.005
 synchronous = true
 temperature = 1.0
-local_lambda = 0.99
+local_lambda = 1.0
+residual = true
+rezero_init = 0.1
 
 [[agent.actor.hidden_layers]]
 size = 27
-activation = "tanh"
+activation = "softsign"
+
+[[agent.actor.hidden_layers]]
+size = 27
+activation = "softsign"
+
+[[agent.actor.hidden_layers]]
+size = 18
+activation = "softsign"
 
 [agent.critic]
-# 9 + 27 = 36
-input_size = 36
+# 9 + 27 + 27 + 18 = 81
+input_size = 81
 output_activation = "linear"
 lr = 0.005
 
 [[agent.critic.hidden_layers]]
 size = 36
-activation = "tanh"
+activation = "softsign"
 
 [training]
-episodes = 50000
+episodes = 200000
 checkpoint_interval = 5000
 log_interval = 500
 seed = 42
