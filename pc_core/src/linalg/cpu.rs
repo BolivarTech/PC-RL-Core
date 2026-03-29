@@ -87,6 +87,11 @@ impl LinAlg for CpuLinAlg {
         a.iter().zip(b.iter()).map(|(x, y)| x * y).collect()
     }
 
+    fn vec_dot(a: &Self::Vector, b: &Self::Vector) -> f64 {
+        assert_eq!(a.len(), b.len(), "vec_dot: length mismatch");
+        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    }
+
     fn vec_len(v: &Self::Vector) -> usize {
         v.len()
     }
@@ -464,5 +469,21 @@ mod tests {
     fn test_rms_error_empty() {
         let rms = CpuLinAlg::rms_error(&[]);
         assert_eq!(rms, 0.0);
+    }
+
+    #[test]
+    fn test_vec_dot_known() {
+        let a = CpuLinAlg::vec_from_slice(&[1.0, 2.0, 3.0]);
+        let b = CpuLinAlg::vec_from_slice(&[4.0, 5.0, 6.0]);
+        // 1*4 + 2*5 + 3*6 = 4 + 10 + 18 = 32
+        let dot = CpuLinAlg::vec_dot(&a, &b);
+        assert!((dot - 32.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_vec_dot_orthogonal() {
+        let a = CpuLinAlg::vec_from_slice(&[1.0, 0.0]);
+        let b = CpuLinAlg::vec_from_slice(&[0.0, 1.0]);
+        assert!((CpuLinAlg::vec_dot(&a, &b)).abs() < 1e-12);
     }
 }

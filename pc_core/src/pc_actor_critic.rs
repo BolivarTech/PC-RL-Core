@@ -217,10 +217,9 @@ impl<L: LinAlg> PcActorCritic<L> {
         mode: SelectionMode,
     ) -> (usize, InferResult<L>) {
         let infer_result = self.actor.infer(input);
-        let y_slice = L::vec_to_vec(&infer_result.y_conv);
-        let action = self
-            .actor
-            .select_action(&y_slice, valid_actions, mode, &mut self.rng);
+        let action =
+            self.actor
+                .select_action(&infer_result.y_conv, valid_actions, mode, &mut self.rng);
         (action, infer_result)
     }
 

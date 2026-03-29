@@ -100,6 +100,9 @@ pub trait LinAlg: Clone + Send + Sync + 'static {
     /// Element-wise (Hadamard) product: `a[i] * b[i]`.
     fn vec_hadamard(a: &Self::Vector, b: &Self::Vector) -> Self::Vector;
 
+    /// Dot product: `sum(a[i] * b[i])`.
+    fn vec_dot(a: &Self::Vector, b: &Self::Vector) -> f64;
+
     /// Returns the number of elements in the vector.
     fn vec_len(v: &Self::Vector) -> usize;
 

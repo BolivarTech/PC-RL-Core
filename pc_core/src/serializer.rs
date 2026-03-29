@@ -626,4 +626,89 @@ mod tests {
         assert!(loaded.actor.rezero_alpha.is_empty());
         let _ = fs::remove_file(&path);
     }
+
+    #[test]
+    fn test_load_agent_generic_matches_load_agent() {
+        let agent = make_agent();
+        let path = temp_path("test_generic_load.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+
+        let (loaded_default, _) = load_agent(&path).unwrap();
+        let (loaded_generic, _) =
+            load_agent_generic::<crate::linalg::cpu::CpuLinAlg>(&path).unwrap();
+
+        let input = vec![0.5, -0.5, 1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0];
+        let r1 = loaded_default.infer(&input);
+        let r2 = loaded_generic.infer(&input);
+
+        for (a, b) in r1.y_conv.iter().zip(r2.y_conv.iter()) {
+            assert!((a - b).abs() < 1e-15, "y_conv differs: {a} vs {b}");
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_roundtrip_preserves_skip_projections_directly() {
+        use crate::pc_actor::SelectionMode;
+        let config = PcActorCriticConfig {
+            actor: PcActorConfig {
+                residual: true,
+                rezero_init: 0.005,
+                hidden_layers: vec![
+                    LayerDef {
+                        size: 27,
+                        activation: Activation::Tanh,
+                    },
+                    LayerDef {
+                        size: 18,
+                        activation: Activation::Tanh,
+                    },
+                ],
+                ..default_config().actor
+            },
+            critic: MlpCriticConfig {
+                input_size: 54,
+                ..default_config().critic
+            },
+            ..default_config()
+        };
+        let mut agent: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
+        // Train to modify projection weights
+        let input = vec![0.5; 9];
+        let valid: Vec<usize> = (0..9).collect();
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let trajectory = vec![crate::pc_actor_critic::TrajectoryStep {
+            input: input.clone(),
+            latent_concat: infer.latent_concat,
+            y_conv: infer.y_conv,
+            hidden_states: infer.hidden_states,
+            prediction_errors: infer.prediction_errors,
+            tanh_components: infer.tanh_components,
+            action,
+            valid_actions: valid,
+            reward: 1.0,
+            surprise_score: infer.surprise_score,
+            steps_used: infer.steps_used,
+        }];
+        agent.learn(&trajectory);
+
+        // Verify projection exists (27→18 requires projection)
+        assert!(agent.actor.skip_projections[0].is_some());
+        let orig_proj = agent.actor.skip_projections[0].as_ref().unwrap();
+        let orig_data = orig_proj.data.clone();
+
+        let path = temp_path("test_skip_proj_roundtrip.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+        let (loaded, _) = load_agent(&path).unwrap();
+
+        let loaded_proj = loaded.actor.skip_projections[0].as_ref().unwrap();
+        assert_eq!(orig_data.len(), loaded_proj.data.len());
+        for (i, (a, b)) in orig_data.iter().zip(loaded_proj.data.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-15,
+                "skip_projection element {i} differs: {a} vs {b}"
+            );
+        }
+        let _ = fs::remove_file(&path);
+    }
 }

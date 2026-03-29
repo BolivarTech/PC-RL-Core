@@ -530,7 +530,7 @@ impl<L: LinAlg> PcActor<L> {
     /// Panics if `valid_actions` is empty.
     pub fn select_action(
         &self,
-        y_conv: &[f64],
+        y_conv: &L::Vector,
         valid_actions: &[usize],
         mode: SelectionMode,
         rng: &mut impl Rng,
@@ -538,8 +538,7 @@ impl<L: LinAlg> PcActor<L> {
         assert!(!valid_actions.is_empty(), "valid_actions must not be empty");
 
         // Scale logits by temperature
-        let y_vec = L::vec_from_slice(y_conv);
-        let scaled = L::vec_scale(&y_vec, 1.0 / self.config.temperature);
+        let scaled = L::vec_scale(y_conv, 1.0 / self.config.temperature);
 
         let probs = L::softmax_masked(&scaled, valid_actions);
 
@@ -668,13 +667,7 @@ impl<L: LinAlg> PcActor<L> {
                 );
 
                 // Update rezero_alpha: dL/d(alpha) = delta · tanh_out
-                let delta_vec = L::vec_to_vec(&effective_delta);
-                let tanh_vec = L::vec_to_vec(tanh_out);
-                let grad_alpha: f64 = delta_vec
-                    .iter()
-                    .zip(tanh_vec.iter())
-                    .map(|(&d, &t)| d * t)
-                    .sum();
+                let grad_alpha: f64 = L::vec_dot(&effective_delta, tanh_out);
                 self.rezero_alpha[alpha_idx] -= effective_lr * grad_alpha;
 
                 // Propagated delta = nonlinear path + skip path (identity or projection)
