@@ -440,20 +440,23 @@ PC inference as a mechanism for parameter efficiency in RL is not well documente
 ### 5.1 Technology
 
 - **Language**: Rust (pure, no ML framework dependencies)
-- **Library crate**: `pc_core` v0.2.0 (published on crates.io)
+- **Library crate**: `pc_core` v1.0.0 (published on crates.io)
+- **Architecture**: Backend-agnostic via `LinAlg` trait (26 methods). All structs generic over `L: LinAlg` with `CpuLinAlg` default. Type aliases: `PcActorCpu`, `MlpCriticCpu`, `PcActorCriticCpu`, `LayerCpu`.
 - **Dependencies**: serde, serde_json, rand, chrono (core); toml, clap, ctrlc (binary)
-- **Tests**: 268 unit tests, TDD methodology throughout
+- **Tests**: 357 unit tests + 12 doctests, TDD methodology throughout
 - **Repository**: https://github.com/BolivarTech/PC-TicTacToe
 
 ### 5.2 Key Design Decisions
 
-1. **Synchronous vs in-place PC updates**: Synchronous mode (snapshot all states, then update) is the default. In-place mode (updates immediately visible to subsequent layers) converges differently and produces slightly different results.
+1. **Backend-agnostic linear algebra**: The `LinAlg` trait abstracts all vector/matrix operations behind associated types (`Vector`, `Matrix`). `CpuLinAlg` uses `Vec<f64>` and `Matrix` with zero-cost delegation. Serialization uses a concrete CPU bridge: generic agents convert to CPU types for JSON save/load via `to_weights()`/`from_weights()`.
 
-2. **Weight and gradient clipping**: Both set to 5.0. Prevents exploding weights from large policy gradient updates while allowing sufficient dynamic range.
+2. **Synchronous vs in-place PC updates**: Synchronous mode (snapshot all states, then update) is the default. In-place mode (updates immediately visible to subsequent layers) converges differently and produces slightly different results.
 
-3. **Deterministic training**: With a fixed seed, training is fully deterministic (identical results across runs). This enables reproducible experimentation and precise ablation studies.
+3. **Weight and gradient clipping**: Both set to 5.0. Prevents exploding weights from large policy gradient updates while allowing sufficient dynamic range.
 
-4. **Curriculum reset on advancement**: Metrics (win/loss/draw window) reset when minimax depth increases. Without reset, high win rates from easier opponents carry over and cause premature advancement at higher depths.
+4. **Deterministic training**: With a fixed seed, training is fully deterministic (identical results across runs). This enables reproducible experimentation and precise ablation studies.
+
+5. **Curriculum reset on advancement**: Metrics (win/loss/draw window) reset when minimax depth increases. Without reset, high win rates from easier opponents carry over and cause premature advancement at higher depths.
 
 ---
 
