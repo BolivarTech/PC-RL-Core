@@ -16,7 +16,7 @@ max_steps = 5
 lr_weights = 0.005
 synchronous = true
 temperature = 1.0
-local_lambda = 0.99
+local_lambda = 0.999
 residual = true
 rezero_init = 0.1
 
@@ -28,9 +28,13 @@ activation = "softsign"
 size = 27
 activation = "softsign"
 
+[[agent.actor.hidden_layers]]
+size = 18
+activation = "softsign"
+
 [agent.critic]
-# 9 + 27 + 27 = 63
-input_size = 63
+# 9 + 27 + 27 + 18 = 81
+input_size = 81
 output_activation = "linear"
 lr = 0.005
 
