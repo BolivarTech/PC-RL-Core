@@ -57,6 +57,9 @@ pub struct PcActorWeights {
     /// ReZero scaling factors for residual skip connections.
     #[serde(default)]
     pub rezero_alpha: Vec<f64>,
+    /// Projection matrices for heterogeneous skip connections.
+    #[serde(default)]
+    pub skip_projections: Vec<Option<crate::matrix::Matrix>>,
     /// Auxiliary linear heads for hidden layer gradient injection.
     #[serde(default)]
     pub aux_heads: Vec<Layer>,
@@ -109,6 +112,7 @@ pub fn save_agent(
         actor_weights: PcActorWeights {
             layers: agent.actor.layers.clone(),
             rezero_alpha: agent.actor.rezero_alpha.clone(),
+            skip_projections: agent.actor.skip_projections.clone(),
             aux_heads: agent.actor.aux_heads.clone(),
         },
         critic_weights: crate::mlp_critic::MlpCriticWeights {
@@ -172,7 +176,7 @@ pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError>
         layers: save_file.actor_weights.layers,
         config: save_file.config.actor.clone(),
         rezero_alpha: save_file.actor_weights.rezero_alpha,
-        skip_projections: Vec::new(), // Reconstructed from save in serialization cycle
+        skip_projections: save_file.actor_weights.skip_projections,
         aux_heads: save_file.actor_weights.aux_heads,
     };
 
