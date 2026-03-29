@@ -1379,7 +1379,7 @@ mod tests {
     }
 
     #[test]
-    fn test_residual_mismatched_hidden_sizes_returns_error() {
+    fn test_residual_mixed_sizes_accepted() {
         let mut rng = make_rng();
         let config = PcActorConfig {
             residual: true,
@@ -1396,7 +1396,64 @@ mod tests {
             ..default_config()
         };
         let result = PcActor::new(config, &mut rng);
-        assert!(result.is_err());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_residual_mixed_sizes_selective_skip() {
+        // [27, 27, 18]: skip between 27→27, no skip between 27→18
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        // Only 1 skip (between layers 0 and 1), not 2
+        assert_eq!(actor.rezero_alpha.len(), 1);
+    }
+
+    #[test]
+    fn test_residual_mixed_sizes_infer_finite() {
+        let mut rng = make_rng();
+        let config = PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..default_config()
+        };
+        let actor = PcActor::new(config, &mut rng).unwrap();
+        let result = actor.infer(&[0.5; 9]);
+        for &v in &result.y_conv {
+            assert!(v.is_finite());
+        }
+        assert_eq!(result.hidden_states.len(), 3);
+        assert_eq!(result.latent_concat.len(), 27 + 27 + 18);
     }
 
     #[test]
