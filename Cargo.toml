@@ -1,5 +1,5 @@
 [workspace]
-members = ["pc_core", "pc_tictactoe"]
+members = ["pc-rl-core", "pc_tictactoe"]
 resolver = "2"
 
 [workspace.dependencies]
