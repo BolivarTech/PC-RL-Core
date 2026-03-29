@@ -243,7 +243,7 @@ pub fn load_agent_generic<L: LinAlg>(
 /// # Examples
 ///
 /// ```
-/// use pc_core::serializer::checkpoint_filename;
+/// use pc_rl_core::serializer::checkpoint_filename;
 ///
 /// let name = checkpoint_filename(100);
 /// assert!(name.starts_with("checkpoint_ep100_"));

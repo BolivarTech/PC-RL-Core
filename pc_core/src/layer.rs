@@ -21,8 +21,8 @@ use crate::matrix::{GRAD_CLIP, WEIGHT_CLIP};
 /// # Examples
 ///
 /// ```
-/// use pc_core::activation::Activation;
-/// use pc_core::layer::LayerDef;
+/// use pc_rl_core::activation::Activation;
+/// use pc_rl_core::layer::LayerDef;
 ///
 /// let def = LayerDef { size: 64, activation: Activation::Tanh };
 /// assert_eq!(def.size, 64);
@@ -45,8 +45,8 @@ pub struct LayerDef {
 /// # Examples
 ///
 /// ```
-/// use pc_core::activation::Activation;
-/// use pc_core::layer::Layer;
+/// use pc_rl_core::activation::Activation;
+/// use pc_rl_core::layer::Layer;
 /// use rand::SeedableRng;
 /// use rand::rngs::StdRng;
 ///

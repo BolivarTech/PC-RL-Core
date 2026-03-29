@@ -37,8 +37,8 @@ use std::fmt::Debug;
 /// # Examples
 ///
 /// ```
-/// use pc_core::linalg::cpu::CpuLinAlg;
-/// use pc_core::linalg::LinAlg;
+/// use pc_rl_core::linalg::cpu::CpuLinAlg;
+/// use pc_rl_core::linalg::LinAlg;
 ///
 /// let v = CpuLinAlg::zeros_vec(5);
 /// assert_eq!(CpuLinAlg::vec_len(&v), 5);

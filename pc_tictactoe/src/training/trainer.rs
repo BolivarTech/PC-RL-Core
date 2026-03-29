@@ -9,8 +9,8 @@
 //! trajectories, and advances minimax depth when the agent's win rate
 //! exceeds a configurable threshold.
 
-use pc_core::pc_actor::SelectionMode;
-use pc_core::pc_actor_critic::{PcActorCritic, TrajectoryStep};
+use pc_rl_core::pc_actor::SelectionMode;
+use pc_rl_core::pc_actor_critic::{PcActorCritic, TrajectoryStep};
 
 use crate::env::minimax::MinimaxPlayer;
 use crate::env::tictactoe::{GameResult, Player, TicTacToe};
@@ -24,7 +24,7 @@ use crate::utils::metrics::{GameOutcome, Metrics};
 /// # Examples
 ///
 /// ```no_run
-/// use pc_core::pc_actor_critic::PcActorCritic;
+/// use pc_rl_core::pc_actor_critic::PcActorCritic;
 /// use pc_tictactoe::training::trainer::Trainer;
 /// use pc_tictactoe::utils::config::AppConfig;
 ///
@@ -282,7 +282,7 @@ mod tests {
         trainer.train(20);
 
         // Compare serialized weights of fresh vs trained agent
-        use pc_core::serializer::save_agent;
+        use pc_rl_core::serializer::save_agent;
         let dir = std::env::temp_dir().join(format!("pc_weight_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let fresh_path = dir.join("fresh.json");

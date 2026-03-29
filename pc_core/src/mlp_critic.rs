@@ -21,9 +21,9 @@ use crate::linalg::LinAlg;
 /// # Examples
 ///
 /// ```
-/// use pc_core::activation::Activation;
-/// use pc_core::layer::LayerDef;
-/// use pc_core::mlp_critic::MlpCriticConfig;
+/// use pc_rl_core::activation::Activation;
+/// use pc_rl_core::layer::LayerDef;
+/// use pc_rl_core::mlp_critic::MlpCriticConfig;
 ///
 /// let config = MlpCriticConfig {
 ///     input_size: 27,
@@ -65,9 +65,9 @@ pub struct MlpCriticWeights {
 /// # Examples
 ///
 /// ```
-/// use pc_core::activation::Activation;
-/// use pc_core::layer::LayerDef;
-/// use pc_core::mlp_critic::{MlpCritic, MlpCriticConfig};
+/// use pc_rl_core::activation::Activation;
+/// use pc_rl_core::layer::LayerDef;
+/// use pc_rl_core::mlp_critic::{MlpCritic, MlpCriticConfig};
 /// use rand::SeedableRng;
 /// use rand::rngs::StdRng;
 ///

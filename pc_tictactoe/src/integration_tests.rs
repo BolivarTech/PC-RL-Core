@@ -9,9 +9,9 @@
 
 #[cfg(test)]
 mod tests {
-    use pc_core::pc_actor::SelectionMode;
-    use pc_core::pc_actor_critic::PcActorCritic;
-    use pc_core::serializer::{load_agent, save_agent};
+    use pc_rl_core::pc_actor::SelectionMode;
+    use pc_rl_core::pc_actor_critic::PcActorCritic;
+    use pc_rl_core::serializer::{load_agent, save_agent};
 
     use crate::env::tictactoe::TicTacToe;
     use crate::utils::config::{AppConfig, HiddenLayerDef};

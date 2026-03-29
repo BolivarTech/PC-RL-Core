@@ -13,7 +13,7 @@ use std::io::Write;
 
 use crate::training::trainer::Trainer;
 use crate::utils::config::AppConfig;
-use pc_core::pc_actor_critic::PcActorCritic;
+use pc_rl_core::pc_actor_critic::PcActorCritic;
 
 /// Which hyperparameter to sweep in the experiment.
 #[derive(Debug, Clone, Copy)]

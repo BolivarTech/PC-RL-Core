@@ -2,16 +2,16 @@
 // Version: 1.0.0
 // Date: 2026-03-25
 
-//! Crate-wide error type for `pc_core`.
+//! Crate-wide error type for `pc_rl_core`.
 
 use std::fmt;
 
-/// Crate-wide error type for `pc_core`.
+/// Crate-wide error type for `pc_rl_core`.
 ///
 /// # Examples
 ///
 /// ```
-/// use pc_core::error::PcError;
+/// use pc_rl_core::error::PcError;
 ///
 /// let err = PcError::ConfigValidation("bad topology".to_string());
 /// assert!(format!("{err}").contains("bad topology"));

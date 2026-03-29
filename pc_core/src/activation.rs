@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// # Examples
 ///
 /// ```
-/// use pc_core::activation::Activation;
+/// use pc_rl_core::activation::Activation;
 ///
 /// let act = Activation::Tanh;
 /// let y = act.apply(0.5);

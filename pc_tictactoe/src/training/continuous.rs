@@ -12,8 +12,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use pc_core::pc_actor::SelectionMode;
-use pc_core::pc_actor_critic::{PcActorCritic, TrajectoryStep};
+use pc_rl_core::pc_actor::SelectionMode;
+use pc_rl_core::pc_actor_critic::{PcActorCritic, TrajectoryStep};
 
 use crate::env::minimax::MinimaxPlayer;
 use crate::env::tictactoe::{GameResult, Player, TicTacToe};
@@ -30,7 +30,7 @@ use crate::utils::metrics::{GameOutcome, Metrics};
 /// ```no_run
 /// use std::sync::Arc;
 /// use std::sync::atomic::AtomicBool;
-/// use pc_core::pc_actor_critic::PcActorCritic;
+/// use pc_rl_core::pc_actor_critic::PcActorCritic;
 /// use pc_tictactoe::training::continuous::ContinuousTrainer;
 /// use pc_tictactoe::utils::config::AppConfig;
 ///

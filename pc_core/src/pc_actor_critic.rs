@@ -27,11 +27,11 @@ use crate::pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
 /// # Examples
 ///
 /// ```
-/// use pc_core::activation::Activation;
-/// use pc_core::layer::LayerDef;
-/// use pc_core::mlp_critic::MlpCriticConfig;
-/// use pc_core::pc_actor::PcActorConfig;
-/// use pc_core::pc_actor_critic::PcActorCriticConfig;
+/// use pc_rl_core::activation::Activation;
+/// use pc_rl_core::layer::LayerDef;
+/// use pc_rl_core::mlp_critic::MlpCriticConfig;
+/// use pc_rl_core::pc_actor::PcActorConfig;
+/// use pc_rl_core::pc_actor_critic::PcActorCriticConfig;
 ///
 /// let config = PcActorCriticConfig {
 ///     actor: PcActorConfig {

@@ -13,11 +13,11 @@ use std::fmt;
 use std::fs;
 use std::path::Path;
 
-use pc_core::activation::Activation;
-use pc_core::layer::LayerDef;
-use pc_core::mlp_critic::MlpCriticConfig;
-use pc_core::pc_actor::PcActorConfig;
-use pc_core::pc_actor_critic::PcActorCriticConfig;
+use pc_rl_core::activation::Activation;
+use pc_rl_core::layer::LayerDef;
+use pc_rl_core::mlp_critic::MlpCriticConfig;
+use pc_rl_core::pc_actor::PcActorConfig;
+use pc_rl_core::pc_actor_critic::PcActorCriticConfig;
 use serde::Deserialize;
 
 /// Top-level application configuration parsed from TOML.

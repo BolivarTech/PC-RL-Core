@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-pc_core = { path = "../pc_core" }
+pc-rl-core = { path = "../pc_core" }
 serde.workspace = true
 serde_json.workspace = true
 rand.workspace = true

@@ -24,7 +24,7 @@ pub const GRAD_CLIP: f64 = 5.0;
 /// # Examples
 ///
 /// ```
-/// use pc_core::matrix::Matrix;
+/// use pc_rl_core::matrix::Matrix;
 ///
 /// let m = Matrix::zeros(2, 3);
 /// assert_eq!(m.rows, 2);
