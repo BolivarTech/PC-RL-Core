@@ -183,7 +183,7 @@ pub enum SelectionMode {
 ///     rezero_init: 0.001,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
-/// let actor = PcActor::new(config, &mut rng).unwrap();
+/// let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
 /// let result = actor.infer(&[0.0; 9]);
 /// assert_eq!(result.y_conv.len(), 9);
 /// ```

@@ -51,8 +51,8 @@ pub struct LayerDef {
 /// use rand::rngs::StdRng;
 ///
 /// let mut rng = StdRng::seed_from_u64(42);
-/// let layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
-/// let output = layer.forward(&vec![1.0, 0.0, -1.0, 0.5]);
+/// let layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+/// let output: Vec<f64> = layer.forward(&vec![1.0, 0.0, -1.0, 0.5]);
 /// assert_eq!(output.len(), 3);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
