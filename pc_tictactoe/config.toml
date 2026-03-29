@@ -16,7 +16,7 @@ max_steps = 5
 lr_weights = 0.005
 synchronous = true
 temperature = 1.0
-local_lambda = 0.999
+local_lambda = 0.9999
 residual = true
 rezero_init = 0.1
 
@@ -43,7 +43,7 @@ size = 36
 activation = "softsign"
 
 [training]
-episodes = 50000
+episodes = 200000
 checkpoint_interval = 5000
 log_interval = 500
 seed = 42

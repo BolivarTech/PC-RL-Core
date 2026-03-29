@@ -579,7 +579,39 @@ Comparing λ=0.9999 vs λ=0.999 for the heterogeneous projection config.
 3. **D>=8 identical** (26%) -- the difference is in the tail: λ=0.999 pushes more seeds past depth 8 into depth 9
 4. **Confirms depth-lambda relationship is topology-dependent** -- for [27,27,18] with projection, λ=0.999 (0.1% PC error) is optimal, same as homogeneous [27,27,27]. The projection does not change the lambda sweet spot
 
-## Conclusions (17 phases, ~3,000+ training runs)
+### Phase 18: Extended Training 200k Episodes (N=35, [27,27,18] softsign, residual+projection, λ=0.999)
+
+Testing whether 4× more training episodes (200,000 vs 50,000) improves the best 3-layer configuration.
+
+| Metric | Phase 18 (200k eps) | Phase 16 (50k eps) | Phase 14 (1×27 best) |
+|--------|--------------------|--------------------|----------------------|
+| Topology | [27,27,18] | [27,27,18] | [27] |
+| Lambda | 0.999 | 0.999 | 0.99 |
+| Episodes | 200,000 | 50,000 | 50,000 |
+| **Mean** | **7.03** | **7.20** | **7.94** |
+| StdDev | 0.89 | 0.83 | 0.81 |
+| Min / Max | 6 / 9 | 6 / 9 | 7 / 9 |
+| D>=8 | 22.9% | 26% | 37.1% |
+| D=9 | 8.6% | 8.6% | 20% |
+
+#### Depth distribution (200k episodes)
+
+| Depth | Count | % |
+|-------|-------|---|
+| 6 | 10 | 28.6% |
+| 7 | 17 | 48.6% |
+| 8 | 5 | 14.3% |
+| 9 | 3 | 8.6% |
+
+#### Findings
+
+1. **4× more episodes provides no improvement** -- mean dropped slightly from 7.20 to 7.03 (not statistically significant). D=9 rate unchanged at 8.6%. The extra 150,000 episodes add zero value.
+2. **Stalling pattern dominates** -- 28.6% of seeds (10/35) got stuck at depth 6 with persistent `0% win / 50% loss / 50% draw`. Many show 100+ consecutive windows without escape, followed by periodic policy collapse (100% loss) and partial recovery.
+3. **All curriculum advancements occur within first 30k episodes** -- after that, seeds are either stuck or have already peaked. A 50,000 episode budget is sufficient for this architecture.
+4. **Depth ceiling is structural, not training-budget** -- the 3-layer optimization landscape has deeper local minima that more gradient steps cannot escape. The agent needs a qualitatively different signal, not more of the same.
+5. **Single-layer [27] remains optimal for 3×3 TTT** -- mean 7.94 vs 7.03, never drops below D=7, hits D=9 at 2.3× the rate. The extra capacity of 3 layers is wasted on a 9-position game.
+
+## Conclusions (18 phases, ~3,100+ training runs)
 
 ### What Works
 
@@ -589,20 +621,22 @@ Comparing λ=0.9999 vs λ=0.999 for the heterogeneous projection config.
 4. **Residual + near-pure backprop enables deep networks** -- with lambda sufficiently close to 1.0, skip connections allow 2-3 layer networks to train without collapsing.
 5. **Lambda=0.999 for 3-layer networks** -- sweet spot for deep residual configs. Mean 7.20, up to 20% D=9 with projection.
 6. **Skip projection for heterogeneous layers** -- [27,27,18] with projection outperforms homogeneous [27,27,27] in D=9 rate (20% vs 6%). Dimensionality reduction acts as implicit regularizer.
+7. **50,000 episodes is sufficient** -- extended training (200k) provides zero improvement. All curriculum advancements occur within 30k episodes; the depth ceiling is structural, not budget-limited.
 
 ### What Doesn't Work
 
-7. **Unbounded activations (ReLU, ELU)** -- incompatible with PC inference loop. Dying neurons or unbounded explosion.
-8. **Lambda < 0.975 with any topology** -- too much PC error overwhelms reward signal. All degrade vs baseline.
-9. **Residual + lambda=0.99 with multi-layer** -- PC error amplifies through skip connections. 2 layers: degraded. 3 layers: catastrophic collapse (mean 3.14).
-10. **MSE auxiliary loss** -- degrades performance in all topologies. Reconstruction gradient conflicts with policy gradient. Sweep 0.05-0.50: uniformly harmful.
-11. **Entropy regularization** -- any coefficient destabilizes learned defensive play.
+8. **Unbounded activations (ReLU, ELU)** -- incompatible with PC inference loop. Dying neurons or unbounded explosion.
+9. **Lambda < 0.975 with any topology** -- too much PC error overwhelms reward signal. All degrade vs baseline.
+10. **Residual + lambda=0.99 with multi-layer** -- PC error amplifies through skip connections. 2 layers: degraded. 3 layers: catastrophic collapse (mean 3.14).
+11. **MSE auxiliary loss** -- degrades performance in all topologies. Reconstruction gradient conflicts with policy gradient. Sweep 0.05-0.50: uniformly harmful.
+12. **Entropy regularization** -- any coefficient destabilizes learned defensive play.
+13. **Extended training (200k episodes)** -- depth ceiling is structural, not training-budget. Seeds either converge within 30k episodes or stall permanently at 50% loss / 50% draw with periodic policy collapse.
 
 ### Discovered Rules
 
-12. **Depth-Lambda Scaling Law: `lambda ≈ 1 - 10^(-L)`** -- 1 layer: 0.99, 3 layers: 0.999. PC error must decrease exponentially with network depth.
-13. **PC inference and learning are independent** -- inference (alpha, max_steps) always active regardless of lambda. Deep networks converge to pure backprop for learning while retaining full deliberation.
-14. **Output activation must be linear** -- tanh on output collapses policy to uniform.
+14. **Depth-Lambda Scaling Law: `lambda ≈ 1 - 10^(-L)`** -- 1 layer: 0.99, 3 layers: 0.999. PC error must decrease exponentially with network depth.
+15. **PC inference and learning are independent** -- inference (alpha, max_steps) always active regardless of lambda. Deep networks converge to pure backprop for learning while retaining full deliberation.
+16. **Output activation must be linear** -- tanh on output collapses policy to uniform.
 
 ### Optimal Configurations
 

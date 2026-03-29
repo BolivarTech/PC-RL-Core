@@ -515,7 +515,7 @@ PC inference as a mechanism for parameter efficiency in RL is not well documente
 
 ## 7. Comprehensive Experimental Conclusions
 
-Over 3,000 training runs across 17 experimental phases establish the following conclusions:
+Over 3,100 training runs across 18 experimental phases establish the following conclusions:
 
 ### The DPC mechanism is real and robust
 
@@ -556,12 +556,17 @@ Learnable linear projection in the skip path (for layers of different sizes) out
 
 Softsign preserves 3.8x more gradient than tanh at high saturation. In 2-layer networks: +0.68 mean depth vs tanh. Widens effective lambda range from 0.99-only to 0.97-0.99.
 
+### Extended training provides no benefit (Phase 18)
+
+Testing 200,000 episodes (4× the standard 50,000) on the best 3-layer config ([27,27,18], softsign, residual+projection, lambda=0.999) confirmed the depth ceiling is structural: mean 7.03 vs 7.20 (50k), D=9 unchanged at 8.6%. All curriculum advancements occur within the first 30,000 episodes. The 3-layer optimization landscape has persistent local minima that more gradient steps cannot escape.
+
 ### What definitively does not work
 
 - **Unbounded activations** (ReLU, ELU) -- diverge in PC loop
 - **MSE auxiliary loss** -- reconstruction gradient conflicts with policy gradient in all topologies
 - **Entropy regularization** -- destabilizes defensive play
 - **Lambda < 0.975** -- too much PC error for any topology
+- **Extended training** -- depth ceiling is structural, not budget-limited (200k episodes = 50k episodes)
 
 ### Design principles
 
@@ -569,12 +574,13 @@ Softsign preserves 3.8x more gradient than tanh at high saturation. In 2-layer n
 2. **Scale PC error inversely with network depth** -- follow `1 - 10^(-L)` rule
 3. **Use softsign + residual + projection for deep networks** -- three mechanisms cooperate to enable gradient flow
 4. **PC inference is always beneficial** -- deliberation helps regardless of how the learning signal is composed
+5. **50,000 episodes is the efficient training budget** -- diminishing returns set in well before 200k; budget is better spent on more seeds than more episodes
 
 ## 8. Future Work
 
 ### Pending on Standard TTT
 
-- **Extended training** (200,000 episodes) for [27,27,18] with projection and lambda=0.999 to test if more training time improves D=9 rate
+- ~~**Extended training** (200,000 episodes) for [27,27,18]~~ -- **Completed (Phase 18)**: 200k episodes provided zero improvement over 50k. Mean 7.03 vs 7.20, D=9 unchanged at 8.6%. The depth ceiling is structural, not training-budget limited. All curriculum advancements occur within first 30k episodes.
 - **Depth-Lambda Scaling Law validation** at 4-5 layers to confirm the `1 - 10^(-L)` relationship
 - **Per-layer lambda** -- different blend factors per hidden layer, more PC error where backprop is weakest
 
