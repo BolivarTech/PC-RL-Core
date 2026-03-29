@@ -41,7 +41,6 @@ use crate::pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
 ///         local_lambda: 1.0,
 ///         residual: false,
 ///         rezero_init: 0.001,
-///         aux_loss_coefficient: 0.0,
 ///     },
 ///     critic: MlpCriticConfig {
 ///         input_size: 27,
