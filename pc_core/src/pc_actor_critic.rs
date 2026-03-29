@@ -8,6 +8,8 @@
 //! with [`MlpCritic`] for value estimation. Supports REINFORCE episodic
 //! learning, TD(0) continuous learning, surprise-based scheduling, and
 //! entropy regularization.
+//!
+//! Generic over a [`LinAlg`] backend `L`. Defaults to [`CpuLinAlg`].
 
 use std::collections::VecDeque;
 
@@ -15,7 +17,8 @@ use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 
 use crate::error::PcError;
-use crate::matrix::softmax_masked;
+use crate::linalg::cpu::CpuLinAlg;
+use crate::linalg::LinAlg;
 use crate::mlp_critic::{MlpCritic, MlpCriticConfig};
 use crate::pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
 
@@ -74,20 +77,22 @@ pub struct PcActorCriticConfig {
 }
 
 /// A single step in a trajectory collected during an episode.
+///
+/// Generic over a [`LinAlg`] backend `L`. Defaults to [`CpuLinAlg`].
 #[derive(Debug, Clone)]
-pub struct TrajectoryStep {
+pub struct TrajectoryStep<L: LinAlg = CpuLinAlg> {
     /// Board state input vector.
-    pub input: Vec<f64>,
+    pub input: L::Vector,
     /// Concatenated hidden layer activations from inference.
-    pub latent_concat: Vec<f64>,
+    pub latent_concat: L::Vector,
     /// Converged output logits from inference.
-    pub y_conv: Vec<f64>,
+    pub y_conv: L::Vector,
     /// Per-layer hidden state activations from inference (for backprop).
-    pub hidden_states: Vec<Vec<f64>>,
+    pub hidden_states: Vec<L::Vector>,
     /// Per-layer prediction errors from the PC inference loop.
-    pub prediction_errors: Vec<Vec<f64>>,
+    pub prediction_errors: Vec<L::Vector>,
     /// Per-layer tanh components for residual layers (for correct backward pass).
-    pub tanh_components: Vec<Option<Vec<f64>>>,
+    pub tanh_components: Vec<Option<L::Vector>>,
     /// Action taken at this step.
     pub action: usize,
     /// Valid actions at this step (needed for masked softmax).
@@ -104,12 +109,14 @@ pub struct TrajectoryStep {
 ///
 /// Combines a predictive coding actor with an MLP critic for
 /// reinforcement learning with surprise-based scheduling.
+///
+/// Generic over a [`LinAlg`] backend `L`. Defaults to [`CpuLinAlg`].
 #[derive(Debug)]
-pub struct PcActorCritic {
+pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// The PC actor network.
-    pub(crate) actor: PcActor,
+    pub(crate) actor: PcActor<L>,
     /// The MLP critic (value function).
-    pub(crate) critic: MlpCritic,
+    pub(crate) critic: MlpCritic<L>,
     /// Agent configuration.
     pub config: PcActorCriticConfig,
     /// Random number generator for action selection.
@@ -118,7 +125,7 @@ pub struct PcActorCritic {
     surprise_buffer: VecDeque<f64>,
 }
 
-impl PcActorCritic {
+impl<L: LinAlg> PcActorCritic<L> {
     /// Creates a new PC Actor-Critic agent.
     ///
     /// # Arguments
@@ -139,8 +146,8 @@ impl PcActorCritic {
 
         use rand::SeedableRng;
         let mut rng = StdRng::seed_from_u64(seed);
-        let actor = PcActor::new(config.actor.clone(), &mut rng)?;
-        let critic = MlpCritic::new(config.critic.clone(), &mut rng)?;
+        let actor = PcActor::<L>::new(config.actor.clone(), &mut rng)?;
+        let critic = MlpCritic::<L>::new(config.critic.clone(), &mut rng)?;
         Ok(Self {
             actor,
             critic,
@@ -160,8 +167,8 @@ impl PcActorCritic {
     /// * `rng` - Random number generator.
     pub fn from_parts(
         config: PcActorCriticConfig,
-        actor: PcActor,
-        critic: MlpCritic,
+        actor: PcActor<L>,
+        critic: MlpCritic<L>,
         rng: StdRng,
     ) -> Self {
         Self {
@@ -185,7 +192,7 @@ impl PcActorCritic {
     /// # Panics
     ///
     /// Panics if `input.len() != config.actor.input_size`.
-    pub fn infer(&self, input: &[f64]) -> InferResult {
+    pub fn infer(&self, input: &[f64]) -> InferResult<L> {
         self.actor.infer(input)
     }
 
@@ -208,11 +215,12 @@ impl PcActorCritic {
         input: &[f64],
         valid_actions: &[usize],
         mode: SelectionMode,
-    ) -> (usize, InferResult) {
+    ) -> (usize, InferResult<L>) {
         let infer_result = self.actor.infer(input);
-        let action =
-            self.actor
-                .select_action(&infer_result.y_conv, valid_actions, mode, &mut self.rng);
+        let y_slice = L::vec_to_vec(&infer_result.y_conv);
+        let action = self
+            .actor
+            .select_action(&y_slice, valid_actions, mode, &mut self.rng);
         (action, infer_result)
     }
 
@@ -228,7 +236,7 @@ impl PcActorCritic {
     /// # Returns
     ///
     /// Average critic loss over the trajectory.
-    pub fn learn(&mut self, trajectory: &[TrajectoryStep]) -> f64 {
+    pub fn learn(&mut self, trajectory: &[TrajectoryStep<L>]) -> f64 {
         if trajectory.is_empty() {
             return 0.0;
         }
@@ -246,8 +254,10 @@ impl PcActorCritic {
 
         for (t, step) in trajectory.iter().enumerate() {
             // Build critic input: concat(input, latent_concat)
-            let mut critic_input = step.input.clone();
-            critic_input.extend_from_slice(&step.latent_concat);
+            let input_vec = L::vec_to_vec(&step.input);
+            let latent_vec = L::vec_to_vec(&step.latent_concat);
+            let mut critic_input = input_vec.clone();
+            critic_input.extend_from_slice(&latent_vec);
 
             // V(s)
             let value = self.critic.forward(&critic_input);
@@ -258,12 +268,14 @@ impl PcActorCritic {
             total_loss += loss;
 
             // Policy gradient
-            let scaled: Vec<f64> = step
-                .y_conv
+            let y_conv_vec = L::vec_to_vec(&step.y_conv);
+            let scaled: Vec<f64> = y_conv_vec
                 .iter()
                 .map(|&v| v / self.actor.config.temperature)
                 .collect();
-            let pi = softmax_masked(&scaled, &step.valid_actions);
+            let scaled_l = L::vec_from_slice(&scaled);
+            let pi_l = L::softmax_masked(&scaled_l, &step.valid_actions);
+            let pi = L::vec_to_vec(&pi_l);
 
             let mut delta = vec![0.0; pi.len()];
             for &i in &step.valid_actions {
@@ -296,7 +308,7 @@ impl PcActorCritic {
                 tanh_components: step.tanh_components.clone(),
             };
             self.actor
-                .update_weights(&delta, &stored_infer, &step.input, s_scale);
+                .update_weights(&delta, &stored_infer, &input_vec, s_scale);
 
             // Push surprise to adaptive buffer
             if self.config.adaptive_surprise {
@@ -327,20 +339,22 @@ impl PcActorCritic {
     pub fn learn_continuous(
         &mut self,
         input: &[f64],
-        infer: &InferResult,
+        infer: &InferResult<L>,
         action: usize,
         valid_actions: &[usize],
         reward: f64,
         next_input: &[f64],
-        next_infer: &InferResult,
+        next_infer: &InferResult<L>,
         terminal: bool,
     ) -> f64 {
         // Build critic inputs
+        let latent_vec = L::vec_to_vec(&infer.latent_concat);
         let mut critic_input = input.to_vec();
-        critic_input.extend_from_slice(&infer.latent_concat);
+        critic_input.extend_from_slice(&latent_vec);
 
+        let next_latent_vec = L::vec_to_vec(&next_infer.latent_concat);
         let mut next_critic_input = next_input.to_vec();
-        next_critic_input.extend_from_slice(&next_infer.latent_concat);
+        next_critic_input.extend_from_slice(&next_latent_vec);
 
         let v_s = self.critic.forward(&critic_input);
         let v_next = if terminal {
@@ -361,12 +375,14 @@ impl PcActorCritic {
         let loss = self.critic.update(&critic_input, target);
 
         // Policy gradient (same formula as learn, but scaled by td_error)
-        let scaled: Vec<f64> = infer
-            .y_conv
+        let y_conv_vec = L::vec_to_vec(&infer.y_conv);
+        let scaled: Vec<f64> = y_conv_vec
             .iter()
             .map(|&v| v / self.actor.config.temperature)
             .collect();
-        let pi = softmax_masked(&scaled, valid_actions);
+        let scaled_l = L::vec_from_slice(&scaled);
+        let pi_l = L::softmax_masked(&scaled_l, valid_actions);
+        let pi = L::vec_to_vec(&pi_l);
 
         let mut delta = vec![0.0; pi.len()];
         for &i in valid_actions {
@@ -485,7 +501,8 @@ mod tests {
     }
 
     fn make_agent() -> PcActorCritic {
-        PcActorCritic::new(default_config(), 42).unwrap()
+        let agent: PcActorCritic = PcActorCritic::new(default_config(), 42).unwrap();
+        agent
     }
 
     fn make_trajectory(agent: &mut PcActorCritic) -> Vec<TrajectoryStep> {
@@ -511,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_learn_empty_returns_zero_without_modifying_weights() {
-        let mut agent = make_agent();
+        let mut agent: PcActorCritic = make_agent();
         let w_before = agent.actor.layers[0].weights.data.clone();
         let cw_before = agent.critic.layers[0].weights.data.clone();
         let loss = agent.learn(&[]);
@@ -522,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_learn_updates_actor_weights() {
-        let mut agent = make_agent();
+        let mut agent: PcActorCritic = make_agent();
         let trajectory = make_trajectory(&mut agent);
         let w_before = agent.actor.layers[0].weights.data.clone();
         let _ = agent.learn(&trajectory);
@@ -531,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_learn_updates_critic_weights() {
-        let mut agent = make_agent();
+        let mut agent: PcActorCritic = make_agent();
         let trajectory = make_trajectory(&mut agent);
         let w_before = agent.critic.layers[0].weights.data.clone();
         let _ = agent.learn(&trajectory);
@@ -540,7 +557,7 @@ mod tests {
 
     #[test]
     fn test_learn_returns_finite_nonneg_loss() {
-        let mut agent = make_agent();
+        let mut agent: PcActorCritic = make_agent();
         let trajectory = make_trajectory(&mut agent);
         let loss = agent.learn(&trajectory);
         assert!(loss.is_finite(), "Loss {loss} is not finite");
@@ -549,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_learn_single_step_trajectory() {
-        let mut agent = make_agent();
+        let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
         let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
@@ -573,7 +590,7 @@ mod tests {
     #[test]
     fn test_learn_multi_step_uses_stored_hidden_states() {
         // Build a 3-step trajectory to exercise multi-step learning
-        let mut agent = make_agent();
+        let mut agent: PcActorCritic = make_agent();
         let inputs = [
             vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5],
             vec![0.5, 0.5, -1.0, 0.0, 1.0, -0.5, 0.0, -1.0, 0.5],
@@ -611,7 +628,7 @@ mod tests {
 
     #[test]
     fn test_learn_continuous_nonterminal_uses_next_value() {
-        let mut agent = make_agent();
+        let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let next_input = vec![-0.5; 9];
         let valid = vec![0, 1, 2];
@@ -634,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_learn_continuous_terminal_uses_reward_only() {
-        let mut agent = make_agent();
+        let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let next_input = vec![0.0; 9];
         let valid = vec![0, 1, 2];
@@ -659,8 +676,8 @@ mod tests {
     fn test_learn_continuous_terminal_and_nonterminal_produce_different_updates() {
         // Create two identical agents
         let config = default_config();
-        let mut agent_term = PcActorCritic::new(config.clone(), 42).unwrap();
-        let mut agent_nonterm = PcActorCritic::new(config, 42).unwrap();
+        let mut agent_term: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
+        let mut agent_nonterm: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
 
         let input = vec![0.5; 9];
         let next_input = vec![-0.5; 9];
@@ -708,7 +725,7 @@ mod tests {
 
     #[test]
     fn test_learn_continuous_updates_actor() {
-        let mut agent = make_agent();
+        let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let next_input = vec![-0.5; 9];
         let valid = vec![0, 1, 2];
@@ -732,21 +749,21 @@ mod tests {
 
     #[test]
     fn test_surprise_scale_below_low() {
-        let agent = make_agent();
+        let agent: PcActorCritic = make_agent();
         let scale = agent.surprise_scale(0.01); // below low=0.02
         assert!((scale - 0.1).abs() < 1e-12, "Expected 0.1, got {scale}");
     }
 
     #[test]
     fn test_surprise_scale_above_high() {
-        let agent = make_agent();
+        let agent: PcActorCritic = make_agent();
         let scale = agent.surprise_scale(0.20); // above high=0.15
         assert!((scale - 2.0).abs() < 1e-12, "Expected 2.0, got {scale}");
     }
 
     #[test]
     fn test_surprise_scale_midpoint_in_range() {
-        let agent = make_agent();
+        let agent: PcActorCritic = make_agent();
         let midpoint = (0.02 + 0.15) / 2.0;
         let scale = agent.surprise_scale(midpoint);
         assert!(
@@ -757,7 +774,7 @@ mod tests {
 
     #[test]
     fn test_surprise_scale_monotone_increasing() {
-        let agent = make_agent();
+        let agent: PcActorCritic = make_agent();
         let s1 = agent.surprise_scale(0.01);
         let s2 = agent.surprise_scale(0.05);
         let s3 = agent.surprise_scale(0.10);
@@ -771,7 +788,7 @@ mod tests {
     fn test_adaptive_surprise_recalibrates_thresholds_after_many_episodes() {
         let mut config = default_config();
         config.adaptive_surprise = true;
-        let mut agent = PcActorCritic::new(config, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
 
         // Fill buffer with varied surprise scores to get nonzero std
         for i in 0..15 {
@@ -811,7 +828,7 @@ mod tests {
         // should keep the policy from collapsing to a single action
         let mut config = default_config();
         config.entropy_coeff = 0.1; // Strong entropy
-        let mut agent = PcActorCritic::new(config, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
 
         let input = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
@@ -852,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_act_returns_valid_action() {
-        let mut agent = make_agent();
+        let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let valid = vec![1, 3, 5, 7];
         for _ in 0..20 {
@@ -864,7 +881,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_act_empty_valid_panics() {
-        let mut agent = make_agent();
+        let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let _ = agent.act(&input, &[], SelectionMode::Training);
     }
@@ -909,7 +926,7 @@ mod tests {
             adaptive_surprise: false,
             entropy_coeff: 0.0, // no entropy to isolate gradient effect
         };
-        let mut agent = PcActorCritic::new(config, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
 
         let input = vec![0.0; 9];
         let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -968,7 +985,9 @@ mod tests {
     fn test_new_returns_error_zero_temperature() {
         let mut config = default_config();
         config.actor.temperature = 0.0;
-        let err = PcActorCritic::new(config, 42).unwrap_err();
+        let err = PcActorCritic::new(config, 42)
+            .map(|_: PcActorCritic| ())
+            .unwrap_err();
         assert!(format!("{err}").contains("temperature"));
     }
 
@@ -977,21 +996,27 @@ mod tests {
         let mut config = default_config();
         config.actor.input_size = 0;
         config.critic.input_size = 0;
-        assert!(PcActorCritic::new(config, 42).is_err());
+        assert!(PcActorCritic::new(config, 42)
+            .map(|_: PcActorCritic| ())
+            .is_err());
     }
 
     #[test]
     fn test_new_returns_error_zero_output_size() {
         let mut config = default_config();
         config.actor.output_size = 0;
-        assert!(PcActorCritic::new(config, 42).is_err());
+        assert!(PcActorCritic::new(config, 42)
+            .map(|_: PcActorCritic| ())
+            .is_err());
     }
 
     #[test]
     fn test_new_returns_error_negative_gamma() {
         let mut config = default_config();
         config.gamma = -0.1;
-        let err = PcActorCritic::new(config, 42).unwrap_err();
+        let err = PcActorCritic::new(config, 42)
+            .map(|_: PcActorCritic| ())
+            .unwrap_err();
         assert!(format!("{err}").contains("gamma"));
     }
 }

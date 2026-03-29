@@ -103,19 +103,6 @@ impl Activation {
             Activation::Linear => 1.0,
         }
     }
-
-    /// Applies the activation function element-wise to a slice.
-    ///
-    /// # Parameters
-    ///
-    /// * `v` - Slice of pre-activation values.
-    ///
-    /// # Returns
-    ///
-    /// A vector of activated values with the same length as `v`.
-    pub fn apply_vec(&self, v: &[f64]) -> Vec<f64> {
-        v.iter().map(|&x| self.apply(x)).collect()
-    }
 }
 
 #[cfg(test)]
@@ -329,27 +316,6 @@ mod tests {
         assert_eq!(Activation::Linear.derivative(999.0), 1.0);
         assert_eq!(Activation::Linear.derivative(-42.0), 1.0);
         assert_eq!(Activation::Linear.derivative(0.0), 1.0);
-    }
-
-    // ── apply_vec tests ──────────────────────────────────────────
-
-    #[test]
-    fn test_apply_vec_preserves_length() {
-        let result = Activation::Tanh.apply_vec(&[1.0, 2.0, 3.0]);
-        assert_eq!(result.len(), 3);
-    }
-
-    #[test]
-    fn test_apply_vec_empty_returns_empty() {
-        let result = Activation::Relu.apply_vec(&[]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_apply_vec_applies_elementwise() {
-        let input = [1.0, -1.0, 0.0];
-        let result = Activation::Relu.apply_vec(&input);
-        assert_eq!(result, vec![1.0, 0.0, 0.0]);
     }
 
     // ── robustness tests ─────────────────────────────────────────

@@ -6,6 +6,9 @@
 //!
 //! Provides save/load for complete agent state (weights, config, metadata)
 //! and checkpoint support with auto-named files.
+//!
+//! Serialization always goes through CPU types (`CpuLinAlg`). Generic agents
+//! convert to/from CPU weights via `to_weights()` / `from_weights()`.
 
 use std::path::{Path, PathBuf};
 
@@ -14,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::PcError;
 use crate::layer::Layer;
+use crate::linalg::LinAlg;
 use crate::mlp_critic::MlpCritic;
 use crate::pc_actor::PcActor;
 use crate::pc_actor_critic::{PcActorCritic, PcActorCriticConfig};
@@ -78,12 +82,12 @@ pub struct SaveFile {
 /// Saves the agent's full state to a JSON file.
 ///
 /// Creates parent directories if they don't exist. Extracts weights
-/// from both actor and critic, bundles with config and metadata,
-/// and writes as pretty-printed JSON.
+/// from both actor and critic via `to_weights()`, bundles with config
+/// and metadata, and writes as pretty-printed JSON.
 ///
 /// # Arguments
 ///
-/// * `agent` - The agent to save.
+/// * `agent` - The agent to save (any `LinAlg` backend).
 /// * `path` - File path for the JSON output.
 /// * `episode` - Current episode number.
 /// * `metrics` - Optional training metrics snapshot.
@@ -92,8 +96,8 @@ pub struct SaveFile {
 ///
 /// Returns `PcError::Io` on file system errors, `PcError::Serialization`
 /// on JSON encoding errors.
-pub fn save_agent(
-    agent: &PcActorCritic,
+pub fn save_agent<L: LinAlg>(
+    agent: &PcActorCritic<L>,
     path: &str,
     episode: usize,
     metrics: Option<TrainingMetrics>,
@@ -106,14 +110,8 @@ pub fn save_agent(
             metrics,
         },
         config: agent.config.clone(),
-        actor_weights: PcActorWeights {
-            layers: agent.actor.layers.clone(),
-            rezero_alpha: agent.actor.rezero_alpha.clone(),
-            skip_projections: agent.actor.skip_projections.clone(),
-        },
-        critic_weights: crate::mlp_critic::MlpCriticWeights {
-            layers: agent.critic.layers.clone(),
-        },
+        actor_weights: agent.actor.to_weights(),
+        critic_weights: agent.critic.to_weights(),
     };
 
     let json = serde_json::to_string_pretty(&save_file)?;
@@ -130,10 +128,11 @@ pub fn save_agent(
     Ok(())
 }
 
-/// Loads an agent from a JSON save file.
+/// Loads an agent from a JSON save file (CPU backend).
 ///
 /// Reads the file, deserializes the `SaveFile`, validates that the
-/// topology matches the config, then reconstructs the agent.
+/// topology matches the config, then reconstructs the agent using
+/// `CpuLinAlg` (the default backend).
 ///
 /// # Arguments
 ///
@@ -168,19 +167,62 @@ pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError>
         });
     }
 
-    let actor = PcActor {
-        layers: save_file.actor_weights.layers,
-        config: save_file.config.actor.clone(),
-        rezero_alpha: save_file.actor_weights.rezero_alpha,
-        skip_projections: save_file.actor_weights.skip_projections,
-    };
+    let actor = PcActor::from_weights(save_file.config.actor.clone(), save_file.actor_weights);
+    let critic = MlpCritic::from_weights(save_file.config.critic.clone(), save_file.critic_weights);
 
-    let critic = MlpCritic::from_weights(
-        save_file.config.critic.clone(),
-        crate::mlp_critic::MlpCriticWeights {
-            layers: save_file.critic_weights.layers,
-        },
-    );
+    use rand::SeedableRng;
+    let rng = rand::rngs::StdRng::from_entropy();
+
+    let agent = PcActorCritic::from_parts(save_file.config, actor, critic, rng);
+
+    Ok((agent, save_file.metadata))
+}
+
+/// Loads an agent from a JSON save file with a specific `LinAlg` backend.
+///
+/// Same as [`load_agent`] but reconstructs the agent using the specified
+/// backend type `L`. Weights are deserialized as CPU types and then
+/// converted via `PcActor::<L>::from_weights()` and
+/// `MlpCritic::<L>::from_weights()`.
+///
+/// # Arguments
+///
+/// * `path` - Path to the JSON save file.
+///
+/// # Errors
+///
+/// Returns `PcError::Io` if the file doesn't exist, `PcError::Serialization`
+/// for invalid JSON, or `PcError::DimensionMismatch` if the saved weights
+/// don't match the config topology.
+pub fn load_agent_generic<L: LinAlg>(
+    path: &str,
+) -> Result<(PcActorCritic<L>, AgentMetadata), PcError> {
+    let json = std::fs::read_to_string(path)?;
+    let save_file: SaveFile = serde_json::from_str(&json)?;
+
+    // Validate actor layer count
+    let expected_actor_layers = save_file.config.actor.hidden_layers.len() + 1;
+    if save_file.actor_weights.layers.len() != expected_actor_layers {
+        return Err(PcError::DimensionMismatch {
+            expected: expected_actor_layers,
+            got: save_file.actor_weights.layers.len(),
+            context: "actor layer count",
+        });
+    }
+
+    // Validate critic layer count
+    let expected_critic_layers = save_file.config.critic.hidden_layers.len() + 1;
+    if save_file.critic_weights.layers.len() != expected_critic_layers {
+        return Err(PcError::DimensionMismatch {
+            expected: expected_critic_layers,
+            got: save_file.critic_weights.layers.len(),
+            context: "critic layer count",
+        });
+    }
+
+    let actor = PcActor::<L>::from_weights(save_file.config.actor.clone(), save_file.actor_weights);
+    let critic =
+        MlpCritic::<L>::from_weights(save_file.config.critic.clone(), save_file.critic_weights);
 
     use rand::SeedableRng;
     let rng = rand::rngs::StdRng::from_entropy();
@@ -217,7 +259,7 @@ pub fn checkpoint_filename(episode: usize) -> String {
 ///
 /// # Arguments
 ///
-/// * `agent` - The agent to checkpoint.
+/// * `agent` - The agent to checkpoint (any `LinAlg` backend).
 /// * `dir` - Directory where the checkpoint file will be created.
 /// * `episode` - Current episode number.
 /// * `metrics` - Optional training metrics snapshot.
@@ -229,8 +271,8 @@ pub fn checkpoint_filename(episode: usize) -> String {
 /// # Errors
 ///
 /// Returns `PcError` on I/O or serialization failures.
-pub fn save_checkpoint(
-    agent: &PcActorCritic,
+pub fn save_checkpoint<L: LinAlg>(
+    agent: &PcActorCritic<L>,
     dir: &str,
     episode: usize,
     metrics: Option<TrainingMetrics>,
@@ -290,7 +332,8 @@ mod tests {
     }
 
     fn make_agent() -> PcActorCritic {
-        PcActorCritic::new(default_config(), 42).unwrap()
+        let agent: PcActorCritic = PcActorCritic::new(default_config(), 42).unwrap();
+        agent
     }
 
     fn temp_path(name: &str) -> String {
@@ -539,7 +582,7 @@ mod tests {
             },
             ..default_config()
         };
-        let mut agent = PcActorCritic::new(config, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
         // Train one step to modify rezero_alpha
         let input = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();

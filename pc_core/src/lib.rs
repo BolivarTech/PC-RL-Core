@@ -20,6 +20,7 @@
 pub mod activation;
 pub mod error;
 pub mod layer;
+pub mod linalg;
 pub mod matrix;
 pub mod mlp_critic;
 pub mod pc_actor;
@@ -29,6 +30,8 @@ pub mod serializer;
 pub use activation::Activation;
 pub use error::PcError;
 pub use layer::{Layer, LayerDef};
+pub use linalg::cpu::CpuLinAlg;
+pub use linalg::LinAlg;
 pub use matrix::{
     argmax_masked, rms_error, sample_from_probs, softmax_masked, Matrix, GRAD_CLIP, WEIGHT_CLIP,
 };
@@ -36,6 +39,15 @@ pub use mlp_critic::{MlpCritic, MlpCriticConfig, MlpCriticWeights};
 pub use pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
 pub use pc_actor_critic::{PcActorCritic, PcActorCriticConfig, TrajectoryStep};
 pub use serializer::{
-    checkpoint_filename, load_agent, save_agent, save_checkpoint, AgentMetadata, PcActorWeights,
-    SaveFile, TrainingMetrics,
+    checkpoint_filename, load_agent, load_agent_generic, save_agent, save_checkpoint,
+    AgentMetadata, PcActorWeights, SaveFile, TrainingMetrics,
 };
+
+/// Type alias: CPU-backed layer.
+pub type LayerCpu = Layer<CpuLinAlg>;
+/// Type alias: CPU-backed PC actor.
+pub type PcActorCpu = PcActor<CpuLinAlg>;
+/// Type alias: CPU-backed MLP critic.
+pub type MlpCriticCpu = MlpCritic<CpuLinAlg>;
+/// Type alias: CPU-backed PC actor-critic agent.
+pub type PcActorCriticCpu = PcActorCritic<CpuLinAlg>;

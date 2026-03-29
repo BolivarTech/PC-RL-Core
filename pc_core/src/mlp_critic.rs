@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::activation::Activation;
 use crate::error::PcError;
 use crate::layer::{Layer, LayerDef};
+use crate::linalg::cpu::CpuLinAlg;
+use crate::linalg::LinAlg;
 
 /// Configuration for the MLP critic network.
 ///
@@ -57,6 +59,9 @@ pub struct MlpCriticWeights {
 /// Estimates V(s) given the concatenation of board state and actor latent
 /// activations. Trained via MSE loss backpropagation through dense layers.
 ///
+/// Generic over a [`LinAlg`] backend `L`. Defaults to [`CpuLinAlg`] for
+/// backward compatibility.
+///
 /// # Examples
 ///
 /// ```
@@ -73,19 +78,19 @@ pub struct MlpCriticWeights {
 ///     lr: 0.005,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
-/// let critic = MlpCritic::new(config, &mut rng).unwrap();
+/// let critic: MlpCritic = MlpCritic::new(config, &mut rng).unwrap();
 /// let value = critic.forward(&vec![0.0; 27]);
 /// assert!(value.is_finite());
 /// ```
 #[derive(Debug)]
-pub struct MlpCritic {
+pub struct MlpCritic<L: LinAlg = CpuLinAlg> {
     /// Dense layers: hidden layers followed by the output layer (1 neuron).
-    pub(crate) layers: Vec<Layer>,
+    pub(crate) layers: Vec<Layer<L>>,
     /// Configuration used to build this critic.
     pub config: MlpCriticConfig,
 }
 
-impl MlpCritic {
+impl<L: LinAlg> MlpCritic<L> {
     /// Builds the layer chain from the given configuration.
     ///
     /// The output layer always has exactly 1 neuron with the configured
@@ -105,16 +110,16 @@ impl MlpCritic {
             ));
         }
 
-        let mut layers = Vec::with_capacity(config.hidden_layers.len() + 1);
+        let mut layers: Vec<Layer<L>> = Vec::with_capacity(config.hidden_layers.len() + 1);
         let mut prev_size = config.input_size;
 
         for def in &config.hidden_layers {
-            layers.push(Layer::new(prev_size, def.size, def.activation, rng));
+            layers.push(Layer::<L>::new(prev_size, def.size, def.activation, rng));
             prev_size = def.size;
         }
 
         // Output layer: 1 neuron
-        layers.push(Layer::new(prev_size, 1, config.output_activation, rng));
+        layers.push(Layer::<L>::new(prev_size, 1, config.output_activation, rng));
 
         Ok(Self { layers, config })
     }
@@ -135,11 +140,11 @@ impl MlpCritic {
             self.config.input_size,
             input.len()
         );
-        let mut current = input.to_vec();
+        let mut current = L::vec_from_slice(input);
         for layer in &self.layers {
             current = layer.forward(&current);
         }
-        current[0]
+        L::vec_get(&current, 0)
     }
 
     /// Performs one MSE-loss update and returns the loss.
@@ -156,22 +161,22 @@ impl MlpCritic {
     /// * `target` - Target value (e.g., discounted return).
     pub fn update(&mut self, input: &[f64], target: f64) -> f64 {
         // Forward pass, storing intermediate inputs and outputs
-        let mut inputs: Vec<Vec<f64>> = Vec::with_capacity(self.layers.len());
-        let mut outputs: Vec<Vec<f64>> = Vec::with_capacity(self.layers.len());
+        let mut inputs: Vec<L::Vector> = Vec::with_capacity(self.layers.len());
+        let mut outputs: Vec<L::Vector> = Vec::with_capacity(self.layers.len());
 
-        let mut current = input.to_vec();
+        let mut current = L::vec_from_slice(input);
         for layer in &self.layers {
             inputs.push(current.clone());
             current = layer.forward(&current);
             outputs.push(current.clone());
         }
 
-        let predicted = current[0];
+        let predicted = L::vec_get(&current, 0);
         let error = target - predicted;
         let loss = error * error;
 
         // Output gradient: d(loss)/d(predicted) = -2*(target - predicted)
-        let mut delta = vec![-2.0 * error];
+        let mut delta = L::vec_from_slice(&[-2.0 * error]);
 
         // Backprop through layers in reverse
         for i in (0..self.layers.len()).rev() {
@@ -188,21 +193,75 @@ impl MlpCritic {
     }
 
     /// Extracts a serializable snapshot of current weights.
+    ///
+    /// Converts generic layers to CPU layers element-by-element for
+    /// backend-agnostic serialization.
     pub fn to_weights(&self) -> MlpCriticWeights {
-        MlpCriticWeights {
-            layers: self.layers.clone(),
-        }
+        let cpu_layers: Vec<Layer> = self
+            .layers
+            .iter()
+            .map(|layer| {
+                let rows = L::mat_rows(&layer.weights);
+                let cols = L::mat_cols(&layer.weights);
+                let mut cpu_weights = CpuLinAlg::zeros_mat(rows, cols);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        CpuLinAlg::mat_set(
+                            &mut cpu_weights,
+                            r,
+                            c,
+                            L::mat_get(&layer.weights, r, c),
+                        );
+                    }
+                }
+                let cpu_bias = L::vec_to_vec(&layer.bias);
+                Layer {
+                    weights: cpu_weights,
+                    bias: cpu_bias,
+                    activation: layer.activation,
+                }
+            })
+            .collect();
+        MlpCriticWeights { layers: cpu_layers }
     }
 
     /// Restores a critic from saved weights without requiring an RNG.
+    ///
+    /// Converts CPU layers to generic layers element-by-element for
+    /// backend-agnostic restoration.
     ///
     /// # Arguments
     ///
     /// * `config` - Must match the topology used when weights were saved.
     /// * `weights` - Previously saved weight snapshot.
     pub fn from_weights(config: MlpCriticConfig, weights: MlpCriticWeights) -> Self {
+        let generic_layers: Vec<Layer<L>> = weights
+            .layers
+            .into_iter()
+            .map(|cpu_layer| {
+                let rows = CpuLinAlg::mat_rows(&cpu_layer.weights);
+                let cols = CpuLinAlg::mat_cols(&cpu_layer.weights);
+                let mut generic_weights = L::zeros_mat(rows, cols);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        L::mat_set(
+                            &mut generic_weights,
+                            r,
+                            c,
+                            CpuLinAlg::mat_get(&cpu_layer.weights, r, c),
+                        );
+                    }
+                }
+                let generic_bias = L::vec_from_slice(&cpu_layer.bias);
+                Layer {
+                    weights: generic_weights,
+                    bias: generic_bias,
+                    activation: cpu_layer.activation,
+                }
+            })
+            .collect();
         Self {
-            layers: weights.layers,
+            layers: generic_layers,
             config,
         }
     }
@@ -239,7 +298,7 @@ mod tests {
     #[test]
     fn test_forward_returns_finite_scalar() {
         let mut rng = make_rng();
-        let critic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let input = vec![0.0; 27];
         let v = critic.forward(&input);
         assert!(v.is_finite(), "forward output {v} is not finite");
@@ -248,7 +307,7 @@ mod tests {
     #[test]
     fn test_forward_different_inputs_give_different_outputs() {
         let mut rng = make_rng();
-        let critic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let a = critic.forward(&vec![0.0; 27]);
         let mut input_b = vec![0.0; 27];
         input_b[0] = 1.0;
@@ -278,7 +337,7 @@ mod tests {
             output_activation: Activation::Linear,
             lr: 0.005,
         };
-        let critic = MlpCritic::new(config, &mut rng).unwrap();
+        let critic: MlpCritic = MlpCritic::new(config, &mut rng).unwrap();
         let v = critic.forward(&vec![0.5; 27]);
         assert!(v.is_finite(), "Deep topology output {v} is not finite");
     }
@@ -286,7 +345,7 @@ mod tests {
     #[test]
     fn test_forward_extreme_input_still_finite() {
         let mut rng = make_rng();
-        let critic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let input: Vec<f64> = (0..27)
             .map(|i| if i % 2 == 0 { 1e6 } else { -1e6 })
             .collect();
@@ -298,7 +357,7 @@ mod tests {
     #[should_panic]
     fn test_forward_panics_wrong_input_size() {
         let mut rng = make_rng();
-        let critic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let _ = critic.forward(&[0.0; 10]); // wrong size
     }
 
@@ -307,7 +366,7 @@ mod tests {
     #[test]
     fn test_update_loss_decreases_over_30_iterations() {
         let mut rng = make_rng();
-        let mut critic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let mut critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let input = vec![0.1; 27];
         let target = 0.5;
         let initial_loss = critic.update(&input, target);
@@ -324,7 +383,7 @@ mod tests {
     #[test]
     fn test_update_returns_finite_nonneg_loss() {
         let mut rng = make_rng();
-        let mut critic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let mut critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let loss = critic.update(&vec![0.0; 27], 1.0);
         assert!(loss.is_finite(), "Loss {loss} is not finite");
         assert!(loss >= 0.0, "Loss {loss} is negative");
@@ -333,7 +392,7 @@ mod tests {
     #[test]
     fn test_update_changes_weights() {
         let mut rng = make_rng();
-        let mut critic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let mut critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let w_before = critic.layers[0].weights.get(0, 0);
         let _ = critic.update(&vec![0.1; 27], 1.0);
         let w_after = critic.layers[0].weights.get(0, 0);
@@ -346,7 +405,7 @@ mod tests {
     #[test]
     fn test_update_clips_weights() {
         let mut rng = make_rng();
-        let mut critic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let mut critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
         // Extreme update to force clipping
         for _ in 0..100 {
             let _ = critic.update(&vec![10.0; 27], 1e6);
@@ -369,12 +428,12 @@ mod tests {
     #[test]
     fn test_serde_roundtrip_preserves_weights() {
         let mut rng = make_rng();
-        let critic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
         let input = vec![0.3; 27];
         let original_output = critic.forward(&input);
 
         let weights = critic.to_weights();
-        let restored = MlpCritic::from_weights(default_config(), weights);
+        let restored: MlpCritic = MlpCritic::from_weights(default_config(), weights);
         let restored_output = restored.forward(&input);
 
         assert!(

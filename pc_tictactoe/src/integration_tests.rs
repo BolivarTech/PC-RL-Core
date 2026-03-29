@@ -150,7 +150,7 @@ mod tests {
 
         // Also verify we can create an agent from this config
         let agent_config = config.to_agent_config().unwrap();
-        let mut agent = PcActorCritic::new(agent_config, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(agent_config, 42).unwrap();
 
         // Play a game to verify topology works end-to-end
         let mut env = TicTacToe::new();

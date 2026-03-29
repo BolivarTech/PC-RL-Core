@@ -288,7 +288,8 @@ mod tests {
         let fresh_path = dir.join("fresh.json");
         let trained_path = dir.join("trained.json");
 
-        let fresh2 = PcActorCritic::new(config.to_agent_config().unwrap(), 42).unwrap();
+        let fresh2: PcActorCritic =
+            PcActorCritic::new(config.to_agent_config().unwrap(), 42).unwrap();
         save_agent(&fresh2, &fresh_path.to_string_lossy(), 0, None).unwrap();
         save_agent(trainer.agent(), &trained_path.to_string_lossy(), 20, None).unwrap();
 

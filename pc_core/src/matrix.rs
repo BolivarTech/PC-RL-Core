@@ -360,7 +360,7 @@ pub fn sample_from_probs(probs: &[f64], mask: &[usize], rng: &mut impl Rng) -> u
 ///
 /// * `v` - Mutable slice to clamp.
 /// * `max_abs` - Maximum absolute value.
-pub fn clip_vec(v: &mut [f64], max_abs: f64) {
+pub(crate) fn clip_vec(v: &mut [f64], max_abs: f64) {
     for x in v.iter_mut() {
         *x = x.clamp(-max_abs, max_abs);
     }
@@ -376,7 +376,7 @@ pub fn clip_vec(v: &mut [f64], max_abs: f64) {
 /// # Returns
 ///
 /// A new vector where each element is `a[i] - b[i]`.
-pub fn vec_sub(a: &[f64], b: &[f64]) -> Vec<f64> {
+pub(crate) fn vec_sub(a: &[f64], b: &[f64]) -> Vec<f64> {
     assert_eq!(
         a.len(),
         b.len(),
@@ -397,7 +397,7 @@ pub fn vec_sub(a: &[f64], b: &[f64]) -> Vec<f64> {
 /// # Returns
 ///
 /// A new vector where each element is `a[i] + b[i]`.
-pub fn vec_add(a: &[f64], b: &[f64]) -> Vec<f64> {
+pub(crate) fn vec_add(a: &[f64], b: &[f64]) -> Vec<f64> {
     assert_eq!(
         a.len(),
         b.len(),
@@ -418,7 +418,7 @@ pub fn vec_add(a: &[f64], b: &[f64]) -> Vec<f64> {
 /// # Returns
 ///
 /// A new vector where each element is `v[i] * s`.
-pub fn vec_scale(v: &[f64], s: f64) -> Vec<f64> {
+pub(crate) fn vec_scale(v: &[f64], s: f64) -> Vec<f64> {
     v.iter().map(|x| x * s).collect()
 }
 
