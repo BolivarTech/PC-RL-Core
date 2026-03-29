@@ -16,7 +16,7 @@ max_steps = 5
 lr_weights = 0.005
 synchronous = true
 temperature = 1.0
-local_lambda = 0.9999
+local_lambda = 1.0
 residual = true
 rezero_init = 0.1
 
