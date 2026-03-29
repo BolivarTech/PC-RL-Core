@@ -20,6 +20,7 @@ fn main() {
         ui::cli::Command::Benchmark(args) => ui::cli::run_benchmark(args),
         ui::cli::Command::Experiment(args) => ui::cli::run_experiment(args),
         ui::cli::Command::Init(args) => ui::cli::run_init(args),
+        ui::cli::Command::SeedTest(args) => ui::cli::run_seed_test(args),
     };
     if let Err(e) = result {
         eprintln!("Error: {e}");

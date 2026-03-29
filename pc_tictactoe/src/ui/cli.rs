@@ -54,6 +54,8 @@ pub enum Command {
     Experiment(ExperimentArgs),
     /// Generate default config.toml with optimal parameters.
     Init(InitArgs),
+    /// Test a fixed config across N random seeds for statistical stability.
+    SeedTest(SeedTestArgs),
 }
 
 /// Arguments for the train subcommand.
@@ -125,6 +127,17 @@ pub struct ExperimentArgs {
     /// Parameter to sweep: "lambda" (default) or "aux".
     #[arg(long, short, default_value = "lambda")]
     pub sweep: String,
+}
+
+/// Arguments for the seed-test subcommand.
+#[derive(Parser)]
+pub struct SeedTestArgs {
+    /// Number of runs (random seeds).
+    #[arg(long, short)]
+    pub n: usize,
+    /// Path to TOML configuration file.
+    #[arg(long, short, default_value = "config.toml")]
+    pub config: String,
 }
 
 /// Arguments for the init subcommand.
@@ -506,6 +519,58 @@ level = "info"
 max_backups = 3
 max_size = 10485760
 "#;
+
+/// Runs the seed-test subcommand.
+///
+/// Trains the same config across N random seeds to test statistical stability.
+///
+/// # Errors
+///
+/// Returns an error on config/IO/training failures.
+pub fn run_seed_test(args: SeedTestArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::training::experiment;
+
+    let config = AppConfig::load(Path::new(&args.config))?;
+    config.validate()?;
+
+    let file = std::fs::File::create("seed_test.txt")?;
+    let stdout = io::stdout();
+    let mut writer = MultiWriter {
+        a: io::BufWriter::new(file),
+        b: stdout.lock(),
+    };
+
+    let results = experiment::run_seed_test(&config, args.n, &mut writer)?;
+
+    let summary = format!(
+        "\n=== SEED TEST ({} runs, lambda={:.4}) ===\n{:<24} {:<10} {:<10} {:<10} {:<10}\n{}\n",
+        results.len(),
+        results.first().map(|r| r.lambda).unwrap_or(0.0),
+        "seed",
+        "max_depth",
+        "win%",
+        "loss%",
+        "draw%",
+        results
+            .iter()
+            .map(|r| format!(
+                "{:<24} {:<10} {:<10.1} {:<10.1} {:<10.1}",
+                r.seed,
+                r.max_depth,
+                r.win_rate * 100.0,
+                r.loss_rate * 100.0,
+                r.draw_rate * 100.0,
+            ))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
+    write!(writer, "{summary}")?;
+    writer.flush()?;
+
+    println!("\nResults saved to seed_test.txt");
+    Ok(())
+}
 
 /// Writer that duplicates output to two writers (file + stdout).
 struct MultiWriter<A: io::Write, B: io::Write> {
