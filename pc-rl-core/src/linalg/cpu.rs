@@ -50,6 +50,21 @@ impl LinAlg for CpuLinAlg {
         Matrix::outer(a, b)
     }
 
+    fn mat_mul(a: &Self::Matrix, b: &Self::Matrix) -> Self::Matrix {
+        assert_eq!(a.cols, b.rows, "mat_mul: inner dimensions mismatch");
+        let mut result = Matrix::zeros(a.rows, b.cols);
+        for i in 0..a.rows {
+            for j in 0..b.cols {
+                let mut sum = 0.0;
+                for k in 0..a.cols {
+                    sum += a.get(i, k) * b.get(k, j);
+                }
+                result.set(i, j, sum);
+            }
+        }
+        result
+    }
+
     fn mat_scale_add(m: &mut Self::Matrix, other: &Self::Matrix, scale: f64) {
         m.scale_add(other, scale);
     }
@@ -485,5 +500,105 @@ mod tests {
         let a = CpuLinAlg::vec_from_slice(&[1.0, 0.0]);
         let b = CpuLinAlg::vec_from_slice(&[0.0, 1.0]);
         assert!((CpuLinAlg::vec_dot(&a, &b)).abs() < 1e-12);
+    }
+
+    // ── Phase 1 Cycle 1.1: mat_mul (matrix × matrix) ────────────
+
+    #[test]
+    fn test_mat_mul_2x3_by_3x2() {
+        // A = [[1,2,3],[4,5,6]] (2×3)
+        // B = [[7,8],[9,10],[11,12]] (3×2)
+        // C = A*B = [[58,64],[139,154]] (2×2)
+        let mut a = CpuLinAlg::zeros_mat(2, 3);
+        CpuLinAlg::mat_set(&mut a, 0, 0, 1.0);
+        CpuLinAlg::mat_set(&mut a, 0, 1, 2.0);
+        CpuLinAlg::mat_set(&mut a, 0, 2, 3.0);
+        CpuLinAlg::mat_set(&mut a, 1, 0, 4.0);
+        CpuLinAlg::mat_set(&mut a, 1, 1, 5.0);
+        CpuLinAlg::mat_set(&mut a, 1, 2, 6.0);
+
+        let mut b = CpuLinAlg::zeros_mat(3, 2);
+        CpuLinAlg::mat_set(&mut b, 0, 0, 7.0);
+        CpuLinAlg::mat_set(&mut b, 0, 1, 8.0);
+        CpuLinAlg::mat_set(&mut b, 1, 0, 9.0);
+        CpuLinAlg::mat_set(&mut b, 1, 1, 10.0);
+        CpuLinAlg::mat_set(&mut b, 2, 0, 11.0);
+        CpuLinAlg::mat_set(&mut b, 2, 1, 12.0);
+
+        let c = CpuLinAlg::mat_mul(&a, &b);
+        assert_eq!(CpuLinAlg::mat_rows(&c), 2);
+        assert_eq!(CpuLinAlg::mat_cols(&c), 2);
+        assert!((CpuLinAlg::mat_get(&c, 0, 0) - 58.0).abs() < 1e-10);
+        assert!((CpuLinAlg::mat_get(&c, 0, 1) - 64.0).abs() < 1e-10);
+        assert!((CpuLinAlg::mat_get(&c, 1, 0) - 139.0).abs() < 1e-10);
+        assert!((CpuLinAlg::mat_get(&c, 1, 1) - 154.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_mat_mul_identity_left() {
+        // I × M = M
+        let mut identity = CpuLinAlg::zeros_mat(3, 3);
+        CpuLinAlg::mat_set(&mut identity, 0, 0, 1.0);
+        CpuLinAlg::mat_set(&mut identity, 1, 1, 1.0);
+        CpuLinAlg::mat_set(&mut identity, 2, 2, 1.0);
+
+        let mut m = CpuLinAlg::zeros_mat(3, 2);
+        CpuLinAlg::mat_set(&mut m, 0, 0, 1.0);
+        CpuLinAlg::mat_set(&mut m, 0, 1, 2.0);
+        CpuLinAlg::mat_set(&mut m, 1, 0, 3.0);
+        CpuLinAlg::mat_set(&mut m, 1, 1, 4.0);
+        CpuLinAlg::mat_set(&mut m, 2, 0, 5.0);
+        CpuLinAlg::mat_set(&mut m, 2, 1, 6.0);
+
+        let result = CpuLinAlg::mat_mul(&identity, &m);
+        assert_eq!(CpuLinAlg::mat_rows(&result), 3);
+        assert_eq!(CpuLinAlg::mat_cols(&result), 2);
+        for r in 0..3 {
+            for c in 0..2 {
+                assert!(
+                    (CpuLinAlg::mat_get(&result, r, c) - CpuLinAlg::mat_get(&m, r, c)).abs()
+                        < 1e-10
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mat_mul_identity_right() {
+        // M × I = M
+        let mut m = CpuLinAlg::zeros_mat(2, 3);
+        CpuLinAlg::mat_set(&mut m, 0, 0, 1.0);
+        CpuLinAlg::mat_set(&mut m, 0, 1, 2.0);
+        CpuLinAlg::mat_set(&mut m, 0, 2, 3.0);
+        CpuLinAlg::mat_set(&mut m, 1, 0, 4.0);
+        CpuLinAlg::mat_set(&mut m, 1, 1, 5.0);
+        CpuLinAlg::mat_set(&mut m, 1, 2, 6.0);
+
+        let mut identity = CpuLinAlg::zeros_mat(3, 3);
+        CpuLinAlg::mat_set(&mut identity, 0, 0, 1.0);
+        CpuLinAlg::mat_set(&mut identity, 1, 1, 1.0);
+        CpuLinAlg::mat_set(&mut identity, 2, 2, 1.0);
+
+        let result = CpuLinAlg::mat_mul(&m, &identity);
+        assert_eq!(CpuLinAlg::mat_rows(&result), 2);
+        assert_eq!(CpuLinAlg::mat_cols(&result), 3);
+        for r in 0..2 {
+            for c in 0..3 {
+                assert!(
+                    (CpuLinAlg::mat_get(&result, r, c) - CpuLinAlg::mat_get(&m, r, c)).abs()
+                        < 1e-10
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mat_mul_result_dimensions() {
+        // (4×3) × (3×5) = (4×5)
+        let a = CpuLinAlg::zeros_mat(4, 3);
+        let b = CpuLinAlg::zeros_mat(3, 5);
+        let c = CpuLinAlg::mat_mul(&a, &b);
+        assert_eq!(CpuLinAlg::mat_rows(&c), 4);
+        assert_eq!(CpuLinAlg::mat_cols(&c), 5);
     }
 }

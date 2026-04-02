@@ -71,6 +71,12 @@ pub trait LinAlg: Clone + Send + Sync + 'static {
     /// Outer product of two vectors: `a * b^T`.
     fn outer_product(a: &Self::Vector, b: &Self::Vector) -> Self::Matrix;
 
+    /// Matrix-matrix multiplication: `a * b`.
+    ///
+    /// Returns a matrix with dimensions `(rows_a, cols_b)`.
+    /// Panics if `cols_a != rows_b`.
+    fn mat_mul(a: &Self::Matrix, b: &Self::Matrix) -> Self::Matrix;
+
     /// Adds `scale * other` element-wise to `m` (in place).
     fn mat_scale_add(m: &mut Self::Matrix, other: &Self::Matrix, scale: f64);
 
