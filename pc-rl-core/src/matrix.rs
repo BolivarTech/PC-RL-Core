@@ -422,6 +422,211 @@ pub(crate) fn vec_scale(v: &[f64], s: f64) -> Vec<f64> {
     v.iter().map(|x| x * s).collect()
 }
 
+/// CCA-based neuron alignment between two activation matrices.
+///
+/// Given activation matrices from parent A and parent B (rows = batch samples,
+/// columns = neurons), computes a permutation that aligns B's neurons to A's
+/// neurons based on functional similarity via Canonical Correlation Analysis.
+///
+/// # Arguments
+///
+/// * `act_a` - Activation matrix for parent A `[batch_size × n_a]`.
+/// * `act_b` - Activation matrix for parent B `[batch_size × n_b]`.
+///
+/// # Returns
+///
+/// A permutation vector of length `min(n_a, n_b)` where `perm[i]` is the
+/// index of the neuron in A that B's neuron `i` maps to.
+pub fn cca_neuron_alignment<L: crate::linalg::LinAlg>(
+    act_a: &L::Matrix,
+    act_b: &L::Matrix,
+) -> Vec<usize> {
+    let batch_size = L::mat_rows(act_a);
+    let n_a = L::mat_cols(act_a);
+    let n_b = L::mat_cols(act_b);
+    let k = n_a.min(n_b);
+
+    if k == 0 || batch_size < 2 {
+        return (0..k).collect();
+    }
+
+    // Phase 1: Standardize columns (mean=0, std=1)
+    let std_a = standardize_columns::<L>(act_a);
+    let std_b = standardize_columns::<L>(act_b);
+
+    let scale = 1.0 / (batch_size as f64 - 1.0);
+
+    // Phase 2: Compute covariance matrices
+    let std_a_t = L::mat_transpose(&std_a);
+    let std_b_t = L::mat_transpose(&std_b);
+
+    let mut c_a = L::mat_mul(&std_a_t, &std_a); // n_a × n_a
+    let mut c_b = L::mat_mul(&std_b_t, &std_b); // n_b × n_b
+    let mut c_ab = L::mat_mul(&std_a_t, &std_b); // n_a × n_b
+
+    // Scale by 1/(batch_size - 1)
+    scale_matrix::<L>(&mut c_a, n_a, n_a, scale);
+    scale_matrix::<L>(&mut c_b, n_b, n_b, scale);
+    scale_matrix::<L>(&mut c_ab, n_a, n_b, scale);
+
+    // Phase 3: Compute C_a^(-1/2) and C_b^(-1/2) via SVD
+    let c_a_inv_sqrt = mat_inv_sqrt::<L>(&c_a);
+    let c_b_inv_sqrt = mat_inv_sqrt::<L>(&c_b);
+
+    // M = C_a^(-1/2) × C_ab × C_b^(-1/2)
+    let temp = L::mat_mul(&c_a_inv_sqrt, &c_ab);
+    let m = L::mat_mul(&temp, &c_b_inv_sqrt);
+
+    // SVD(M) → U, S, V
+    let (u, _s, v) = L::svd(&m);
+
+    // Phase 4: Greedy matching
+    greedy_match::<L>(&u, &v, n_a, n_b)
+}
+
+/// Scale all elements of a matrix by a scalar.
+fn scale_matrix<L: crate::linalg::LinAlg>(m: &mut L::Matrix, rows: usize, cols: usize, s: f64) {
+    for r in 0..rows {
+        for c in 0..cols {
+            let val = L::mat_get(m, r, c);
+            L::mat_set(m, r, c, val * s);
+        }
+    }
+}
+
+/// Standardize columns of a matrix to mean=0, std=1.
+/// Dead neurons (std < epsilon) get zeroed columns.
+fn standardize_columns<L: crate::linalg::LinAlg>(m: &L::Matrix) -> L::Matrix {
+    let rows = L::mat_rows(m);
+    let cols = L::mat_cols(m);
+    let mut result = L::zeros_mat(rows, cols);
+    let eps = 1e-12;
+
+    for c in 0..cols {
+        // Compute mean
+        let mut sum = 0.0;
+        for r in 0..rows {
+            sum += L::mat_get(m, r, c);
+        }
+        let mean = sum / rows as f64;
+
+        // Compute std
+        let mut var_sum = 0.0;
+        for r in 0..rows {
+            let diff = L::mat_get(m, r, c) - mean;
+            var_sum += diff * diff;
+        }
+        let std = (var_sum / rows as f64).sqrt();
+
+        if std > eps {
+            for r in 0..rows {
+                L::mat_set(&mut result, r, c, (L::mat_get(m, r, c) - mean) / std);
+            }
+        }
+        // Dead neuron: column stays zero
+    }
+    result
+}
+
+/// Compute M^(-1/2) for a symmetric positive semi-definite matrix via SVD.
+/// Eigenvalues below epsilon are treated as zero.
+fn mat_inv_sqrt<L: crate::linalg::LinAlg>(m: &L::Matrix) -> L::Matrix {
+    let n = L::mat_rows(m);
+    let (u, s, _v) = L::svd(m);
+    let eps = 1e-10;
+
+    // Build diag(1/sqrt(s_i)) for non-zero singular values
+    let k = L::vec_len(&s);
+    let mut diag_inv_sqrt = L::zeros_mat(k, k);
+    for i in 0..k {
+        let si = L::vec_get(&s, i);
+        if si > eps {
+            L::mat_set(&mut diag_inv_sqrt, i, i, 1.0 / si.sqrt());
+        }
+    }
+
+    // M^(-1/2) = V × diag(1/sqrt(S)) × U^T
+    // For symmetric M: U ≈ V, so M^(-1/2) = U × diag(1/sqrt(S)) × U^T
+    let temp = L::mat_mul(&u, &diag_inv_sqrt);
+    let ut = L::mat_transpose(&u);
+    let mut result = L::mat_mul(&temp, &ut);
+
+    // Ensure result is n×n (SVD may truncate)
+    if L::mat_rows(&result) != n || L::mat_cols(&result) != n {
+        let mut padded = L::zeros_mat(n, n);
+        let r_rows = L::mat_rows(&result);
+        let r_cols = L::mat_cols(&result);
+        for r in 0..r_rows.min(n) {
+            for c in 0..r_cols.min(n) {
+                L::mat_set(&mut padded, r, c, L::mat_get(&result, r, c));
+            }
+        }
+        result = padded;
+    }
+
+    result
+}
+
+/// Greedy matching from CCA canonical directions.
+/// Returns permutation[i] = index in A that B's neuron i maps to.
+fn greedy_match<L: crate::linalg::LinAlg>(
+    u: &L::Matrix,
+    v: &L::Matrix,
+    n_a: usize,
+    n_b: usize,
+) -> Vec<usize> {
+    let k = n_a.min(n_b);
+    let n_canonical = L::mat_cols(u).min(L::mat_cols(v));
+
+    let mut matched_a = vec![false; n_a];
+    let mut matched_b = vec![false; n_b];
+    let mut perm = vec![0usize; k];
+    let mut assigned = vec![false; k];
+
+    // Match by strongest canonical correlation first
+    for col in 0..n_canonical {
+        // Find neuron in A with largest |u_k| coefficient
+        let mut best_a = 0;
+        let mut best_a_val = 0.0_f64;
+        for (i, &is_matched) in matched_a.iter().enumerate().take(n_a.min(L::mat_rows(u))) {
+            let val = L::mat_get(u, i, col).abs();
+            if val > best_a_val && !is_matched {
+                best_a_val = val;
+                best_a = i;
+            }
+        }
+
+        // Find neuron in B with largest |v_k| coefficient
+        let mut best_b = 0;
+        let mut best_b_val = 0.0_f64;
+        for (i, &is_matched) in matched_b.iter().enumerate().take(n_b.min(L::mat_rows(v))) {
+            let val = L::mat_get(v, i, col).abs();
+            if val > best_b_val && !is_matched {
+                best_b_val = val;
+                best_b = i;
+            }
+        }
+
+        if !matched_a[best_a] && !matched_b[best_b] && best_b < k {
+            perm[best_b] = best_a;
+            assigned[best_b] = true;
+            matched_a[best_a] = true;
+            matched_b[best_b] = true;
+        }
+    }
+
+    // Assign remaining unmatched B neurons to remaining A positions
+    let remaining_a: Vec<usize> = (0..n_a).filter(|i| !matched_a[*i]).collect();
+    let unassigned_b: Vec<usize> = (0..k).filter(|i| !assigned[*i]).collect();
+    for (idx, &b_idx) in unassigned_b.iter().enumerate() {
+        if idx < remaining_a.len() {
+            perm[b_idx] = remaining_a[idx];
+        }
+    }
+
+    perm
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -880,6 +1085,252 @@ mod tests {
     }
 
     // ── sample_from_probs distribution ───────────────────────────
+
+    // ── Phase 3 Cycle 3.1: CCA identical activations → identity ────
+
+    #[test]
+    fn test_cca_identical_activations_identity_permutation() {
+        // Same activations for A and B → identity permutation [0, 1, 2]
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::linalg::LinAlg;
+
+        let batch_size = 100;
+        let n_neurons = 3;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Generate random activations (batch_size × n_neurons)
+        let mut act_a = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        for r in 0..batch_size {
+            for c in 0..n_neurons {
+                let val: f64 = rng.gen_range(-1.0..1.0);
+                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+            }
+        }
+        let act_b = act_a.clone();
+
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        assert_eq!(perm.len(), n_neurons);
+        assert_eq!(perm, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_cca_permutation_length_is_min() {
+        // A has 4 neurons, B has 4 neurons → perm length = 4
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::linalg::LinAlg;
+
+        let batch_size = 100;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut act = CpuLinAlg::zeros_mat(batch_size, 4);
+        for r in 0..batch_size {
+            for c in 0..4 {
+                let val: f64 = rng.gen_range(-1.0..1.0);
+                CpuLinAlg::mat_set(&mut act, r, c, val);
+            }
+        }
+
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act, &act);
+        assert_eq!(perm.len(), 4);
+    }
+
+    // ── Phase 3 Cycle 3.2: CCA recovers permutation ────────────
+
+    #[test]
+    fn test_cca_permuted_activations_recovers_permutation() {
+        // B = permuted A with columns [2, 0, 1] → perm should map back
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::linalg::LinAlg;
+
+        let batch_size = 500;
+        let n_neurons = 3;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut act_a = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        for r in 0..batch_size {
+            for c in 0..n_neurons {
+                let val: f64 = rng.gen_range(-1.0..1.0);
+                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+            }
+        }
+
+        // B columns = [A_col2, A_col0, A_col1]
+        // So B neuron 0 = A neuron 2, B neuron 1 = A neuron 0, B neuron 2 = A neuron 1
+        // permutation[i] = which A neuron maps to B neuron i
+        // Expected: [2, 0, 1]
+        let mut act_b = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let col_map = [2, 0, 1]; // B_col_j = A_col_{col_map[j]}
+        for r in 0..batch_size {
+            for j in 0..n_neurons {
+                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, col_map[j]));
+            }
+        }
+
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        assert_eq!(perm, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn test_cca_permuted_with_small_batch() {
+        // Same permutation test but with batch_size=50
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::linalg::LinAlg;
+
+        let batch_size = 50;
+        let n_neurons = 3;
+        let mut rng = StdRng::seed_from_u64(99);
+
+        let mut act_a = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        for r in 0..batch_size {
+            for c in 0..n_neurons {
+                let val: f64 = rng.gen_range(-1.0..1.0);
+                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+            }
+        }
+
+        // Permutation [1, 2, 0]
+        let mut act_b = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let col_map = [1, 2, 0];
+        for r in 0..batch_size {
+            for j in 0..n_neurons {
+                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, col_map[j]));
+            }
+        }
+
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        assert_eq!(perm, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn test_cca_permuted_large_batch() {
+        // batch_size=500, verifying robustness
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::linalg::LinAlg;
+
+        let batch_size = 500;
+        let n_neurons = 4;
+        let mut rng = StdRng::seed_from_u64(7);
+
+        let mut act_a = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        for r in 0..batch_size {
+            for c in 0..n_neurons {
+                let val: f64 = rng.gen_range(-1.0..1.0);
+                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+            }
+        }
+
+        // Permutation [3, 1, 0, 2]
+        let mut act_b = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let col_map = [3, 1, 0, 2];
+        for r in 0..batch_size {
+            for j in 0..n_neurons {
+                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, col_map[j]));
+            }
+        }
+
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        assert_eq!(perm, vec![3, 1, 0, 2]);
+    }
+
+    // ── Phase 3 Cycle 3.3: CCA with different dimensions ────────
+
+    #[test]
+    fn test_cca_a_larger_than_b() {
+        // A has 4 neurons, B has 3 neurons → permutation length = 3
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::linalg::LinAlg;
+
+        let batch_size = 200;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut act_a = CpuLinAlg::zeros_mat(batch_size, 4);
+        for r in 0..batch_size {
+            for c in 0..4 {
+                let val: f64 = rng.gen_range(-1.0..1.0);
+                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+            }
+        }
+
+        // B has 3 neurons: B_col_j = A_col_j (first 3 columns)
+        let mut act_b = CpuLinAlg::zeros_mat(batch_size, 3);
+        for r in 0..batch_size {
+            for c in 0..3 {
+                CpuLinAlg::mat_set(&mut act_b, r, c, CpuLinAlg::mat_get(&act_a, r, c));
+            }
+        }
+
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        assert_eq!(perm.len(), 3);
+    }
+
+    #[test]
+    fn test_cca_b_larger_than_a() {
+        // A has 3 neurons, B has 5 neurons → permutation length = 3 (min)
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::linalg::LinAlg;
+
+        let batch_size = 200;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut act_a = CpuLinAlg::zeros_mat(batch_size, 3);
+        for r in 0..batch_size {
+            for c in 0..3 {
+                let val: f64 = rng.gen_range(-1.0..1.0);
+                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+            }
+        }
+
+        let mut act_b = CpuLinAlg::zeros_mat(batch_size, 5);
+        for r in 0..batch_size {
+            for c in 0..5 {
+                let val: f64 = rng.gen_range(-1.0..1.0);
+                CpuLinAlg::mat_set(&mut act_b, r, c, val);
+            }
+        }
+
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        assert_eq!(perm.len(), 3);
+    }
+
+    #[test]
+    fn test_cca_dead_neuron_excluded() {
+        // One neuron in B has zero variance (dead) → still produces valid permutation
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::linalg::LinAlg;
+
+        let batch_size = 100;
+        let n_neurons = 3;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        let mut act_a = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        for r in 0..batch_size {
+            for c in 0..n_neurons {
+                let val: f64 = rng.gen_range(-1.0..1.0);
+                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+            }
+        }
+
+        // B: neuron 1 is dead (constant 0), neurons 0 and 2 copy from A
+        let mut act_b = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        for r in 0..batch_size {
+            CpuLinAlg::mat_set(&mut act_b, r, 0, CpuLinAlg::mat_get(&act_a, r, 0));
+            CpuLinAlg::mat_set(&mut act_b, r, 1, 0.0); // dead neuron
+            CpuLinAlg::mat_set(&mut act_b, r, 2, CpuLinAlg::mat_get(&act_a, r, 2));
+        }
+
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        // Should produce a valid permutation of length 3, no panic
+        assert_eq!(perm.len(), n_neurons);
+        // All indices in range [0, n_neurons)
+        for &p in &perm {
+            assert!(p < n_neurons, "permutation index {p} out of range");
+        }
+        // All indices unique
+        let mut sorted = perm.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), n_neurons, "permutation has duplicates");
+    }
 
     #[test]
     fn test_sample_from_probs_distribution_roughly_correct() {
