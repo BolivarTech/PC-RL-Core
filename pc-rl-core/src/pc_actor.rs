@@ -323,124 +323,68 @@ impl<L: LinAlg> PcActor<L> {
         let mut prev_perm: Option<Vec<usize>> = None;
 
         // ── Input layer (layer 0): CCA-aligned crossover ─────────
-        let child_h0_size = child_config.hidden_layers[0].size;
-        let child_h0_act = child_config.hidden_layers[0].activation;
+        let child_h0 = &child_config.hidden_layers[0];
 
         if parent_a.config.input_size == child_config.input_size
             && parent_b.config.input_size == child_config.input_size
         {
-            let a_layer = &parent_a.layers[0];
-            let b_layer = &parent_b.layers[0];
-            let n_a = L::mat_rows(&a_layer.weights);
-            let n_b = L::mat_rows(&b_layer.weights);
-
-            // CCA alignment for first hidden layer
-            let perm = if !caches_a.is_empty() && !caches_b.is_empty() {
-                Some(crate::matrix::cca_neuron_alignment::<L>(
-                    &caches_a[0],
-                    &caches_b[0],
-                )?)
-            } else {
-                None
-            };
-
-            // Apply row permutation to parent B's first hidden layer
-            let b_weights_aligned = if let Some(ref p) = perm {
-                permute_rows::<L>(&b_layer.weights, p, n_b)
-            } else {
-                b_layer.weights.clone()
-            };
-            let b_biases_aligned = if let Some(ref p) = perm {
-                permute_vec::<L>(&b_layer.bias, p, n_b)
-            } else {
-                b_layer.bias.clone()
-            };
-
-            let (weights, biases) = blend_layer_weights::<L>(
-                (&a_layer.weights, &a_layer.bias, n_a),
-                (&b_weights_aligned, &b_biases_aligned, n_b),
-                child_h0_size,
-                L::mat_cols(&a_layer.weights),
+            let cache_a_0 = caches_a.first();
+            let cache_b_0 = caches_b.first();
+            let (layer, perm) = cca_align_and_blend_layer::<L>(
+                &parent_a.layers[0],
+                &parent_b.layers[0],
+                cache_a_0,
+                cache_b_0,
+                None, // No previous perm for first layer
+                child_h0.size,
+                L::mat_cols(&parent_a.layers[0].weights),
+                child_h0.activation,
                 alpha,
                 rng,
-            );
-            layers.push(Layer {
-                weights,
-                bias: biases,
-                activation: child_h0_act,
-            });
-
+            )?;
+            layers.push(layer);
             prev_perm = perm;
         } else {
             layers.push(Layer::<L>::new(
                 child_config.input_size,
-                child_h0_size,
-                child_h0_act,
+                child_h0.size,
+                child_h0.activation,
                 rng,
             ));
         }
 
         // ── Hidden layers 1..n: CCA-aligned crossover ────────────
         for h_idx in 1..num_child_hidden {
-            let child_size = child_config.hidden_layers[h_idx].size;
-            let child_act = child_config.hidden_layers[h_idx].activation;
+            let child_def = &child_config.hidden_layers[h_idx];
             let prev_child_size = child_config.hidden_layers[h_idx - 1].size;
 
             let a_has = h_idx < num_parent_a_hidden;
             let b_has = h_idx < num_parent_b_hidden;
 
             if a_has && b_has {
-                let a_layer = &parent_a.layers[h_idx];
-                let b_layer = &parent_b.layers[h_idx];
-                let n_a = L::mat_rows(&a_layer.weights);
-                let n_b = L::mat_rows(&b_layer.weights);
-
-                // Apply previous layer's permutation to columns of parent B
-                let b_weights_col_permuted = if let Some(ref pp) = prev_perm {
-                    permute_cols::<L>(&b_layer.weights, pp)
-                } else {
-                    b_layer.weights.clone()
-                };
-
-                // CCA alignment for this layer's rows
-                let perm = if h_idx < caches_a.len() && h_idx < caches_b.len() {
-                    Some(crate::matrix::cca_neuron_alignment::<L>(
-                        &caches_a[h_idx],
-                        &caches_b[h_idx],
-                    )?)
-                } else {
-                    None
-                };
-
-                let b_weights_aligned = if let Some(ref p) = perm {
-                    permute_rows::<L>(&b_weights_col_permuted, p, n_b)
-                } else {
-                    b_weights_col_permuted
-                };
-                let b_biases_aligned = if let Some(ref p) = perm {
-                    permute_vec::<L>(&b_layer.bias, p, n_b)
-                } else {
-                    b_layer.bias.clone()
-                };
-
-                let (weights, biases) = blend_layer_weights::<L>(
-                    (&a_layer.weights, &a_layer.bias, n_a),
-                    (&b_weights_aligned, &b_biases_aligned, n_b),
-                    child_size,
+                let cache_a_h = caches_a.get(h_idx);
+                let cache_b_h = caches_b.get(h_idx);
+                let (layer, perm) = cca_align_and_blend_layer::<L>(
+                    &parent_a.layers[h_idx],
+                    &parent_b.layers[h_idx],
+                    cache_a_h,
+                    cache_b_h,
+                    prev_perm.as_deref(),
+                    child_def.size,
                     prev_child_size,
+                    child_def.activation,
                     alpha,
                     rng,
-                );
-                layers.push(Layer {
-                    weights,
-                    bias: biases,
-                    activation: child_act,
-                });
-
+                )?;
+                layers.push(layer);
                 prev_perm = perm;
             } else {
-                // Xavier init for layers without both parents
-                layers.push(Layer::<L>::new(prev_child_size, child_size, child_act, rng));
+                layers.push(Layer::<L>::new(
+                    prev_child_size,
+                    child_def.size,
+                    child_def.activation,
+                    rng,
+                ));
                 prev_perm = None;
             }
         }
@@ -1205,6 +1149,75 @@ pub(crate) fn blend_layer_weights<L: LinAlg>(
     }
 
     (weights, biases)
+}
+
+/// CCA-aligns and blends a single hidden layer from two parents.
+///
+/// Handles the common pattern: CCA alignment → column permutation from
+/// previous layer → row permutation → blend. Returns the blended layer
+/// and the CCA permutation applied (for column propagation to the next layer).
+///
+/// * `prev_perm` — Permutation from the previous layer to apply to columns.
+///   Pass `None` to skip column propagation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cca_align_and_blend_layer<L: LinAlg>(
+    a_layer: &Layer<L>,
+    b_layer: &Layer<L>,
+    cache_a: Option<&L::Matrix>,
+    cache_b: Option<&L::Matrix>,
+    prev_perm: Option<&[usize]>,
+    child_rows: usize,
+    child_cols: usize,
+    child_activation: Activation,
+    alpha: f64,
+    rng: &mut impl Rng,
+) -> Result<(Layer<L>, Option<Vec<usize>>), crate::error::PcError> {
+    let n_a = L::mat_rows(&a_layer.weights);
+    let n_b = L::mat_rows(&b_layer.weights);
+
+    // CCA alignment
+    let perm = if let (Some(ca), Some(cb)) = (cache_a, cache_b) {
+        Some(crate::matrix::cca_neuron_alignment::<L>(ca, cb)?)
+    } else {
+        None
+    };
+
+    // Apply previous layer's permutation to columns of parent B
+    let b_weights_col = if let Some(pp) = prev_perm {
+        permute_cols::<L>(&b_layer.weights, pp)
+    } else {
+        b_layer.weights.clone()
+    };
+
+    // Apply CCA row permutation to parent B
+    let b_weights_aligned = if let Some(ref p) = perm {
+        permute_rows::<L>(&b_weights_col, p, n_b)
+    } else {
+        b_weights_col
+    };
+    let b_bias_aligned = if let Some(ref p) = perm {
+        permute_vec::<L>(&b_layer.bias, p, n_b)
+    } else {
+        b_layer.bias.clone()
+    };
+
+    let (weights, biases) = blend_layer_weights::<L>(
+        (&a_layer.weights, &a_layer.bias, n_a),
+        (&b_weights_aligned, &b_bias_aligned, n_b),
+        child_rows,
+        child_cols,
+        alpha,
+        rng,
+    );
+
+    Ok((
+        Layer {
+            weights,
+            bias: biases,
+            activation: child_activation,
+        },
+        perm,
+    ))
 }
 
 #[cfg(test)]

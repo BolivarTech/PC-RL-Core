@@ -151,7 +151,7 @@ impl<L: LinAlg> MlpCritic<L> {
         child_config: MlpCriticConfig,
         rng: &mut impl Rng,
     ) -> Result<Self, PcError> {
-        use crate::pc_actor::{blend_layer_weights, permute_rows, permute_vec};
+        use crate::pc_actor::{cca_align_and_blend_layer, permute_cols};
 
         let num_child_hidden = child_config.hidden_layers.len();
         if num_child_hidden == 0 {
@@ -163,112 +163,69 @@ impl<L: LinAlg> MlpCritic<L> {
         let num_b_hidden = parent_b.config.hidden_layers.len();
 
         let mut layers: Vec<Layer<L>> = Vec::new();
+        let mut prev_perm: Option<Vec<usize>> = None;
 
         // Input layer (layer 0): CCA-aligned crossover
-        let child_h0_size = child_config.hidden_layers[0].size;
-        let child_h0_act = child_config.hidden_layers[0].activation;
+        let child_h0 = &child_config.hidden_layers[0];
 
         if parent_a.config.input_size == child_config.input_size
             && parent_b.config.input_size == child_config.input_size
         {
-            let a_layer = &parent_a.layers[0];
-            let b_layer = &parent_b.layers[0];
-            let n_a = L::mat_rows(&a_layer.weights);
-            let n_b = L::mat_rows(&b_layer.weights);
-
-            let perm = if !caches_a.is_empty() && !caches_b.is_empty() {
-                Some(crate::matrix::cca_neuron_alignment::<L>(
-                    &caches_a[0],
-                    &caches_b[0],
-                )?)
-            } else {
-                None
-            };
-
-            let b_weights_aligned = if let Some(ref p) = perm {
-                permute_rows::<L>(&b_layer.weights, p, n_b)
-            } else {
-                b_layer.weights.clone()
-            };
-            let b_bias_aligned = if let Some(ref p) = perm {
-                permute_vec::<L>(&b_layer.bias, p, n_b)
-            } else {
-                b_layer.bias.clone()
-            };
-
-            let (weights, biases) = blend_layer_weights::<L>(
-                (&a_layer.weights, &a_layer.bias, n_a),
-                (&b_weights_aligned, &b_bias_aligned, n_b),
-                child_h0_size,
-                L::mat_cols(&a_layer.weights),
+            let (layer, perm) = cca_align_and_blend_layer::<L>(
+                &parent_a.layers[0],
+                &parent_b.layers[0],
+                caches_a.first(),
+                caches_b.first(),
+                None,
+                child_h0.size,
+                L::mat_cols(&parent_a.layers[0].weights),
+                child_h0.activation,
                 alpha,
                 rng,
-            );
-            layers.push(Layer {
-                weights,
-                bias: biases,
-                activation: child_h0_act,
-            });
+            )?;
+            layers.push(layer);
+            prev_perm = perm;
         } else {
             layers.push(Layer::<L>::new(
                 child_config.input_size,
-                child_h0_size,
-                child_h0_act,
+                child_h0.size,
+                child_h0.activation,
                 rng,
             ));
         }
 
         // Hidden layers 1..n
         for h_idx in 1..num_child_hidden {
-            let child_size = child_config.hidden_layers[h_idx].size;
-            let child_act = child_config.hidden_layers[h_idx].activation;
+            let child_def = &child_config.hidden_layers[h_idx];
             let prev_child_size = child_config.hidden_layers[h_idx - 1].size;
 
             if h_idx < num_a_hidden && h_idx < num_b_hidden {
-                let a_layer = &parent_a.layers[h_idx];
-                let b_layer = &parent_b.layers[h_idx];
-                let n_a = L::mat_rows(&a_layer.weights);
-                let n_b = L::mat_rows(&b_layer.weights);
-
-                let perm = if h_idx < caches_a.len() && h_idx < caches_b.len() {
-                    Some(crate::matrix::cca_neuron_alignment::<L>(
-                        &caches_a[h_idx],
-                        &caches_b[h_idx],
-                    )?)
-                } else {
-                    None
-                };
-
-                let b_w = if let Some(ref p) = perm {
-                    permute_rows::<L>(&b_layer.weights, p, n_b)
-                } else {
-                    b_layer.weights.clone()
-                };
-                let b_b = if let Some(ref p) = perm {
-                    permute_vec::<L>(&b_layer.bias, p, n_b)
-                } else {
-                    b_layer.bias.clone()
-                };
-
-                let (weights, biases) = blend_layer_weights::<L>(
-                    (&a_layer.weights, &a_layer.bias, n_a),
-                    (&b_w, &b_b, n_b),
-                    child_size,
+                let (layer, perm) = cca_align_and_blend_layer::<L>(
+                    &parent_a.layers[h_idx],
+                    &parent_b.layers[h_idx],
+                    caches_a.get(h_idx),
+                    caches_b.get(h_idx),
+                    prev_perm.as_deref(),
+                    child_def.size,
                     prev_child_size,
+                    child_def.activation,
                     alpha,
                     rng,
-                );
-                layers.push(Layer {
-                    weights,
-                    bias: biases,
-                    activation: child_act,
-                });
+                )?;
+                layers.push(layer);
+                prev_perm = perm;
             } else {
-                layers.push(Layer::<L>::new(prev_child_size, child_size, child_act, rng));
+                layers.push(Layer::<L>::new(
+                    prev_child_size,
+                    child_def.size,
+                    child_def.activation,
+                    rng,
+                ));
+                prev_perm = None;
             }
         }
 
-        // Output layer (1 neuron): positional crossover or Xavier
+        // Output layer (1 neuron): positional crossover with column propagation
         let last_child_hidden = child_config.hidden_layers.last().map(|d| d.size).unwrap();
         let a_out = parent_a.layers.last().unwrap();
         let b_out = parent_b.layers.last().unwrap();
@@ -276,11 +233,16 @@ impl<L: LinAlg> MlpCritic<L> {
         if L::mat_cols(&a_out.weights) == last_child_hidden
             && L::mat_cols(&b_out.weights) == last_child_hidden
         {
+            let b_out_permuted = if let Some(ref pp) = prev_perm {
+                permute_cols::<L>(&b_out.weights, pp)
+            } else {
+                b_out.weights.clone()
+            };
             let mut weights = L::zeros_mat(1, last_child_hidden);
             let mut biases = L::zeros_vec(1);
             for c in 0..last_child_hidden {
                 let va = L::mat_get(&a_out.weights, 0, c);
-                let vb = L::mat_get(&b_out.weights, 0, c);
+                let vb = L::mat_get(&b_out_permuted, 0, c);
                 L::mat_set(&mut weights, 0, c, alpha * va + (1.0 - alpha) * vb);
             }
             let ba = L::vec_get(&a_out.bias, 0);
