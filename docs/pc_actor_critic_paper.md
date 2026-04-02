@@ -444,7 +444,7 @@ PC inference as a mechanism for parameter efficiency in RL is not well documente
 - **Architecture**: Backend-agnostic via `LinAlg` trait (26 methods). All structs generic over `L: LinAlg` with `CpuLinAlg` default. Type aliases: `PcActorCpu`, `MlpCriticCpu`, `PcActorCriticCpu`, `LayerCpu`.
 - **Dependencies**: serde, serde_json, rand, chrono (core); toml, clap, ctrlc (binary)
 - **Tests**: 357 unit tests + 12 doctests, TDD methodology throughout
-- **Repository**: https://github.com/BolivarTech/PC-TicTacToe
+- **Repository**: https://github.com/BolivarTech/PC-RL-Core
 
 ### 5.2 Key Design Decisions
 
@@ -638,5 +638,5 @@ The current architecture uses PC inference only in the actor. A natural question
 
 *Author: Julian Bolivar -- BolivarTech*
 *Date: March 2026*
-*Repository: https://github.com/BolivarTech/PC-TicTacToe*
+*Repository: https://github.com/BolivarTech/PC-RL-Core*
 *Crate: https://crates.io/crates/pc-rl-core*

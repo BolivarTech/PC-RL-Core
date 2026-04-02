@@ -1,6 +1,6 @@
-# PC-TicTacToe
+# PC-RL-Core
 
-[![CI](https://github.com/BolivarTech/PC-TicTacToe/actions/workflows/ci.yml/badge.svg)](https://github.com/BolivarTech/PC-TicTacToe/actions/workflows/ci.yml)
+[![CI](https://github.com/BolivarTech/PC-RL-Core/actions/workflows/ci.yml/badge.svg)](https://github.com/BolivarTech/PC-RL-Core/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 
@@ -57,7 +57,7 @@ All core structs are generic over `L: LinAlg` (default `CpuLinAlg`), enabling fu
 ## Project Structure
 
 ```
-PC-TicTacToe/
+PC-RL-Core/
 ├── pc-rl-core/                    # Reusable RL library (v1.0.0)
 │   └── src/
 │       ├── linalg/
