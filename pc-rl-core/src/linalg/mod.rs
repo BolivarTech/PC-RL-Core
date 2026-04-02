@@ -11,6 +11,7 @@
 pub mod cpu;
 
 use crate::activation::Activation;
+use crate::error::PcError;
 use rand::Rng;
 use std::fmt::Debug;
 
@@ -43,6 +44,16 @@ use std::fmt::Debug;
 /// let v = CpuLinAlg::zeros_vec(5);
 /// assert_eq!(CpuLinAlg::vec_len(&v), 5);
 /// ```
+/// Result type for SVD decomposition: `Ok((U, S, V))` or convergence error.
+pub type SvdResult<L> = Result<
+    (
+        <L as LinAlg>::Matrix,
+        <L as LinAlg>::Vector,
+        <L as LinAlg>::Matrix,
+    ),
+    PcError,
+>;
+
 pub trait LinAlg: Clone + Send + Sync + 'static {
     /// 1-D vector type.
     type Vector: Clone + Send + Sync + Debug;
@@ -79,12 +90,16 @@ pub trait LinAlg: Clone + Send + Sync + 'static {
 
     /// Singular Value Decomposition: `M = U × diag(S) × V^T`.
     ///
-    /// Returns `(U, S, V)` where:
+    /// Returns `Ok((U, S, V))` where:
     /// - `U` is `(m, k)` with orthonormal columns,
     /// - `S` is a vector of `k` non-negative singular values in descending order,
     /// - `V` is `(n, k)` with orthonormal columns,
     /// - `k = min(m, n)`.
-    fn svd(m: &Self::Matrix) -> (Self::Matrix, Self::Vector, Self::Matrix);
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::ConfigValidation` if the decomposition fails to converge.
+    fn svd(m: &Self::Matrix) -> SvdResult<Self>;
 
     /// Adds `scale * other` element-wise to `m` (in place).
     fn mat_scale_add(m: &mut Self::Matrix, other: &Self::Matrix, scale: f64);

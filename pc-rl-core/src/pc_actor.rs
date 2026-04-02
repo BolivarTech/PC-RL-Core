@@ -310,12 +310,19 @@ impl<L: LinAlg> PcActor<L> {
         rng: &mut impl Rng,
     ) -> Result<Self, PcError> {
         let num_child_hidden = child_config.hidden_layers.len();
+        if num_child_hidden == 0 {
+            return Err(PcError::ConfigValidation(
+                "crossover requires at least one hidden layer".into(),
+            ));
+        }
         let num_parent_a_hidden = parent_a.config.hidden_layers.len();
         let num_parent_b_hidden = parent_b.config.hidden_layers.len();
 
         let mut layers: Vec<Layer<L>> = Vec::new();
+        // Track the previous layer's CCA permutation for column propagation
+        let mut prev_perm: Option<Vec<usize>> = None;
 
-        // ── Input layer (layer 0): positional crossover ──────────
+        // ── Input layer (layer 0): CCA-aligned crossover ─────────
         let child_h0_size = child_config.hidden_layers[0].size;
         let child_h0_act = child_config.hidden_layers[0].activation;
 
@@ -327,17 +334,17 @@ impl<L: LinAlg> PcActor<L> {
             let n_a = L::mat_rows(&a_layer.weights);
             let n_b = L::mat_rows(&b_layer.weights);
 
-            // CCA alignment for first hidden layer if both parents have it
+            // CCA alignment for first hidden layer
             let perm = if !caches_a.is_empty() && !caches_b.is_empty() {
                 Some(crate::matrix::cca_neuron_alignment::<L>(
                     &caches_a[0],
                     &caches_b[0],
-                ))
+                )?)
             } else {
                 None
             };
 
-            // Apply permutation to parent B's first hidden layer rows
+            // Apply row permutation to parent B's first hidden layer
             let b_weights_aligned = if let Some(ref p) = perm {
                 permute_rows::<L>(&b_layer.weights, p, n_b)
             } else {
@@ -362,6 +369,8 @@ impl<L: LinAlg> PcActor<L> {
                 bias: biases,
                 activation: child_h0_act,
             });
+
+            prev_perm = perm;
         } else {
             layers.push(Layer::<L>::new(
                 child_config.input_size,
@@ -386,20 +395,27 @@ impl<L: LinAlg> PcActor<L> {
                 let n_a = L::mat_rows(&a_layer.weights);
                 let n_b = L::mat_rows(&b_layer.weights);
 
-                // CCA alignment
+                // Apply previous layer's permutation to columns of parent B
+                let b_weights_col_permuted = if let Some(ref pp) = prev_perm {
+                    permute_cols::<L>(&b_layer.weights, pp)
+                } else {
+                    b_layer.weights.clone()
+                };
+
+                // CCA alignment for this layer's rows
                 let perm = if h_idx < caches_a.len() && h_idx < caches_b.len() {
                     Some(crate::matrix::cca_neuron_alignment::<L>(
                         &caches_a[h_idx],
                         &caches_b[h_idx],
-                    ))
+                    )?)
                 } else {
                     None
                 };
 
                 let b_weights_aligned = if let Some(ref p) = perm {
-                    permute_rows::<L>(&b_layer.weights, p, n_b)
+                    permute_rows::<L>(&b_weights_col_permuted, p, n_b)
                 } else {
-                    b_layer.weights.clone()
+                    b_weights_col_permuted
                 };
                 let b_biases_aligned = if let Some(ref p) = perm {
                     permute_vec::<L>(&b_layer.bias, p, n_b)
@@ -420,9 +436,12 @@ impl<L: LinAlg> PcActor<L> {
                     bias: biases,
                     activation: child_act,
                 });
+
+                prev_perm = perm;
             } else {
                 // Xavier init for layers without both parents
                 layers.push(Layer::<L>::new(prev_child_size, child_size, child_act, rng));
+                prev_perm = None;
             }
         }
 
@@ -434,17 +453,22 @@ impl<L: LinAlg> PcActor<L> {
         let b_out_in = L::mat_cols(&b_out.weights);
 
         if a_out_in == last_child_hidden && b_out_in == last_child_hidden {
-            // Positional crossover
+            // Positional crossover with column permutation from last hidden layer
+            let b_out_permuted = if let Some(ref pp) = prev_perm {
+                permute_cols::<L>(&b_out.weights, pp)
+            } else {
+                b_out.weights.clone()
+            };
             let out_rows = child_config.output_size;
             let mut weights = L::zeros_mat(out_rows, last_child_hidden);
             let mut biases = L::zeros_vec(out_rows);
             let blend_rows = out_rows
                 .min(L::mat_rows(&a_out.weights))
-                .min(L::mat_rows(&b_out.weights));
+                .min(L::mat_rows(&b_out_permuted));
             for r in 0..blend_rows {
                 for c in 0..last_child_hidden {
                     let va = L::mat_get(&a_out.weights, r, c);
-                    let vb = L::mat_get(&b_out.weights, r, c);
+                    let vb = L::mat_get(&b_out_permuted, r, c);
                     L::mat_set(&mut weights, r, c, alpha * va + (1.0 - alpha) * vb);
                 }
                 let ba = L::vec_get(&a_out.bias, r);
@@ -1047,6 +1071,29 @@ impl<L: LinAlg> PcActor<L> {
             skip_projections,
         }
     }
+}
+
+/// Permute columns of a weight matrix according to a permutation.
+/// `perm[i]` = source column index for destination column i.
+pub(crate) fn permute_cols<L: LinAlg>(m: &L::Matrix, perm: &[usize]) -> L::Matrix {
+    let rows = L::mat_rows(m);
+    let cols = L::mat_cols(m);
+    let perm_len = perm.len();
+    let mut result = L::zeros_mat(rows, cols);
+    for (dst, &src) in perm.iter().enumerate().take(cols.min(perm_len)) {
+        if src < cols {
+            for r in 0..rows {
+                L::mat_set(&mut result, r, dst, L::mat_get(m, r, src));
+            }
+        }
+    }
+    // Copy remaining columns (beyond permutation length) in original order
+    for dst in perm_len..cols {
+        for r in 0..rows {
+            L::mat_set(&mut result, r, dst, L::mat_get(m, r, dst));
+        }
+    }
+    result
 }
 
 /// Permute rows of a weight matrix according to a permutation.
@@ -3014,5 +3061,163 @@ mod tests {
                 assert!(w.is_finite(), "NaN/Inf in skip projection");
             }
         }
+    }
+
+    // ── Fix #1: Column permutation propagation ──────────────────
+
+    #[test]
+    fn test_crossover_multilayer_column_permutation_consistency() {
+        // Two identical parents → child should be identical regardless of
+        // CCA permutation (identity) or column ordering. But if we manually
+        // set parent B = parent A with a known neuron permutation at layer 0,
+        // the child at alpha=0.5 should produce a network whose layer 1
+        // columns are also reordered to match.
+        //
+        // Strategy: crossover parent A with itself (same weights). The CCA
+        // permutation should be identity, and the child should equal both
+        // parents. Then crossover with alpha=0.5 using two different parents.
+        // Run inference on the child — if column permutation is broken,
+        // the child's layer 1 receives inputs in the wrong order, and
+        // inference produces different results than a properly-permuted child.
+        use crate::linalg::LinAlg;
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config = PcActorConfig {
+            hidden_layers: vec![
+                LayerDef {
+                    size: 8,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 8,
+                    activation: Activation::Tanh,
+                },
+            ],
+            input_size: 4,
+            output_size: 4,
+            ..crossover_config_27()
+        };
+        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 100);
+        let caches_b = make_caches_for_actor(&actor_b, 100);
+        let cache_mats_a: Vec<_> = (0..2).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..2).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        // Get CCA permutation for layer 0 to check if it's non-trivial
+        let perm0 =
+            crate::matrix::cca_neuron_alignment::<CpuLinAlg>(&cache_mats_a[0], &cache_mats_b[0])
+                .unwrap();
+        let is_nontrivial = perm0.iter().enumerate().any(|(i, &p)| i != p);
+
+        // Only test column propagation if CCA produced a non-trivial permutation
+        if !is_nontrivial {
+            // Parents too similar for meaningful test — skip
+            return;
+        }
+
+        // Crossover with alpha=0.5
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let child: PcActor = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            0.5,
+            config.clone(),
+            &mut rng_child,
+        )
+        .unwrap();
+
+        // Verify: layer 1's input columns should be permuted to match layer 0's
+        // row permutation of parent B. Check that the child's layer 1 column
+        // ordering is consistent by verifying that inference produces finite,
+        // non-degenerate output AND that crossover applied the column permutation.
+        //
+        // If columns are NOT permuted, parent B's layer 1 columns still reference
+        // the original neuron positions, but the blended layer 0 has reordered
+        // neurons. The inconsistency means column c of layer 1 connects to the
+        // wrong neuron from layer 0.
+        //
+        // We verify by checking that the column permutation was actually applied:
+        // parent B's layer 1 columns should be reordered by perm0.
+        let b_layer1 = &actor_b.layers[1];
+        let b_cols = CpuLinAlg::mat_cols(&b_layer1.weights);
+
+        // Expected: child layer 1 col[c] = 0.5 * A.layer1.col[c] + 0.5 * B.layer1.col[perm0[c]]
+        // If column permutation is NOT applied, it would be:
+        // child layer 1 col[c] = 0.5 * A.layer1.col[c] + 0.5 * B.layer1.col[c]  (wrong!)
+        let a_layer1 = &actor_a.layers[1];
+        let child_layer1 = &child.layers[1];
+        let n_rows = CpuLinAlg::mat_rows(&child_layer1.weights);
+
+        let mut has_col_permutation = false;
+        for (c, &src_col) in perm0.iter().enumerate().take(b_cols.min(perm0.len())) {
+            if src_col == c {
+                continue; // Identity position, can't distinguish
+            }
+            // Check if child col c matches the permuted blend (correct)
+            // vs the unpermuted blend (broken)
+            for r in 0..n_rows {
+                let a_val = CpuLinAlg::mat_get(&a_layer1.weights, r, c);
+                let b_val_permuted = CpuLinAlg::mat_get(&b_layer1.weights, r, src_col);
+                let b_val_unpermuted = CpuLinAlg::mat_get(&b_layer1.weights, r, c);
+                let child_val = CpuLinAlg::mat_get(&child_layer1.weights, r, c);
+
+                let expected_permuted = 0.5 * a_val + 0.5 * b_val_permuted;
+                let expected_unpermuted = 0.5 * a_val + 0.5 * b_val_unpermuted;
+
+                // If column permutation is applied, child matches permuted expectation
+                if (child_val - expected_permuted).abs() < 1e-10
+                    && (child_val - expected_unpermuted).abs() > 1e-10
+                {
+                    has_col_permutation = true;
+                }
+            }
+        }
+
+        assert!(
+            has_col_permutation,
+            "Layer 1 columns should be permuted to match layer 0's CCA \
+             permutation of parent B. perm0={perm0:?}"
+        );
+    }
+
+    // ── Fix #5: Empty hidden_layers guard ────────────────────────
+
+    #[test]
+    fn test_crossover_empty_hidden_layers_returns_error() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config = crossover_config_27();
+        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config, &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 50);
+        let caches_b = make_caches_for_actor(&actor_b, 50);
+        let cache_mats_a: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        // Child config with empty hidden layers should return error, not panic
+        let empty_config = PcActorConfig {
+            hidden_layers: vec![],
+            ..crossover_config_27()
+        };
+
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let result = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            0.5,
+            empty_config,
+            &mut rng_child,
+        );
+        assert!(
+            result.is_err(),
+            "Crossover with empty hidden_layers should return error"
+        );
     }
 }

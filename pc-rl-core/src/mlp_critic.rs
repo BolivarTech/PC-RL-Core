@@ -154,6 +154,11 @@ impl<L: LinAlg> MlpCritic<L> {
         use crate::pc_actor::{blend_layer_weights, permute_rows, permute_vec};
 
         let num_child_hidden = child_config.hidden_layers.len();
+        if num_child_hidden == 0 {
+            return Err(PcError::ConfigValidation(
+                "crossover requires at least one hidden layer".into(),
+            ));
+        }
         let num_a_hidden = parent_a.config.hidden_layers.len();
         let num_b_hidden = parent_b.config.hidden_layers.len();
 
@@ -175,7 +180,7 @@ impl<L: LinAlg> MlpCritic<L> {
                 Some(crate::matrix::cca_neuron_alignment::<L>(
                     &caches_a[0],
                     &caches_b[0],
-                ))
+                )?)
             } else {
                 None
             };
@@ -229,7 +234,7 @@ impl<L: LinAlg> MlpCritic<L> {
                     Some(crate::matrix::cca_neuron_alignment::<L>(
                         &caches_a[h_idx],
                         &caches_b[h_idx],
-                    ))
+                    )?)
                 } else {
                     None
                 };
@@ -815,5 +820,41 @@ mod tests {
         assert_eq!(CpuLinAlg::mat_rows(&child.layers[0].weights), 36);
         let v = child.forward(&vec![0.3; 27]);
         assert!(v.is_finite());
+    }
+
+    // ── Fix #5: Empty hidden_layers guard ────────────────────────
+
+    #[test]
+    fn test_critic_crossover_empty_hidden_layers_returns_error() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config = default_config();
+        let critic_a: MlpCritic = MlpCritic::new(config.clone(), &mut rng_a).unwrap();
+        let critic_b: MlpCritic = MlpCritic::new(config, &mut rng_b).unwrap();
+
+        let cache_a = vec![make_critic_cache(36, 50)];
+        let cache_b = vec![make_critic_cache(36, 50)];
+
+        let empty_config = MlpCriticConfig {
+            input_size: 27,
+            hidden_layers: vec![],
+            output_activation: Activation::Linear,
+            lr: 0.005,
+        };
+
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let result = MlpCritic::crossover(
+            &critic_a,
+            &critic_b,
+            &cache_a,
+            &cache_b,
+            0.5,
+            empty_config,
+            &mut rng_child,
+        );
+        assert!(
+            result.is_err(),
+            "Crossover with empty hidden_layers should return error"
+        );
     }
 }

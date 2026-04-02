@@ -440,14 +440,14 @@ pub(crate) fn vec_scale(v: &[f64], s: f64) -> Vec<f64> {
 pub fn cca_neuron_alignment<L: crate::linalg::LinAlg>(
     act_a: &L::Matrix,
     act_b: &L::Matrix,
-) -> Vec<usize> {
+) -> Result<Vec<usize>, crate::error::PcError> {
     let batch_size = L::mat_rows(act_a);
     let n_a = L::mat_cols(act_a);
     let n_b = L::mat_cols(act_b);
     let k = n_a.min(n_b);
 
     if k == 0 || batch_size < 2 {
-        return (0..k).collect();
+        return Ok((0..k).collect());
     }
 
     // Phase 1: Standardize columns (mean=0, std=1)
@@ -470,18 +470,18 @@ pub fn cca_neuron_alignment<L: crate::linalg::LinAlg>(
     scale_matrix::<L>(&mut c_ab, n_a, n_b, scale);
 
     // Phase 3: Compute C_a^(-1/2) and C_b^(-1/2) via SVD
-    let c_a_inv_sqrt = mat_inv_sqrt::<L>(&c_a);
-    let c_b_inv_sqrt = mat_inv_sqrt::<L>(&c_b);
+    let c_a_inv_sqrt = mat_inv_sqrt::<L>(&c_a)?;
+    let c_b_inv_sqrt = mat_inv_sqrt::<L>(&c_b)?;
 
     // M = C_a^(-1/2) × C_ab × C_b^(-1/2)
     let temp = L::mat_mul(&c_a_inv_sqrt, &c_ab);
     let m = L::mat_mul(&temp, &c_b_inv_sqrt);
 
     // SVD(M) → U, S, V
-    let (u, _s, v) = L::svd(&m);
+    let (u, _s, v) = L::svd(&m)?;
 
     // Phase 4: Greedy matching
-    greedy_match::<L>(&u, &v, n_a, n_b)
+    Ok(greedy_match::<L>(&u, &v, n_a, n_b))
 }
 
 /// Scale all elements of a matrix by a scalar.
@@ -516,7 +516,7 @@ fn standardize_columns<L: crate::linalg::LinAlg>(m: &L::Matrix) -> L::Matrix {
             let diff = L::mat_get(m, r, c) - mean;
             var_sum += diff * diff;
         }
-        let std = (var_sum / rows as f64).sqrt();
+        let std = (var_sum / (rows as f64 - 1.0)).sqrt();
 
         if std > eps {
             for r in 0..rows {
@@ -530,9 +530,11 @@ fn standardize_columns<L: crate::linalg::LinAlg>(m: &L::Matrix) -> L::Matrix {
 
 /// Compute M^(-1/2) for a symmetric positive semi-definite matrix via SVD.
 /// Eigenvalues below epsilon are treated as zero.
-fn mat_inv_sqrt<L: crate::linalg::LinAlg>(m: &L::Matrix) -> L::Matrix {
+fn mat_inv_sqrt<L: crate::linalg::LinAlg>(
+    m: &L::Matrix,
+) -> Result<L::Matrix, crate::error::PcError> {
     let n = L::mat_rows(m);
-    let (u, s, _v) = L::svd(m);
+    let (u, s, _v) = L::svd(m)?;
     let eps = 1e-10;
 
     // Build diag(1/sqrt(s_i)) for non-zero singular values
@@ -564,7 +566,7 @@ fn mat_inv_sqrt<L: crate::linalg::LinAlg>(m: &L::Matrix) -> L::Matrix {
         result = padded;
     }
 
-    result
+    Ok(result)
 }
 
 /// Greedy matching from CCA canonical directions.
@@ -1108,7 +1110,7 @@ mod tests {
         }
         let act_b = act_a.clone();
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
         assert_eq!(perm.len(), n_neurons);
         assert_eq!(perm, vec![0, 1, 2]);
     }
@@ -1130,7 +1132,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act, &act);
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act, &act).unwrap();
         assert_eq!(perm.len(), 4);
     }
 
@@ -1166,7 +1168,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
         assert_eq!(perm, vec![2, 0, 1]);
     }
 
@@ -1197,7 +1199,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
         assert_eq!(perm, vec![1, 2, 0]);
     }
 
@@ -1228,7 +1230,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
         assert_eq!(perm, vec![3, 1, 0, 2]);
     }
 
@@ -1259,7 +1261,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
         assert_eq!(perm.len(), 3);
     }
 
@@ -1288,7 +1290,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
         assert_eq!(perm.len(), 3);
     }
 
@@ -1318,7 +1320,7 @@ mod tests {
             CpuLinAlg::mat_set(&mut act_b, r, 2, CpuLinAlg::mat_get(&act_a, r, 2));
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b);
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
         // Should produce a valid permutation of length 3, no panic
         assert_eq!(perm.len(), n_neurons);
         // All indices in range [0, n_neurons)

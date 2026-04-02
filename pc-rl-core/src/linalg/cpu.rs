@@ -65,13 +65,13 @@ impl LinAlg for CpuLinAlg {
         result
     }
 
-    fn svd(m: &Self::Matrix) -> (Self::Matrix, Self::Vector, Self::Matrix) {
+    fn svd(m: &Self::Matrix) -> crate::linalg::SvdResult<Self> {
         let rows = m.rows;
         let cols = m.cols;
         let k = rows.min(cols);
 
         if k == 0 {
-            return (Matrix::zeros(rows, 0), vec![], Matrix::zeros(cols, 0));
+            return Ok((Matrix::zeros(rows, 0), vec![], Matrix::zeros(cols, 0)));
         }
 
         // 1. Compute M^T × M (n×n symmetric matrix)
@@ -87,8 +87,9 @@ impl LinAlg for CpuLinAlg {
         }
         let mut d_mat = mtm.clone();
 
-        let max_iter = 100 * n * n;
-        let tol = 1e-12;
+        let max_iter = 200 * n * n;
+        let tol = 1e-10;
+        let mut converged = false;
 
         for _ in 0..max_iter {
             // Find largest off-diagonal element
@@ -107,6 +108,7 @@ impl LinAlg for CpuLinAlg {
             }
 
             if max_val < tol {
+                converged = true;
                 break;
             }
 
@@ -162,6 +164,12 @@ impl LinAlg for CpuLinAlg {
             }
         }
 
+        if !converged && n > 1 {
+            return Err(crate::error::PcError::ConfigValidation(format!(
+                "Jacobi SVD did not converge for {n}x{n} matrix after {max_iter} iterations"
+            )));
+        }
+
         // 3. Extract eigenvalues, compute S = sqrt(D), sort descending
         let mut eigen_pairs: Vec<(f64, usize)> = (0..n)
             .map(|i| {
@@ -192,7 +200,7 @@ impl LinAlg for CpuLinAlg {
             }
         }
 
-        (u_mat, s_vec, v_sorted)
+        Ok((u_mat, s_vec, v_sorted))
     }
 
     fn mat_scale_add(m: &mut Self::Matrix, other: &Self::Matrix, scale: f64) {
@@ -798,7 +806,7 @@ mod tests {
     fn test_svd_2x2_diagonal() {
         // diag(5, 3) → U≈I, S=[5,3], V≈I (up to sign)
         let m = mat_from_rows(2, 2, &[5.0, 0.0, 0.0, 3.0]);
-        let (u, s, v) = CpuLinAlg::svd(&m);
+        let (u, s, v) = CpuLinAlg::svd(&m).unwrap();
 
         // S values = [5, 3] sorted descending
         assert!((CpuLinAlg::vec_get(&s, 0) - 5.0).abs() < 1e-10);
@@ -820,7 +828,7 @@ mod tests {
     fn test_svd_3x3_reconstruction() {
         // Known 3×3 matrix
         let m = mat_from_rows(3, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]);
-        let (u, s, v) = CpuLinAlg::svd(&m);
+        let (u, s, v) = CpuLinAlg::svd(&m).unwrap();
 
         // Reconstruction within tolerance
         let recon = reconstruct_usv(&u, &s, &v);
@@ -839,7 +847,7 @@ mod tests {
     #[test]
     fn test_svd_rectangular_3x2_reconstruction() {
         let m = mat_from_rows(3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let (u, s, v) = CpuLinAlg::svd(&m);
+        let (u, s, v) = CpuLinAlg::svd(&m).unwrap();
 
         // U is 3×2, S has 2 elements, V is 2×2
         assert_eq!(CpuLinAlg::mat_rows(&u), 3);
@@ -862,7 +870,7 @@ mod tests {
     #[test]
     fn test_svd_singular_values_non_negative_descending() {
         let m = mat_from_rows(3, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]);
-        let (_u, s, _v) = CpuLinAlg::svd(&m);
+        let (_u, s, _v) = CpuLinAlg::svd(&m).unwrap();
 
         for i in 0..CpuLinAlg::vec_len(&s) {
             assert!(
@@ -886,7 +894,7 @@ mod tests {
     #[test]
     fn test_svd_orthonormal_columns() {
         let m = mat_from_rows(3, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]);
-        let (u, _s, v) = CpuLinAlg::svd(&m);
+        let (u, _s, v) = CpuLinAlg::svd(&m).unwrap();
 
         // U^T × U ≈ I
         let utu = CpuLinAlg::mat_mul(&CpuLinAlg::mat_transpose(&u), &u);
@@ -902,7 +910,7 @@ mod tests {
     #[test]
     fn test_svd_1x1_matrix() {
         let m = mat_from_rows(1, 1, &[7.0]);
-        let (_u, s, _v) = CpuLinAlg::svd(&m);
+        let (_u, s, _v) = CpuLinAlg::svd(&m).unwrap();
         assert_eq!(CpuLinAlg::vec_len(&s), 1);
         assert!((CpuLinAlg::vec_get(&s, 0) - 7.0).abs() < 1e-10);
     }
@@ -910,7 +918,7 @@ mod tests {
     #[test]
     fn test_svd_1x1_negative() {
         let m = mat_from_rows(1, 1, &[-3.0]);
-        let (u, s, v) = CpuLinAlg::svd(&m);
+        let (u, s, v) = CpuLinAlg::svd(&m).unwrap();
         // S must be non-negative
         assert!(CpuLinAlg::vec_get(&s, 0) >= 0.0);
         assert!((CpuLinAlg::vec_get(&s, 0) - 3.0).abs() < 1e-10);
@@ -922,7 +930,7 @@ mod tests {
     #[test]
     fn test_svd_zero_matrix() {
         let m = CpuLinAlg::zeros_mat(3, 3);
-        let (_u, s, _v) = CpuLinAlg::svd(&m);
+        let (_u, s, _v) = CpuLinAlg::svd(&m).unwrap();
         for i in 0..CpuLinAlg::vec_len(&s) {
             assert!(
                 CpuLinAlg::vec_get(&s, i).abs() < 1e-12,
@@ -936,7 +944,7 @@ mod tests {
     fn test_svd_repeated_singular_values() {
         // diag(4, 4, 2) → S = [4, 4, 2]
         let m = mat_from_rows(3, 3, &[4.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 2.0]);
-        let (u, s, v) = CpuLinAlg::svd(&m);
+        let (u, s, v) = CpuLinAlg::svd(&m).unwrap();
         assert!((CpuLinAlg::vec_get(&s, 0) - 4.0).abs() < 1e-10);
         assert!((CpuLinAlg::vec_get(&s, 1) - 4.0).abs() < 1e-10);
         assert!((CpuLinAlg::vec_get(&s, 2) - 2.0).abs() < 1e-10);
@@ -957,7 +965,7 @@ mod tests {
         // Deterministic 16×16 matrix
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
         let m = CpuLinAlg::xavier_mat(16, 16, &mut rng);
-        let (u, s, v) = CpuLinAlg::svd(&m);
+        let (u, s, v) = CpuLinAlg::svd(&m).unwrap();
 
         let recon = reconstruct_usv(&u, &s, &v);
         for r in 0..16 {
@@ -967,6 +975,34 @@ mod tests {
                     "reconstruction mismatch at ({r},{c}): got {} expected {}",
                     CpuLinAlg::mat_get(&recon, r, c),
                     CpuLinAlg::mat_get(&m, r, c)
+                );
+            }
+        }
+    }
+
+    // ── Fix #4: SVD returns Result ──────────────────────────────
+
+    #[test]
+    fn test_svd_returns_ok_for_valid_matrix() {
+        let m = mat_from_rows(3, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]);
+        let result = CpuLinAlg::svd(&m);
+        assert!(result.is_ok(), "SVD of valid matrix should return Ok");
+        let (u, s, v) = result.unwrap();
+        assert_eq!(CpuLinAlg::vec_len(&s), 3);
+        assert_eq!(CpuLinAlg::mat_rows(&u), 3);
+        assert_eq!(CpuLinAlg::mat_rows(&v), 3);
+    }
+
+    #[test]
+    fn test_svd_result_reconstruction() {
+        // Verify reconstruction works through Result unwrap
+        let m = mat_from_rows(2, 2, &[5.0, 0.0, 0.0, 3.0]);
+        let (u, s, v) = CpuLinAlg::svd(&m).unwrap();
+        let recon = reconstruct_usv(&u, &s, &v);
+        for r in 0..2 {
+            for c in 0..2 {
+                assert!(
+                    (CpuLinAlg::mat_get(&recon, r, c) - CpuLinAlg::mat_get(&m, r, c)).abs() < 1e-10
                 );
             }
         }

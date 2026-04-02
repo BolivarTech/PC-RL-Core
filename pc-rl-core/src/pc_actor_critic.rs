@@ -1441,6 +1441,6 @@ mod tests {
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
         let mat = CpuLinAlg::zeros_mat(10, 3);
-        let _perm = crate::matrix::cca_neuron_alignment::<CpuLinAlg>(&mat, &mat);
+        let _perm = crate::matrix::cca_neuron_alignment::<CpuLinAlg>(&mat, &mat).unwrap();
     }
 }
