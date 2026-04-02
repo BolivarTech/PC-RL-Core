@@ -282,6 +282,260 @@ impl<L: LinAlg> PcActor<L> {
         })
     }
 
+    /// Creates a child actor by crossing over two parent actors using CCA neuron alignment.
+    ///
+    /// Aligns hidden neurons functionally via CCA before blending weights.
+    /// Input and output layers use positional crossover (no permutation problem).
+    ///
+    /// # Arguments
+    ///
+    /// * `parent_a` - First parent (reference, typically higher fitness).
+    /// * `parent_b` - Second parent (aligned to A via CCA).
+    /// * `caches_a` - Per-layer activation matrices for parent A `[batch × neurons]`.
+    /// * `caches_b` - Per-layer activation matrices for parent B `[batch × neurons]`.
+    /// * `alpha` - Blending weight: 1.0 = all A, 0.0 = all B.
+    /// * `child_config` - Topology configuration for the child network.
+    /// * `rng` - Random number generator for Xavier initialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::ConfigValidation` if `child_config` is invalid.
+    pub fn crossover(
+        parent_a: &PcActor<L>,
+        parent_b: &PcActor<L>,
+        caches_a: &[L::Matrix],
+        caches_b: &[L::Matrix],
+        alpha: f64,
+        child_config: PcActorConfig,
+        rng: &mut impl Rng,
+    ) -> Result<Self, PcError> {
+        let num_child_hidden = child_config.hidden_layers.len();
+        let num_parent_a_hidden = parent_a.config.hidden_layers.len();
+        let num_parent_b_hidden = parent_b.config.hidden_layers.len();
+
+        let mut layers: Vec<Layer<L>> = Vec::new();
+
+        // ── Input layer (layer 0): positional crossover ──────────
+        let child_h0_size = child_config.hidden_layers[0].size;
+        let child_h0_act = child_config.hidden_layers[0].activation;
+
+        if parent_a.config.input_size == child_config.input_size
+            && parent_b.config.input_size == child_config.input_size
+        {
+            let a_layer = &parent_a.layers[0];
+            let b_layer = &parent_b.layers[0];
+            let n_a = L::mat_rows(&a_layer.weights);
+            let n_b = L::mat_rows(&b_layer.weights);
+
+            // CCA alignment for first hidden layer if both parents have it
+            let perm = if !caches_a.is_empty() && !caches_b.is_empty() {
+                Some(crate::matrix::cca_neuron_alignment::<L>(
+                    &caches_a[0],
+                    &caches_b[0],
+                ))
+            } else {
+                None
+            };
+
+            // Apply permutation to parent B's first hidden layer rows
+            let b_weights_aligned = if let Some(ref p) = perm {
+                permute_rows::<L>(&b_layer.weights, p, n_b)
+            } else {
+                b_layer.weights.clone()
+            };
+            let b_biases_aligned = if let Some(ref p) = perm {
+                permute_vec::<L>(&b_layer.bias, p, n_b)
+            } else {
+                b_layer.bias.clone()
+            };
+
+            let (weights, biases) = blend_layer_weights::<L>(
+                (&a_layer.weights, &a_layer.bias, n_a),
+                (&b_weights_aligned, &b_biases_aligned, n_b),
+                child_h0_size,
+                L::mat_cols(&a_layer.weights),
+                alpha,
+                rng,
+            );
+            layers.push(Layer {
+                weights,
+                bias: biases,
+                activation: child_h0_act,
+            });
+        } else {
+            layers.push(Layer::<L>::new(
+                child_config.input_size,
+                child_h0_size,
+                child_h0_act,
+                rng,
+            ));
+        }
+
+        // ── Hidden layers 1..n: CCA-aligned crossover ────────────
+        for h_idx in 1..num_child_hidden {
+            let child_size = child_config.hidden_layers[h_idx].size;
+            let child_act = child_config.hidden_layers[h_idx].activation;
+            let prev_child_size = child_config.hidden_layers[h_idx - 1].size;
+
+            let a_has = h_idx < num_parent_a_hidden;
+            let b_has = h_idx < num_parent_b_hidden;
+
+            if a_has && b_has {
+                let a_layer = &parent_a.layers[h_idx];
+                let b_layer = &parent_b.layers[h_idx];
+                let n_a = L::mat_rows(&a_layer.weights);
+                let n_b = L::mat_rows(&b_layer.weights);
+
+                // CCA alignment
+                let perm = if h_idx < caches_a.len() && h_idx < caches_b.len() {
+                    Some(crate::matrix::cca_neuron_alignment::<L>(
+                        &caches_a[h_idx],
+                        &caches_b[h_idx],
+                    ))
+                } else {
+                    None
+                };
+
+                let b_weights_aligned = if let Some(ref p) = perm {
+                    permute_rows::<L>(&b_layer.weights, p, n_b)
+                } else {
+                    b_layer.weights.clone()
+                };
+                let b_biases_aligned = if let Some(ref p) = perm {
+                    permute_vec::<L>(&b_layer.bias, p, n_b)
+                } else {
+                    b_layer.bias.clone()
+                };
+
+                let (weights, biases) = blend_layer_weights::<L>(
+                    (&a_layer.weights, &a_layer.bias, n_a),
+                    (&b_weights_aligned, &b_biases_aligned, n_b),
+                    child_size,
+                    prev_child_size,
+                    alpha,
+                    rng,
+                );
+                layers.push(Layer {
+                    weights,
+                    bias: biases,
+                    activation: child_act,
+                });
+            } else {
+                // Xavier init for layers without both parents
+                layers.push(Layer::<L>::new(prev_child_size, child_size, child_act, rng));
+            }
+        }
+
+        // ── Output layer: positional crossover or Xavier ─────────
+        let last_child_hidden = child_config.hidden_layers.last().map(|d| d.size).unwrap();
+        let a_out = parent_a.layers.last().unwrap();
+        let b_out = parent_b.layers.last().unwrap();
+        let a_out_in = L::mat_cols(&a_out.weights);
+        let b_out_in = L::mat_cols(&b_out.weights);
+
+        if a_out_in == last_child_hidden && b_out_in == last_child_hidden {
+            // Positional crossover
+            let out_rows = child_config.output_size;
+            let mut weights = L::zeros_mat(out_rows, last_child_hidden);
+            let mut biases = L::zeros_vec(out_rows);
+            let blend_rows = out_rows
+                .min(L::mat_rows(&a_out.weights))
+                .min(L::mat_rows(&b_out.weights));
+            for r in 0..blend_rows {
+                for c in 0..last_child_hidden {
+                    let va = L::mat_get(&a_out.weights, r, c);
+                    let vb = L::mat_get(&b_out.weights, r, c);
+                    L::mat_set(&mut weights, r, c, alpha * va + (1.0 - alpha) * vb);
+                }
+                let ba = L::vec_get(&a_out.bias, r);
+                let bb = L::vec_get(&b_out.bias, r);
+                L::vec_set(&mut biases, r, alpha * ba + (1.0 - alpha) * bb);
+            }
+            layers.push(Layer {
+                weights,
+                bias: biases,
+                activation: child_config.output_activation,
+            });
+        } else {
+            layers.push(Layer::<L>::new(
+                last_child_hidden,
+                child_config.output_size,
+                child_config.output_activation,
+                rng,
+            ));
+        }
+
+        // ── Residual components ──────────────────────────────────
+        let (rezero_alpha, skip_projections) = if child_config.residual {
+            let mut alphas = Vec::new();
+            let mut projs = Vec::new();
+            for i in 1..num_child_hidden {
+                // ReZero alpha: blend if both parents have it
+                let a_has_rz = i - 1 < parent_a.rezero_alpha.len();
+                let b_has_rz = i - 1 < parent_b.rezero_alpha.len();
+                let rz = if a_has_rz && b_has_rz {
+                    alpha * parent_a.rezero_alpha[i - 1]
+                        + (1.0 - alpha) * parent_b.rezero_alpha[i - 1]
+                } else if a_has_rz {
+                    parent_a.rezero_alpha[i - 1]
+                } else if b_has_rz {
+                    parent_b.rezero_alpha[i - 1]
+                } else {
+                    child_config.rezero_init
+                };
+                alphas.push(rz);
+
+                // Skip projections
+                let cur_size = child_config.hidden_layers[i].size;
+                let prev_size = child_config.hidden_layers[i - 1].size;
+                if cur_size != prev_size {
+                    let a_proj = parent_a
+                        .skip_projections
+                        .get(i - 1)
+                        .and_then(|p| p.as_ref());
+                    let b_proj = parent_b
+                        .skip_projections
+                        .get(i - 1)
+                        .and_then(|p| p.as_ref());
+                    if let (Some(ap), Some(bp)) = (a_proj, b_proj) {
+                        if L::mat_rows(ap) == cur_size
+                            && L::mat_cols(ap) == prev_size
+                            && L::mat_rows(bp) == cur_size
+                            && L::mat_cols(bp) == prev_size
+                        {
+                            // Blend projections
+                            let mut proj = L::zeros_mat(cur_size, prev_size);
+                            for r in 0..cur_size {
+                                for c in 0..prev_size {
+                                    let va = L::mat_get(ap, r, c);
+                                    let vb = L::mat_get(bp, r, c);
+                                    L::mat_set(&mut proj, r, c, alpha * va + (1.0 - alpha) * vb);
+                                }
+                            }
+                            projs.push(Some(proj));
+                        } else {
+                            projs.push(Some(L::xavier_mat(cur_size, prev_size, rng)));
+                        }
+                    } else {
+                        projs.push(Some(L::xavier_mat(cur_size, prev_size, rng)));
+                    }
+                } else {
+                    projs.push(None);
+                }
+            }
+            (alphas, projs)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        Ok(Self {
+            layers,
+            config: child_config,
+            rezero_alpha,
+            skip_projections,
+        })
+    }
+
     /// Returns the total size of the latent concatenation (sum of hidden layer sizes).
     pub fn latent_size(&self) -> usize {
         self.config.hidden_layers.iter().map(|def| def.size).sum()
@@ -793,6 +1047,117 @@ impl<L: LinAlg> PcActor<L> {
             skip_projections,
         }
     }
+}
+
+/// Permute rows of a weight matrix according to a permutation.
+/// `perm[i]` = source row index for destination row i.
+fn permute_rows<L: LinAlg>(m: &L::Matrix, perm: &[usize], n: usize) -> L::Matrix {
+    let cols = L::mat_cols(m);
+    let perm_len = perm.len();
+    let mut result = L::zeros_mat(n, cols);
+    for (dst, &src) in perm.iter().enumerate().take(n.min(perm_len)) {
+        if src < L::mat_rows(m) {
+            for c in 0..cols {
+                L::mat_set(&mut result, dst, c, L::mat_get(m, src, c));
+            }
+        }
+    }
+    // Copy remaining rows (unmatched) in original order
+    for dst in perm_len..n {
+        if dst < L::mat_rows(m) {
+            for c in 0..cols {
+                L::mat_set(&mut result, dst, c, L::mat_get(m, dst, c));
+            }
+        }
+    }
+    result
+}
+
+/// Permute elements of a bias vector according to a permutation.
+fn permute_vec<L: LinAlg>(v: &L::Vector, perm: &[usize], n: usize) -> L::Vector {
+    let perm_len = perm.len();
+    let mut result = L::zeros_vec(n);
+    for (dst, &src) in perm.iter().enumerate().take(n.min(perm_len)) {
+        if src < L::vec_len(v) {
+            L::vec_set(&mut result, dst, L::vec_get(v, src));
+        }
+    }
+    for dst in perm_len..n {
+        if dst < L::vec_len(v) {
+            L::vec_set(&mut result, dst, L::vec_get(v, dst));
+        }
+    }
+    result
+}
+
+/// Blend weights from two parent layers into a child layer.
+/// Handles all 4 dimension cases (equal, child smaller, parents differ, child larger).
+///
+/// * `parent_a` - (weights, bias, neuron_count) for parent A.
+/// * `parent_b` - (weights, bias, neuron_count) for parent B (already CCA-aligned).
+/// * `child_cols` - Number of columns (input size) for child layer.
+#[allow(clippy::too_many_arguments)]
+fn blend_layer_weights<L: LinAlg>(
+    parent_a: (&L::Matrix, &L::Vector, usize),
+    parent_b: (&L::Matrix, &L::Vector, usize),
+    n_child: usize,
+    child_cols: usize,
+    alpha: f64,
+    rng: &mut impl Rng,
+) -> (L::Matrix, L::Vector) {
+    let (a_weights, a_biases, n_a) = parent_a;
+    let (b_weights, b_biases, n_b) = parent_b;
+    let n_min = n_a.min(n_b);
+    let n_max = n_a.max(n_b);
+    let a_cols = L::mat_cols(a_weights);
+    let b_cols = L::mat_cols(b_weights);
+    let use_cols = child_cols.min(a_cols).min(b_cols);
+
+    let mut weights = L::zeros_mat(n_child, child_cols);
+    let mut biases = L::zeros_vec(n_child);
+
+    // Blending zone [0..min(n_min, n_child))
+    let blend_end = n_min.min(n_child);
+    for r in 0..blend_end {
+        for c in 0..use_cols {
+            let va = L::mat_get(a_weights, r, c);
+            let vb = L::mat_get(b_weights, r, c);
+            L::mat_set(&mut weights, r, c, alpha * va + (1.0 - alpha) * vb);
+        }
+        let ba = L::vec_get(a_biases, r);
+        let bb = L::vec_get(b_biases, r);
+        L::vec_set(&mut biases, r, alpha * ba + (1.0 - alpha) * bb);
+    }
+
+    // Copy zone [n_min..min(n_max, n_child)) from the larger parent
+    let copy_end = n_max.min(n_child);
+    if copy_end > blend_end {
+        let (larger_w, larger_b) = if n_a >= n_b {
+            (a_weights, a_biases)
+        } else {
+            (b_weights, b_biases)
+        };
+        let larger_cols = L::mat_cols(larger_w);
+        for r in blend_end..copy_end {
+            for c in 0..child_cols.min(larger_cols) {
+                L::mat_set(&mut weights, r, c, L::mat_get(larger_w, r, c));
+            }
+            L::vec_set(&mut biases, r, L::vec_get(larger_b, r));
+        }
+    }
+
+    // Xavier zone [n_max..n_child) for new neurons
+    if n_child > n_max {
+        let xavier = L::xavier_mat(n_child - n_max, child_cols, rng);
+        for r in n_max..n_child {
+            for c in 0..child_cols {
+                L::mat_set(&mut weights, r, c, L::mat_get(&xavier, r - n_max, c));
+            }
+            // biases stay zero for Xavier zone
+        }
+    }
+
+    (weights, biases)
 }
 
 #[cfg(test)]
@@ -2056,5 +2421,598 @@ mod tests {
         let config = hybrid_config(1.1);
         let result: Result<PcActor, _> = PcActor::new(config, &mut rng);
         assert!(result.is_err());
+    }
+
+    // ── Phase 5 Cycle 5.1: Crossover same topology ─────────────
+
+    fn crossover_config_27() -> PcActorConfig {
+        PcActorConfig {
+            input_size: 9,
+            hidden_layers: vec![LayerDef {
+                size: 27,
+                activation: Activation::Tanh,
+            }],
+            output_size: 9,
+            output_activation: Activation::Linear,
+            alpha: 0.03,
+            tol: 0.01,
+            min_steps: 1,
+            max_steps: 5,
+            lr_weights: 0.005,
+            synchronous: true,
+            temperature: 1.0,
+            local_lambda: 0.99,
+            residual: false,
+            rezero_init: 0.001,
+        }
+    }
+
+    fn make_caches_for_actor(actor: &PcActor, batch_size: usize) -> Vec<Vec<Vec<f64>>> {
+        let num_hidden = actor.config.hidden_layers.len();
+        let mut layers: Vec<Vec<Vec<f64>>> = (0..num_hidden).map(|_| Vec::new()).collect();
+        for i in 0..batch_size {
+            let input: Vec<f64> = (0..actor.config.input_size)
+                .map(|j| ((i * actor.config.input_size + j) as f64 * 0.01).sin())
+                .collect();
+            let result = actor.infer(&input);
+            for (layer_idx, state) in result.hidden_states.iter().enumerate() {
+                layers[layer_idx].push(state.clone());
+            }
+        }
+        layers
+    }
+
+    fn build_cache_matrix(
+        cache_layers: &[Vec<Vec<f64>>],
+        layer_idx: usize,
+    ) -> crate::matrix::Matrix {
+        use crate::linalg::LinAlg;
+        let samples = &cache_layers[layer_idx];
+        let batch_size = samples.len();
+        let n_neurons = samples[0].len();
+        let mut mat = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        for (r, sample) in samples.iter().enumerate() {
+            for (c, &val) in sample.iter().enumerate() {
+                CpuLinAlg::mat_set(&mut mat, r, c, val);
+            }
+        }
+        mat
+    }
+
+    #[test]
+    fn test_crossover_same_topology_produces_valid_actor() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config = crossover_config_27();
+        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 50);
+        let caches_b = make_caches_for_actor(&actor_b, 50);
+        let cache_mats_a: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let child: PcActor = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            0.5,
+            config,
+            &mut rng_child,
+        )
+        .unwrap();
+
+        // Child has same topology
+        assert_eq!(child.layers.len(), actor_a.layers.len());
+        for (i, layer) in child.layers.iter().enumerate() {
+            assert_eq!(
+                CpuLinAlg::mat_rows(&layer.weights),
+                CpuLinAlg::mat_rows(&actor_a.layers[i].weights)
+            );
+            assert_eq!(
+                CpuLinAlg::mat_cols(&layer.weights),
+                CpuLinAlg::mat_cols(&actor_a.layers[i].weights)
+            );
+        }
+    }
+
+    #[test]
+    fn test_crossover_same_topology_child_differs_from_parents() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config = crossover_config_27();
+        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 50);
+        let caches_b = make_caches_for_actor(&actor_b, 50);
+        let cache_mats_a: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let child: PcActor = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            0.5,
+            config,
+            &mut rng_child,
+        )
+        .unwrap();
+
+        // Child weights differ from both parents (blended)
+        assert_ne!(child.layers[0].weights.data, actor_a.layers[0].weights.data);
+        assert_ne!(child.layers[0].weights.data, actor_b.layers[0].weights.data);
+    }
+
+    #[test]
+    fn test_crossover_alpha_one_approximates_parent_a() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config = crossover_config_27();
+        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 50);
+        let caches_b = make_caches_for_actor(&actor_b, 50);
+        let cache_mats_a: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let child: PcActor = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            1.0, // alpha=1.0 → child ≈ parent A
+            config,
+            &mut rng_child,
+        )
+        .unwrap();
+
+        // Input layer (layer 0): positional crossover, should be close to parent A
+        let a_w = &actor_a.layers[0].weights.data;
+        let child_w = &child.layers[0].weights.data;
+        let max_diff: f64 = a_w
+            .iter()
+            .zip(child_w.iter())
+            .map(|(a, c)| (a - c).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 1e-10,
+            "alpha=1.0: input layer max diff from parent A = {max_diff}"
+        );
+    }
+
+    #[test]
+    fn test_crossover_child_weights_finite() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config = crossover_config_27();
+        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 50);
+        let caches_b = make_caches_for_actor(&actor_b, 50);
+        let cache_mats_a: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let child: PcActor = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            0.5,
+            config,
+            &mut rng_child,
+        )
+        .unwrap();
+
+        for (i, layer) in child.layers.iter().enumerate() {
+            for &w in &layer.weights.data {
+                assert!(w.is_finite(), "NaN/Inf in layer {i} weights");
+            }
+            for b in CpuLinAlg::vec_to_vec(&layer.bias) {
+                assert!(b.is_finite(), "NaN/Inf in layer {i} biases");
+            }
+        }
+    }
+
+    // ── Phase 5 Cycle 5.2: Crossover child smaller ──────────────
+
+    #[test]
+    fn test_crossover_child_smaller() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config_27 = PcActorConfig {
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..crossover_config_27()
+        };
+        let actor_a: PcActor = PcActor::new(config_27.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config_27, &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 50);
+        let caches_b = make_caches_for_actor(&actor_b, 50);
+        let cache_mats_a: Vec<_> = (0..2).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..2).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        let child_config = PcActorConfig {
+            hidden_layers: vec![
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..crossover_config_27()
+        };
+
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let child: PcActor = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            0.5,
+            child_config,
+            &mut rng_child,
+        )
+        .unwrap();
+
+        // Child hidden layers have 18 neurons
+        use crate::linalg::LinAlg;
+        assert_eq!(CpuLinAlg::mat_rows(&child.layers[0].weights), 18);
+        assert_eq!(CpuLinAlg::mat_rows(&child.layers[1].weights), 18);
+    }
+
+    // ── Phase 5 Cycle 5.3: Crossover parents differ ─────────────
+
+    #[test]
+    fn test_crossover_parents_different_sizes() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config_a = crossover_config_27(); // [27]
+        let config_b = PcActorConfig {
+            hidden_layers: vec![LayerDef {
+                size: 18,
+                activation: Activation::Tanh,
+            }],
+            ..crossover_config_27()
+        }; // [18]
+
+        let actor_a: PcActor = PcActor::new(config_a, &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config_b, &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 50);
+        let caches_b = make_caches_for_actor(&actor_b, 50);
+        let cache_mats_a: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        // Child has [27] → blending zone [0..18), copy zone [18..27) from parent A
+        let child_config = crossover_config_27();
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let child: PcActor = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            0.5,
+            child_config,
+            &mut rng_child,
+        )
+        .unwrap();
+
+        use crate::linalg::LinAlg;
+        // Child has correct dimensions [27]
+        assert_eq!(CpuLinAlg::mat_rows(&child.layers[0].weights), 27);
+        // All weights finite
+        for &w in &child.layers[0].weights.data {
+            assert!(w.is_finite());
+        }
+    }
+
+    // ── Phase 5 Cycle 5.4: Crossover child larger ───────────────
+
+    #[test]
+    fn test_crossover_child_larger() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config_18 = PcActorConfig {
+            hidden_layers: vec![LayerDef {
+                size: 18,
+                activation: Activation::Tanh,
+            }],
+            ..crossover_config_27()
+        };
+        let actor_a: PcActor = PcActor::new(config_18.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config_18, &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 50);
+        let caches_b = make_caches_for_actor(&actor_b, 50);
+        let cache_mats_a: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..1).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        // Child has [27] → blending zone [0..18), Xavier zone [18..27)
+        let child_config = crossover_config_27();
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let child: PcActor = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            0.5,
+            child_config,
+            &mut rng_child,
+        )
+        .unwrap();
+
+        use crate::linalg::LinAlg;
+        assert_eq!(CpuLinAlg::mat_rows(&child.layers[0].weights), 27);
+        // All weights finite
+        for &w in &child.layers[0].weights.data {
+            assert!(w.is_finite());
+        }
+        // Xavier zone weights are not all zero (random init)
+        let xavier_zone_nonzero = (18..27).any(|r| {
+            (0..CpuLinAlg::mat_cols(&child.layers[0].weights))
+                .any(|c| CpuLinAlg::mat_get(&child.layers[0].weights, r, c).abs() > 1e-15)
+        });
+        assert!(
+            xavier_zone_nonzero,
+            "Xavier zone [18..27) should have non-zero weights"
+        );
+    }
+
+    // ── Phase 5 Cycle 5.5: Crossover layer count mismatch ───────
+
+    #[test]
+    fn test_crossover_child_more_layers() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config_2l = PcActorConfig {
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..crossover_config_27()
+        };
+        let actor_a: PcActor = PcActor::new(config_2l.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config_2l, &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 50);
+        let caches_b = make_caches_for_actor(&actor_b, 50);
+        let cache_mats_a: Vec<_> = (0..2).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..2).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        // Child has 3 hidden layers → layers 0-1 crossover, layer 2 Xavier
+        let child_config = PcActorConfig {
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..crossover_config_27()
+        };
+
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let child: PcActor = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            0.5,
+            child_config,
+            &mut rng_child,
+        )
+        .unwrap();
+
+        use crate::linalg::LinAlg;
+        // Child has 4 layers (3 hidden + 1 output)
+        assert_eq!(child.layers.len(), 4);
+        // Layer 2 (new) has 18 rows
+        assert_eq!(CpuLinAlg::mat_rows(&child.layers[2].weights), 18);
+        // All weights finite
+        for (i, layer) in child.layers.iter().enumerate() {
+            for &w in &layer.weights.data {
+                assert!(w.is_finite(), "NaN/Inf in layer {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_crossover_child_fewer_layers() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config_3l = PcActorConfig {
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..crossover_config_27()
+        };
+        let actor_a: PcActor = PcActor::new(config_3l.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config_3l, &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 50);
+        let caches_b = make_caches_for_actor(&actor_b, 50);
+        let cache_mats_a: Vec<_> = (0..3).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..3).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        // Child has 2 hidden layers → layers 0-1 crossover, layer 2 discarded
+        let child_config = PcActorConfig {
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..crossover_config_27()
+        };
+
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let child: PcActor = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            0.5,
+            child_config,
+            &mut rng_child,
+        )
+        .unwrap();
+
+        use crate::linalg::LinAlg;
+        // Child has 3 layers (2 hidden + 1 output)
+        assert_eq!(child.layers.len(), 3);
+        // Output layer input_size = 27 (last hidden size)
+        assert_eq!(CpuLinAlg::mat_cols(&child.layers[2].weights), 27);
+    }
+
+    // ── Phase 5 Cycle 5.6: Crossover residual components ────────
+
+    #[test]
+    fn test_crossover_residual_rezero_blended() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config = PcActorConfig {
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Softsign,
+                },
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Softsign,
+                },
+            ],
+            residual: true,
+            rezero_init: 0.1,
+            ..crossover_config_27()
+        };
+        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 50);
+        let caches_b = make_caches_for_actor(&actor_b, 50);
+        let cache_mats_a: Vec<_> = (0..2).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..2).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let child: PcActor = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            0.5,
+            config,
+            &mut rng_child,
+        )
+        .unwrap();
+
+        // Child has rezero_alpha values
+        assert!(!child.rezero_alpha.is_empty());
+        // Blended rezero_alpha: with alpha=0.5 and both parents same init,
+        // child should be close to parent values
+        for &rz in &child.rezero_alpha {
+            assert!(rz.is_finite(), "rezero_alpha is not finite");
+        }
+    }
+
+    #[test]
+    fn test_crossover_residual_skip_projections_blended() {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(123);
+        let config = PcActorConfig {
+            hidden_layers: vec![
+                LayerDef {
+                    size: 27,
+                    activation: Activation::Softsign,
+                },
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Softsign,
+                },
+            ],
+            residual: true,
+            rezero_init: 0.1,
+            ..crossover_config_27()
+        };
+        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+
+        let caches_a = make_caches_for_actor(&actor_a, 50);
+        let caches_b = make_caches_for_actor(&actor_b, 50);
+        let cache_mats_a: Vec<_> = (0..2).map(|i| build_cache_matrix(&caches_a, i)).collect();
+        let cache_mats_b: Vec<_> = (0..2).map(|i| build_cache_matrix(&caches_b, i)).collect();
+
+        let mut rng_child = StdRng::seed_from_u64(99);
+        let child: PcActor = PcActor::crossover(
+            &actor_a,
+            &actor_b,
+            &cache_mats_a,
+            &cache_mats_b,
+            0.5,
+            config,
+            &mut rng_child,
+        )
+        .unwrap();
+
+        // Child should have skip_projections for size mismatch (27→18)
+        assert!(!child.skip_projections.is_empty());
+        // At least one projection should be Some (27→18 needs projection)
+        let has_projection = child.skip_projections.iter().any(|p| p.is_some());
+        assert!(has_projection, "Expected at least one skip projection");
+
+        // Projection weights are finite
+        for mat in child.skip_projections.iter().flatten() {
+            for &w in &mat.data {
+                assert!(w.is_finite(), "NaN/Inf in skip projection");
+            }
+        }
     }
 }

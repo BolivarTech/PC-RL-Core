@@ -1161,8 +1161,8 @@ mod tests {
         let mut act_b = CpuLinAlg::zeros_mat(batch_size, n_neurons);
         let col_map = [2, 0, 1]; // B_col_j = A_col_{col_map[j]}
         for r in 0..batch_size {
-            for j in 0..n_neurons {
-                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, col_map[j]));
+            for (j, &src_col) in col_map.iter().enumerate() {
+                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, src_col));
             }
         }
 
@@ -1192,8 +1192,8 @@ mod tests {
         let mut act_b = CpuLinAlg::zeros_mat(batch_size, n_neurons);
         let col_map = [1, 2, 0];
         for r in 0..batch_size {
-            for j in 0..n_neurons {
-                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, col_map[j]));
+            for (j, &src_col) in col_map.iter().enumerate() {
+                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, src_col));
             }
         }
 
@@ -1223,8 +1223,8 @@ mod tests {
         let mut act_b = CpuLinAlg::zeros_mat(batch_size, n_neurons);
         let col_map = [3, 1, 0, 2];
         for r in 0..batch_size {
-            for j in 0..n_neurons {
-                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, col_map[j]));
+            for (j, &src_col) in col_map.iter().enumerate() {
+                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, src_col));
             }
         }
 
