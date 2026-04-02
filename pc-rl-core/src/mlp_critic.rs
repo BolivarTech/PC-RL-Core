@@ -329,6 +329,39 @@ impl<L: LinAlg> MlpCritic<L> {
         L::vec_get(&current, 0)
     }
 
+    /// Computes V(s) and returns both the value and hidden layer activations.
+    ///
+    /// Identical to [`forward`](Self::forward) but also captures intermediate
+    /// hidden layer activations for use in CCA neuron alignment during crossover.
+    ///
+    /// # Returns
+    ///
+    /// `(value, hidden_states)` where `hidden_states[i]` is the activation
+    /// vector of hidden layer `i` (excludes the output layer).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `input.len() != config.input_size`.
+    pub fn forward_with_hidden(&self, input: &[f64]) -> (f64, Vec<L::Vector>) {
+        assert_eq!(
+            input.len(),
+            self.config.input_size,
+            "MlpCritic::forward_with_hidden: expected input size {}, got {}",
+            self.config.input_size,
+            input.len()
+        );
+        let num_hidden = self.config.hidden_layers.len();
+        let mut hidden_states = Vec::with_capacity(num_hidden);
+        let mut current = L::vec_from_slice(input);
+        for (i, layer) in self.layers.iter().enumerate() {
+            current = layer.forward(&current);
+            if i < num_hidden {
+                hidden_states.push(current.clone());
+            }
+        }
+        (L::vec_get(&current, 0), hidden_states)
+    }
+
     /// Performs one MSE-loss update and returns the loss.
     ///
     /// 1. Forward pass storing each layer's input and output.
@@ -820,6 +853,66 @@ mod tests {
         assert_eq!(CpuLinAlg::mat_rows(&child.layers[0].weights), 36);
         let v = child.forward(&vec![0.3; 27]);
         assert!(v.is_finite());
+    }
+
+    // ── Fix #5: Empty hidden_layers guard ────────────────────────
+
+    // ── Fix #2: forward_with_hidden ────────────────────────────
+
+    #[test]
+    fn test_forward_with_hidden_returns_value_and_states() {
+        let mut rng = make_rng();
+        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let input = vec![0.3; 27];
+        let (value, hidden_states) = critic.forward_with_hidden(&input);
+
+        assert!(value.is_finite(), "value not finite: {value}");
+        // 1 hidden layer → 1 entry in hidden_states
+        assert_eq!(hidden_states.len(), 1);
+        // Hidden layer has 36 neurons
+        assert_eq!(hidden_states[0].len(), 36);
+    }
+
+    #[test]
+    fn test_forward_with_hidden_matches_forward() {
+        let mut rng = make_rng();
+        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let input = vec![0.3; 27];
+        let value_plain = critic.forward(&input);
+        let (value_hidden, _) = critic.forward_with_hidden(&input);
+
+        assert!(
+            (value_plain - value_hidden).abs() < 1e-12,
+            "forward and forward_with_hidden should return same value: {value_plain} vs {value_hidden}"
+        );
+    }
+
+    #[test]
+    fn test_forward_with_hidden_two_layers() {
+        let config = MlpCriticConfig {
+            input_size: 27,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 36,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 24,
+                    activation: Activation::Tanh,
+                },
+            ],
+            output_activation: Activation::Linear,
+            lr: 0.005,
+        };
+        let mut rng = make_rng();
+        let critic: MlpCritic = MlpCritic::new(config, &mut rng).unwrap();
+        let input = vec![0.3; 27];
+        let (value, hidden_states) = critic.forward_with_hidden(&input);
+
+        assert!(value.is_finite());
+        assert_eq!(hidden_states.len(), 2);
+        assert_eq!(hidden_states[0].len(), 36);
+        assert_eq!(hidden_states[1].len(), 24);
     }
 
     // ── Fix #5: Empty hidden_layers guard ────────────────────────

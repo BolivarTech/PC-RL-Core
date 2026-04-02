@@ -243,32 +243,45 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// Returns `PcError::DimensionMismatch` if activation caches have different
     /// batch sizes. Returns `PcError::ConfigValidation` if child config is invalid.
+    #[allow(clippy::too_many_arguments)]
     pub fn crossover(
         parent_a: &PcActorCritic<L>,
         parent_b: &PcActorCritic<L>,
-        cache_a: &ActivationCache<L>,
-        cache_b: &ActivationCache<L>,
+        actor_cache_a: &ActivationCache<L>,
+        actor_cache_b: &ActivationCache<L>,
+        critic_cache_a: &ActivationCache<L>,
+        critic_cache_b: &ActivationCache<L>,
         alpha: f64,
         child_config: PcActorCriticConfig,
         seed: u64,
     ) -> Result<Self, PcError> {
-        // Validate batch sizes match
-        if cache_a.batch_size() != cache_b.batch_size() {
+        // Validate actor batch sizes match
+        if actor_cache_a.batch_size() != actor_cache_b.batch_size() {
             return Err(PcError::DimensionMismatch {
-                expected: cache_a.batch_size(),
-                got: cache_b.batch_size(),
-                context: "activation cache batch sizes must match for crossover",
+                expected: actor_cache_a.batch_size(),
+                got: actor_cache_b.batch_size(),
+                context: "actor activation cache batch sizes must match for crossover",
+            });
+        }
+        // Validate critic batch sizes match
+        if critic_cache_a.batch_size() != critic_cache_b.batch_size() {
+            return Err(PcError::DimensionMismatch {
+                expected: critic_cache_a.batch_size(),
+                got: critic_cache_b.batch_size(),
+                context: "critic activation cache batch sizes must match for crossover",
             });
         }
 
         // Convert caches to matrices [batch × neurons] for CCA
-        let actor_cache_mats_a = cache_to_matrices::<L>(cache_a);
-        let actor_cache_mats_b = cache_to_matrices::<L>(cache_b);
+        let actor_cache_mats_a = cache_to_matrices::<L>(actor_cache_a);
+        let actor_cache_mats_b = cache_to_matrices::<L>(actor_cache_b);
+        let critic_cache_mats_a = cache_to_matrices::<L>(critic_cache_a);
+        let critic_cache_mats_b = cache_to_matrices::<L>(critic_cache_b);
 
         use rand::SeedableRng;
         let mut rng = StdRng::seed_from_u64(seed);
 
-        // Crossover actor
+        // Crossover actor with actor-specific caches
         let actor = PcActor::<L>::crossover(
             &parent_a.actor,
             &parent_b.actor,
@@ -279,16 +292,12 @@ impl<L: LinAlg> PcActorCritic<L> {
             &mut rng,
         )?;
 
-        // For critic, we reuse the same actor caches (critic hidden layers
-        // correlate with actor hidden layers in this architecture)
-        let critic_cache_mats_a = &actor_cache_mats_a;
-        let critic_cache_mats_b = &actor_cache_mats_b;
-
+        // Crossover critic with critic-specific caches
         let critic = MlpCritic::<L>::crossover(
             &parent_a.critic,
             &parent_b.critic,
-            critic_cache_mats_a,
-            critic_cache_mats_b,
+            &critic_cache_mats_a,
+            &critic_cache_mats_b,
             alpha,
             child_config.critic.clone(),
             &mut rng,
@@ -1294,18 +1303,27 @@ mod tests {
 
     // ── Phase 7 Cycle 7.1: PcActorCritic::crossover ────────────
 
-    fn build_cache_for_agent(agent: &mut PcActorCritic, batch_size: usize) -> ActivationCache {
-        let num_hidden = agent.config.actor.hidden_layers.len();
-        let mut cache: ActivationCache = ActivationCache::new(num_hidden);
+    fn build_caches_for_agent(
+        agent: &mut PcActorCritic,
+        batch_size: usize,
+    ) -> (ActivationCache, ActivationCache) {
+        let num_actor_hidden = agent.config.actor.hidden_layers.len();
+        let num_critic_hidden = agent.config.critic.hidden_layers.len();
+        let mut actor_cache: ActivationCache = ActivationCache::new(num_actor_hidden);
+        let mut critic_cache: ActivationCache = ActivationCache::new(num_critic_hidden);
         let valid: Vec<usize> = (0..agent.config.actor.output_size).collect();
         for i in 0..batch_size {
             let input: Vec<f64> = (0..agent.config.actor.input_size)
                 .map(|j| ((i * 9 + j) as f64 * 0.1).sin())
                 .collect();
             let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
-            cache.record(&infer.hidden_states);
+            actor_cache.record(&infer.hidden_states);
+            let mut critic_input = input;
+            critic_input.extend_from_slice(&infer.latent_concat);
+            let (_value, critic_hidden) = agent.critic.forward_with_hidden(&critic_input);
+            critic_cache.record(&critic_hidden);
         }
-        cache
+        (actor_cache, critic_cache)
     }
 
     #[test]
@@ -1314,14 +1332,14 @@ mod tests {
         let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
         let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
 
-        let cache_a = build_cache_for_agent(&mut agent_a, 50);
-        let cache_b = build_cache_for_agent(&mut agent_b, 50);
+        let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
+        let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
 
-        let child: PcActorCritic =
-            PcActorCritic::crossover(&agent_a, &agent_b, &cache_a, &cache_b, 0.5, config, 99)
-                .unwrap();
+        let child: PcActorCritic = PcActorCritic::crossover(
+            &agent_a, &agent_b, &ac_a, &ac_b, &cc_a, &cc_b, 0.5, config, 99,
+        )
+        .unwrap();
 
-        // Child has correct config
         assert_eq!(
             child.config.actor.hidden_layers.len(),
             agent_a.config.actor.hidden_layers.len()
@@ -1334,12 +1352,13 @@ mod tests {
         let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
         let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
 
-        let cache_a = build_cache_for_agent(&mut agent_a, 50);
-        let cache_b = build_cache_for_agent(&mut agent_b, 50);
+        let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
+        let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
 
-        let child: PcActorCritic =
-            PcActorCritic::crossover(&agent_a, &agent_b, &cache_a, &cache_b, 0.5, config, 99)
-                .unwrap();
+        let child: PcActorCritic = PcActorCritic::crossover(
+            &agent_a, &agent_b, &ac_a, &ac_b, &cc_a, &cc_b, 0.5, config, 99,
+        )
+        .unwrap();
 
         assert_ne!(
             child.actor.layers[0].weights.data,
@@ -1357,12 +1376,13 @@ mod tests {
         let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
         let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
 
-        let cache_a = build_cache_for_agent(&mut agent_a, 50);
-        let cache_b = build_cache_for_agent(&mut agent_b, 50);
+        let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
+        let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
 
-        let child: PcActorCritic =
-            PcActorCritic::crossover(&agent_a, &agent_b, &cache_a, &cache_b, 0.5, config, 99)
-                .unwrap();
+        let child: PcActorCritic = PcActorCritic::crossover(
+            &agent_a, &agent_b, &ac_a, &ac_b, &cc_a, &cc_b, 0.5, config, 99,
+        )
+        .unwrap();
 
         assert_ne!(
             child.critic.layers[0].weights.data,
@@ -1382,12 +1402,13 @@ mod tests {
         let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
         let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
 
-        let cache_a = build_cache_for_agent(&mut agent_a, 50);
-        let cache_b = build_cache_for_agent(&mut agent_b, 50);
+        let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
+        let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
 
-        let mut child: PcActorCritic =
-            PcActorCritic::crossover(&agent_a, &agent_b, &cache_a, &cache_b, 0.5, config, 99)
-                .unwrap();
+        let mut child: PcActorCritic = PcActorCritic::crossover(
+            &agent_a, &agent_b, &ac_a, &ac_b, &cc_a, &cc_b, 0.5, config, 99,
+        )
+        .unwrap();
 
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2, 3, 4];
@@ -1401,12 +1422,13 @@ mod tests {
         let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
         let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
 
-        let cache_a = build_cache_for_agent(&mut agent_a, 50);
-        let cache_b = build_cache_for_agent(&mut agent_b, 50);
+        let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
+        let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
 
-        let mut child: PcActorCritic =
-            PcActorCritic::crossover(&agent_a, &agent_b, &cache_a, &cache_b, 0.5, config, 99)
-                .unwrap();
+        let mut child: PcActorCritic = PcActorCritic::crossover(
+            &agent_a, &agent_b, &ac_a, &ac_b, &cc_a, &cc_b, 0.5, config, 99,
+        )
+        .unwrap();
 
         let trajectory = make_trajectory(&mut child);
         let loss = child.learn(&trajectory);
@@ -1419,12 +1441,94 @@ mod tests {
         let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
         let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
 
-        let cache_a = build_cache_for_agent(&mut agent_a, 50);
-        let cache_b = build_cache_for_agent(&mut agent_b, 30); // different batch size
+        let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
+        let (ac_b, _cc_b) = build_caches_for_agent(&mut agent_b, 30); // different batch
+        let (_, cc_b_match) = build_caches_for_agent(&mut agent_b, 50);
 
-        let result =
-            PcActorCritic::crossover(&agent_a, &agent_b, &cache_a, &cache_b, 0.5, config, 99);
-        assert!(result.is_err(), "Mismatched batch sizes should error");
+        // Actor batch mismatch
+        let result = PcActorCritic::crossover(
+            &agent_a,
+            &agent_b,
+            &ac_a,
+            &ac_b,
+            &cc_a,
+            &cc_b_match,
+            0.5,
+            config,
+            99,
+        );
+        assert!(result.is_err(), "Mismatched actor batch sizes should error");
+    }
+
+    // ── Fix #2: Separate critic caches in crossover ────────────
+
+    #[test]
+    fn test_agent_crossover_with_separate_critic_caches() {
+        let config = default_config();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+
+        let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
+        let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
+
+        let child: PcActorCritic = PcActorCritic::crossover(
+            &agent_a, &agent_b, &ac_a, &ac_b, &cc_a, &cc_b, 0.5, config, 99,
+        )
+        .unwrap();
+
+        assert_eq!(child.critic.layers.len(), agent_a.critic.layers.len());
+    }
+
+    #[test]
+    fn test_agent_crossover_critic_uses_own_caches() {
+        let config = default_config();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+
+        let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
+        let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
+
+        let child: PcActorCritic = PcActorCritic::crossover(
+            &agent_a, &agent_b, &ac_a, &ac_b, &cc_a, &cc_b, 0.5, config, 99,
+        )
+        .unwrap();
+
+        assert_ne!(
+            child.critic.layers[0].weights.data,
+            agent_a.critic.layers[0].weights.data
+        );
+        assert_ne!(
+            child.critic.layers[0].weights.data,
+            agent_b.critic.layers[0].weights.data
+        );
+    }
+
+    #[test]
+    fn test_agent_crossover_mismatched_critic_batch_error() {
+        let config = default_config();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+
+        let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
+        let (ac_b, _) = build_caches_for_agent(&mut agent_b, 50);
+        // Build critic cache with different batch size
+        let (_, cc_b_small) = build_caches_for_agent(&mut agent_b, 30);
+
+        let result = PcActorCritic::crossover(
+            &agent_a,
+            &agent_b,
+            &ac_a,
+            &ac_b,
+            &cc_a,
+            &cc_b_small,
+            0.5,
+            config,
+            99,
+        );
+        assert!(
+            result.is_err(),
+            "Mismatched critic batch sizes should error"
+        );
     }
 
     // ── Phase 7 Cycle 7.3: lib.rs re-exports ────────────────────
