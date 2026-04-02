@@ -224,6 +224,85 @@ impl<L: LinAlg> PcActorCritic<L> {
         })
     }
 
+    /// Creates a child agent by crossing over two parent agents using CCA neuron alignment.
+    ///
+    /// Delegates to `PcActor::crossover` and `MlpCritic::crossover`, converting
+    /// activation caches to the matrix format expected by CCA alignment.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent_a` - First parent agent (reference, typically higher fitness).
+    /// * `parent_b` - Second parent agent.
+    /// * `cache_a` - Activation cache for parent A on the reference batch.
+    /// * `cache_b` - Activation cache for parent B on the reference batch.
+    /// * `alpha` - Blending weight: 1.0 = all A, 0.0 = all B.
+    /// * `child_config` - Configuration for the child agent.
+    /// * `seed` - Random seed for the child's RNG.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::DimensionMismatch` if activation caches have different
+    /// batch sizes. Returns `PcError::ConfigValidation` if child config is invalid.
+    pub fn crossover(
+        parent_a: &PcActorCritic<L>,
+        parent_b: &PcActorCritic<L>,
+        cache_a: &ActivationCache<L>,
+        cache_b: &ActivationCache<L>,
+        alpha: f64,
+        child_config: PcActorCriticConfig,
+        seed: u64,
+    ) -> Result<Self, PcError> {
+        // Validate batch sizes match
+        if cache_a.batch_size() != cache_b.batch_size() {
+            return Err(PcError::DimensionMismatch {
+                expected: cache_a.batch_size(),
+                got: cache_b.batch_size(),
+                context: "activation cache batch sizes must match for crossover",
+            });
+        }
+
+        // Convert caches to matrices [batch × neurons] for CCA
+        let actor_cache_mats_a = cache_to_matrices::<L>(cache_a);
+        let actor_cache_mats_b = cache_to_matrices::<L>(cache_b);
+
+        use rand::SeedableRng;
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        // Crossover actor
+        let actor = PcActor::<L>::crossover(
+            &parent_a.actor,
+            &parent_b.actor,
+            &actor_cache_mats_a,
+            &actor_cache_mats_b,
+            alpha,
+            child_config.actor.clone(),
+            &mut rng,
+        )?;
+
+        // For critic, we reuse the same actor caches (critic hidden layers
+        // correlate with actor hidden layers in this architecture)
+        let critic_cache_mats_a = &actor_cache_mats_a;
+        let critic_cache_mats_b = &actor_cache_mats_b;
+
+        let critic = MlpCritic::<L>::crossover(
+            &parent_a.critic,
+            &parent_b.critic,
+            critic_cache_mats_a,
+            critic_cache_mats_b,
+            alpha,
+            child_config.critic.clone(),
+            &mut rng,
+        )?;
+
+        Ok(Self {
+            actor,
+            critic,
+            config: child_config,
+            rng,
+            surprise_buffer: VecDeque::new(),
+        })
+    }
+
     /// Reconstructs an agent from pre-built components (used by serializer).
     ///
     /// # Arguments
@@ -519,6 +598,32 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
         self.surprise_buffer.push_back(surprise);
     }
+}
+
+/// Converts an `ActivationCache` into a vector of matrices `[batch × neurons]`,
+/// one per hidden layer, suitable for CCA alignment.
+fn cache_to_matrices<L: LinAlg>(cache: &ActivationCache<L>) -> Vec<L::Matrix> {
+    let num_layers = cache.num_layers();
+    let batch_size = cache.batch_size();
+    let mut matrices = Vec::with_capacity(num_layers);
+
+    for layer_idx in 0..num_layers {
+        let samples = cache.layer(layer_idx);
+        if samples.is_empty() {
+            matrices.push(L::zeros_mat(0, 0));
+            continue;
+        }
+        let n_neurons = L::vec_len(&samples[0]);
+        let mut mat = L::zeros_mat(batch_size, n_neurons);
+        for (r, sample) in samples.iter().enumerate() {
+            for c in 0..n_neurons {
+                L::mat_set(&mut mat, r, c, L::vec_get(sample, c));
+            }
+        }
+        matrices.push(mat);
+    }
+
+    matrices
 }
 
 #[cfg(test)]
@@ -1185,5 +1290,157 @@ mod tests {
                 "Layer {layer_idx} should have 10 samples"
             );
         }
+    }
+
+    // ── Phase 7 Cycle 7.1: PcActorCritic::crossover ────────────
+
+    fn build_cache_for_agent(agent: &mut PcActorCritic, batch_size: usize) -> ActivationCache {
+        let num_hidden = agent.config.actor.hidden_layers.len();
+        let mut cache: ActivationCache = ActivationCache::new(num_hidden);
+        let valid: Vec<usize> = (0..agent.config.actor.output_size).collect();
+        for i in 0..batch_size {
+            let input: Vec<f64> = (0..agent.config.actor.input_size)
+                .map(|j| ((i * 9 + j) as f64 * 0.1).sin())
+                .collect();
+            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            cache.record(&infer.hidden_states);
+        }
+        cache
+    }
+
+    #[test]
+    fn test_agent_crossover_produces_valid_agent() {
+        let config = default_config();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+
+        let cache_a = build_cache_for_agent(&mut agent_a, 50);
+        let cache_b = build_cache_for_agent(&mut agent_b, 50);
+
+        let child: PcActorCritic =
+            PcActorCritic::crossover(&agent_a, &agent_b, &cache_a, &cache_b, 0.5, config, 99)
+                .unwrap();
+
+        // Child has correct config
+        assert_eq!(
+            child.config.actor.hidden_layers.len(),
+            agent_a.config.actor.hidden_layers.len()
+        );
+    }
+
+    #[test]
+    fn test_agent_crossover_actor_weights_differ() {
+        let config = default_config();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+
+        let cache_a = build_cache_for_agent(&mut agent_a, 50);
+        let cache_b = build_cache_for_agent(&mut agent_b, 50);
+
+        let child: PcActorCritic =
+            PcActorCritic::crossover(&agent_a, &agent_b, &cache_a, &cache_b, 0.5, config, 99)
+                .unwrap();
+
+        assert_ne!(
+            child.actor.layers[0].weights.data,
+            agent_a.actor.layers[0].weights.data
+        );
+        assert_ne!(
+            child.actor.layers[0].weights.data,
+            agent_b.actor.layers[0].weights.data
+        );
+    }
+
+    #[test]
+    fn test_agent_crossover_critic_weights_differ() {
+        let config = default_config();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+
+        let cache_a = build_cache_for_agent(&mut agent_a, 50);
+        let cache_b = build_cache_for_agent(&mut agent_b, 50);
+
+        let child: PcActorCritic =
+            PcActorCritic::crossover(&agent_a, &agent_b, &cache_a, &cache_b, 0.5, config, 99)
+                .unwrap();
+
+        assert_ne!(
+            child.critic.layers[0].weights.data,
+            agent_a.critic.layers[0].weights.data
+        );
+        assert_ne!(
+            child.critic.layers[0].weights.data,
+            agent_b.critic.layers[0].weights.data
+        );
+    }
+
+    // ── Phase 7 Cycle 7.2: Integration — full GA workflow ───────
+
+    #[test]
+    fn test_agent_crossover_child_can_infer() {
+        let config = default_config();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+
+        let cache_a = build_cache_for_agent(&mut agent_a, 50);
+        let cache_b = build_cache_for_agent(&mut agent_b, 50);
+
+        let mut child: PcActorCritic =
+            PcActorCritic::crossover(&agent_a, &agent_b, &cache_a, &cache_b, 0.5, config, 99)
+                .unwrap();
+
+        let input = vec![0.5; 9];
+        let valid = vec![0, 1, 2, 3, 4];
+        let (action, _) = child.act(&input, &valid, SelectionMode::Training);
+        assert!(valid.contains(&action), "Action {action} not in valid set");
+    }
+
+    #[test]
+    fn test_agent_crossover_child_can_learn() {
+        let config = default_config();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+
+        let cache_a = build_cache_for_agent(&mut agent_a, 50);
+        let cache_b = build_cache_for_agent(&mut agent_b, 50);
+
+        let mut child: PcActorCritic =
+            PcActorCritic::crossover(&agent_a, &agent_b, &cache_a, &cache_b, 0.5, config, 99)
+                .unwrap();
+
+        let trajectory = make_trajectory(&mut child);
+        let loss = child.learn(&trajectory);
+        assert!(loss.is_finite(), "Child learn loss not finite: {loss}");
+    }
+
+    #[test]
+    fn test_agent_crossover_mismatched_batch_size_error() {
+        let config = default_config();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+
+        let cache_a = build_cache_for_agent(&mut agent_a, 50);
+        let cache_b = build_cache_for_agent(&mut agent_b, 30); // different batch size
+
+        let result =
+            PcActorCritic::crossover(&agent_a, &agent_b, &cache_a, &cache_b, 0.5, config, 99);
+        assert!(result.is_err(), "Mismatched batch sizes should error");
+    }
+
+    // ── Phase 7 Cycle 7.3: lib.rs re-exports ────────────────────
+
+    #[test]
+    fn test_activation_cache_accessible_from_crate() {
+        // Verify ActivationCache is accessible via pc_actor_critic module
+        let _cache: crate::pc_actor_critic::ActivationCache = ActivationCache::new(1);
+    }
+
+    #[test]
+    fn test_cca_neuron_alignment_accessible_from_crate() {
+        // Verify cca_neuron_alignment is accessible via matrix module
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::linalg::LinAlg;
+        let mat = CpuLinAlg::zeros_mat(10, 3);
+        let _perm = crate::matrix::cca_neuron_alignment::<CpuLinAlg>(&mat, &mat);
     }
 }

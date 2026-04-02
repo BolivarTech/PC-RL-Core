@@ -33,11 +33,12 @@ pub use layer::{Layer, LayerDef};
 pub use linalg::cpu::CpuLinAlg;
 pub use linalg::LinAlg;
 pub use matrix::{
-    argmax_masked, rms_error, sample_from_probs, softmax_masked, Matrix, GRAD_CLIP, WEIGHT_CLIP,
+    argmax_masked, cca_neuron_alignment, rms_error, sample_from_probs, softmax_masked, Matrix,
+    GRAD_CLIP, WEIGHT_CLIP,
 };
 pub use mlp_critic::{MlpCritic, MlpCriticConfig, MlpCriticWeights};
 pub use pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
-pub use pc_actor_critic::{PcActorCritic, PcActorCriticConfig, TrajectoryStep};
+pub use pc_actor_critic::{ActivationCache, PcActorCritic, PcActorCriticConfig, TrajectoryStep};
 pub use serializer::{
     checkpoint_filename, load_agent, load_agent_generic, save_agent, save_checkpoint,
     AgentMetadata, PcActorWeights, SaveFile, TrainingMetrics,
