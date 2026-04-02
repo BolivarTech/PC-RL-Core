@@ -48,7 +48,7 @@ Input (9) ──> [H1 27, Softsign] ──> [H2 27, Softsign] ──> [H3 18, So
          [Critic Hidden 36, Softsign] ──> V(s)
 ```
 
-All core structs are generic over `L: LinAlg` (default `CpuLinAlg`), enabling future GPU backends.
+All core structs are generic over `L: LinAlg` (default `CpuLinAlg`), enabling future GPU backends. The library is **GA-ready** with CCA-based crossover operators for evolving network populations.
 
 **Predictive Coding Loop**: Instead of a single feedforward pass, the actor runs an iterative inference loop where higher layers generate top-down predictions of lower layer states. The prediction error (surprise) between layers drives hidden state updates. This process converges to a stable internal representation before action selection.
 
@@ -61,15 +61,15 @@ PC-TicTacToe/
 ├── pc-rl-core/                    # Reusable RL library (v1.0.0)
 │   └── src/
 │       ├── linalg/
-│       │   ├── mod.rs          # LinAlg trait (26 methods, backend-agnostic)
-│       │   └── cpu.rs          # CpuLinAlg (Vec<f64> + Matrix)
+│       │   ├── mod.rs          # LinAlg trait (32 methods, backend-agnostic)
+│       │   └── cpu.rs          # CpuLinAlg (Vec<f64> + Matrix, Jacobi SVD)
 │       ├── activation.rs       # Tanh, ReLU, Sigmoid, ELU, Softsign, Linear
 │       ├── error.rs            # PcError crate-wide error type
-│       ├── matrix.rs           # Dense matrix struct, softmax, sampling
+│       ├── matrix.rs           # Dense matrix, softmax, CCA alignment, Hungarian assignment
 │       ├── layer.rs            # Layer<L: LinAlg> with PC top-down support
-│       ├── pc_actor.rs         # PcActor<L> with inference loop, residual, projection
-│       ├── mlp_critic.rs       # MlpCritic<L> value function
-│       ├── pc_actor_critic.rs  # PcActorCritic<L> integrated agent
+│       ├── pc_actor.rs         # PcActor<L> with inference loop, residual, crossover
+│       ├── mlp_critic.rs       # MlpCritic<L> value function, crossover
+│       ├── pc_actor_critic.rs  # PcActorCritic<L> agent, ActivationCache, crossover
 │       └── serializer.rs       # JSON persistence (CPU concrete bridge)
 ├── pc_tictactoe/               # Game binary
 │   ├── config.toml             # Training configuration
@@ -127,6 +127,7 @@ Key parameters:
 - **Output activation must be Linear** -- Tanh bounds logits to [-1,1], preventing policy learning
 - **Bounded activations required for PC** -- ReLU dies, ELU explodes; tanh and softsign work
 - **Backend-agnostic architecture** -- `LinAlg` trait enables CPU/GPU swap with zero logic changes
+- **GA-ready crossover** -- CCA neuron alignment solves the permutation problem; Hungarian optimal assignment; supports topology mutation (dimension/layer count changes)
 
 Validated through 19 experimental phases, ~3,200 training runs across multiple architectural configurations.
 
@@ -148,7 +149,7 @@ No PyTorch, TensorFlow, or any ML framework. Pure Rust from scratch.
 
 ## Testing
 
-357 unit tests + 12 doctests covering all modules:
+425 unit tests + 13 doctests covering all modules:
 
 ```bash
 # Run all tests
