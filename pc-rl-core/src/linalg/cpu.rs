@@ -90,10 +90,11 @@ impl LinAlg for CpuLinAlg {
         let max_iter = 200 * n * n;
         let tol = 1e-10;
         let mut converged = false;
+        let mut max_val = 0.0_f64;
 
         for _ in 0..max_iter {
             // Find largest off-diagonal element
-            let mut max_val = 0.0_f64;
+            max_val = 0.0_f64;
             let mut p = 0;
             let mut q = 1;
             for i in 0..n {
@@ -107,7 +108,7 @@ impl LinAlg for CpuLinAlg {
                 }
             }
 
-            if max_val < tol {
+            if max_val <= tol {
                 converged = true;
                 break;
             }
@@ -166,7 +167,7 @@ impl LinAlg for CpuLinAlg {
 
         if !converged && n > 1 {
             return Err(crate::error::PcError::ConfigValidation(format!(
-                "Jacobi SVD did not converge for {n}x{n} matrix after {max_iter} iterations"
+                "Jacobi SVD did not converge for {n}x{n} matrix after {max_iter} iterations with {max_val} > {tol}"
             )));
         }
 
