@@ -87,8 +87,8 @@ impl LinAlg for CpuLinAlg {
         }
         let mut d_mat = mtm.clone();
 
-        let max_iter = 500 * n * n;
-        let tol = 1e-10;
+        let max_iter = 200 * n * n;
+        let tol = 1e-9;
         let mut converged = false;
         let mut max_val = 0.0_f64;
 
