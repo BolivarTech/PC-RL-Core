@@ -478,10 +478,36 @@ pub fn cca_neuron_alignment<L: crate::linalg::LinAlg>(
     let m = L::mat_mul(&temp, &c_b_inv_sqrt);
 
     // SVD(M) → U, S, V
-    let (u, _s, v) = L::svd(&m)?;
+    let (u, s, v) = L::svd(&m)?;
 
-    // Phase 4: Greedy matching
-    Ok(greedy_match::<L>(&u, &v, n_a, n_b))
+    // Phase 4: Build cost matrix and solve optimal assignment via Hungarian
+    let n_canonical = L::mat_cols(&u).min(L::mat_cols(&v));
+
+    // Cost matrix: cost[b][a] = -similarity(a, b)
+    // similarity = sum_k S[k] * |U[a,k]| * |V[b,k]|
+    let mut cost = vec![vec![0.0; n_a]; n_b];
+    for (b, cost_row) in cost.iter_mut().enumerate() {
+        for (a, cost_cell) in cost_row.iter_mut().enumerate() {
+            let mut sim = 0.0;
+            for kk in 0..n_canonical {
+                let sk = L::vec_get(&s, kk);
+                sim += sk * L::mat_get(&u, a, kk).abs() * L::mat_get(&v, b, kk).abs();
+            }
+            *cost_cell = -sim; // Negate: Hungarian minimizes
+        }
+    }
+
+    // Solve assignment
+    let assignment = hungarian_assignment(&cost);
+
+    // Build permutation: perm[b] = assigned a for each b
+    let k = n_a.min(n_b);
+    let mut perm = vec![0usize; k];
+    for (b, &a) in assignment.iter().enumerate().take(k) {
+        perm[b] = a;
+    }
+
+    Ok(perm)
 }
 
 /// Scale all elements of a matrix by a scalar.
@@ -571,6 +597,106 @@ fn mat_inv_sqrt<L: crate::linalg::LinAlg>(
 
 /// Greedy matching from CCA canonical directions.
 /// Returns permutation[i] = index in A that B's neuron i maps to.
+/// Hungarian algorithm (Kuhn-Munkres) for optimal assignment.
+///
+/// Given an n×m cost matrix (rows = workers, cols = jobs), finds the
+/// assignment that minimizes total cost. Returns a vector where
+/// `result[i]` is the column assigned to row i.
+///
+/// Handles rectangular matrices by padding to square with zeros.
+/// Time complexity: O(n^3) where n = max(rows, cols).
+pub(crate) fn hungarian_assignment(cost: &[Vec<f64>]) -> Vec<usize> {
+    let n_rows = cost.len();
+    if n_rows == 0 {
+        return vec![];
+    }
+    let n_cols = cost[0].len();
+    let n = n_rows.max(n_cols);
+
+    // Pad to square matrix
+    let mut c = vec![vec![0.0; n + 1]; n + 1]; // 1-indexed
+    for (i, row) in cost.iter().enumerate() {
+        for (j, &val) in row.iter().enumerate() {
+            c[i + 1][j + 1] = val;
+        }
+    }
+
+    // u[i] = potential for row i, v[j] = potential for col j
+    let mut u = vec![0.0; n + 1];
+    let mut v = vec![0.0; n + 1];
+    // p[j] = row assigned to column j (0 = unassigned)
+    let mut p = vec![0usize; n + 1];
+    // way[j] = column that leads to j in the augmenting path
+    let mut way = vec![0usize; n + 1];
+
+    for i in 1..=n {
+        // Start augmenting path from row i
+        p[0] = i;
+        let mut j0 = 0usize; // virtual column
+        let mut min_v = vec![f64::MAX; n + 1];
+        let mut used = vec![false; n + 1];
+
+        loop {
+            used[j0] = true;
+            let i0 = p[j0];
+            let mut delta = f64::MAX;
+            let mut j1 = 0usize;
+
+            for j in 1..=n {
+                if !used[j] {
+                    let cur = c[i0][j] - u[i0] - v[j];
+                    if cur < min_v[j] {
+                        min_v[j] = cur;
+                        way[j] = j0;
+                    }
+                    if min_v[j] < delta {
+                        delta = min_v[j];
+                        j1 = j;
+                    }
+                }
+            }
+
+            // Update potentials
+            for j in 0..=n {
+                if used[j] {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                } else {
+                    min_v[j] -= delta;
+                }
+            }
+
+            j0 = j1;
+
+            if p[j0] == 0 {
+                break; // Found augmenting path
+            }
+        }
+
+        // Trace back augmenting path
+        loop {
+            let j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+            if j0 == 0 {
+                break;
+            }
+        }
+    }
+
+    // Extract assignment: for each row i, find its assigned column
+    let mut result = vec![0usize; n_rows];
+    for j in 1..=n {
+        if p[j] >= 1 && p[j] <= n_rows {
+            result[p[j] - 1] = j - 1;
+        }
+    }
+    result
+}
+
+/// Greedy matching from CCA canonical directions (deprecated, kept for reference).
+/// Use `hungarian_assignment` instead for optimal matching.
+#[allow(dead_code)]
 fn greedy_match<L: crate::linalg::LinAlg>(
     u: &L::Matrix,
     v: &L::Matrix,
@@ -1332,6 +1458,118 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), n_neurons, "permutation has duplicates");
+    }
+
+    // ── Fix #9: Hungarian matching ─────────────────────────────
+
+    #[test]
+    fn test_hungarian_assignment_basic() {
+        // Verify hungarian_assignment solves a known 3x3 cost matrix optimally
+        // Cost matrix (minimize):
+        //   [[1, 2, 3],
+        //    [2, 4, 6],
+        //    [3, 6, 9]]
+        // Optimal: (0,2)=3, (1,1)=4, (2,0)=3 → total=10
+        let assignment = hungarian_assignment(&[
+            vec![1.0, 2.0, 3.0],
+            vec![2.0, 4.0, 6.0],
+            vec![3.0, 6.0, 9.0],
+        ]);
+        // Verify total cost is optimal (10)
+        let total: f64 = assignment
+            .iter()
+            .enumerate()
+            .map(|(i, &j)| [1.0, 2.0, 3.0, 2.0, 4.0, 6.0, 3.0, 6.0, 9.0][i * 3 + j])
+            .sum();
+        assert!(
+            (total - 10.0).abs() < 1e-10,
+            "Expected total cost 10, got {total}"
+        );
+    }
+
+    #[test]
+    fn test_hungarian_assignment_permuted() {
+        // Cost matrix where optimal is NOT the diagonal:
+        //   [[5, 1, 3],
+        //    [2, 8, 7],
+        //    [6, 4, 1]]
+        // Optimal: (0,1)=1, (1,0)=2, (2,2)=1 → total=4
+        let assignment = hungarian_assignment(&[
+            vec![5.0, 1.0, 3.0],
+            vec![2.0, 8.0, 7.0],
+            vec![6.0, 4.0, 1.0],
+        ]);
+        assert_eq!(assignment, vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn test_hungarian_assignment_4x4() {
+        // 4×4 cost matrix:
+        //   [[10, 5, 13, 15],
+        //    [3, 9, 18,  6],
+        //    [10, 7, 2, 12],
+        //    [5, 11, 9,  4]]
+        // Optimal: (0,1)=5, (1,0)=3, (2,2)=2, (3,3)=4 → total=14
+        let assignment = hungarian_assignment(&[
+            vec![10.0, 5.0, 13.0, 15.0],
+            vec![3.0, 9.0, 18.0, 6.0],
+            vec![10.0, 7.0, 2.0, 12.0],
+            vec![5.0, 11.0, 9.0, 4.0],
+        ]);
+        assert_eq!(assignment, vec![1, 0, 2, 3]);
+    }
+
+    #[test]
+    fn test_hungarian_assignment_1x1() {
+        let assignment = hungarian_assignment(&[vec![42.0]]);
+        assert_eq!(assignment, vec![0]);
+    }
+
+    #[test]
+    fn test_hungarian_optimal_vs_greedy_on_collision_case() {
+        // Construct activations where greedy matching fails due to argmax collision
+        // but Hungarian finds the optimal alignment.
+        //
+        // Create two networks where neurons in B are a known permutation of A,
+        // but with correlated noise that causes argmax collisions in canonical
+        // directions. Use enough neurons that collisions are likely.
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::linalg::LinAlg;
+
+        let batch_size = 200;
+        let n = 8;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Generate A with distinct but correlated neuron activations
+        let mut act_a = CpuLinAlg::zeros_mat(batch_size, n);
+        for r in 0..batch_size {
+            // Base signal
+            let base: f64 = rng.gen_range(-1.0..1.0);
+            for c in 0..n {
+                let noise: f64 = rng.gen_range(-0.3..0.3);
+                // Each neuron = base * weight_c + noise
+                let weight = (c as f64 + 1.0) / n as f64;
+                CpuLinAlg::mat_set(&mut act_a, r, c, base * weight + noise);
+            }
+        }
+
+        // B is a known permutation of A: [5, 3, 7, 1, 6, 0, 4, 2]
+        let true_perm = [5, 3, 7, 1, 6, 0, 4, 2];
+        let mut act_b = CpuLinAlg::zeros_mat(batch_size, n);
+        for r in 0..batch_size {
+            for (j, &src_col) in true_perm.iter().enumerate() {
+                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, src_col));
+            }
+        }
+
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
+
+        // With Hungarian, the optimal assignment should recover the true permutation
+        assert_eq!(
+            perm,
+            true_perm.to_vec(),
+            "Hungarian should recover exact permutation for correlated neurons"
+        );
     }
 
     #[test]
