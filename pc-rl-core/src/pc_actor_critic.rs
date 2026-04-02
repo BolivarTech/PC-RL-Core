@@ -105,6 +105,73 @@ pub struct TrajectoryStep<L: LinAlg = CpuLinAlg> {
     pub steps_used: usize,
 }
 
+/// Cache for hidden layer activations captured during inference.
+///
+/// Used by CCA neuron alignment during crossover to compare functional
+/// neuron responses between parent networks. Activations are recorded
+/// during normal fitness evaluation at zero additional compute cost.
+///
+/// Generic over a [`LinAlg`] backend `L`. Defaults to [`CpuLinAlg`].
+///
+/// # Examples
+///
+/// ```
+/// use pc_rl_core::pc_actor_critic::ActivationCache;
+/// use pc_rl_core::linalg::cpu::CpuLinAlg;
+///
+/// let cache: ActivationCache<CpuLinAlg> = ActivationCache::new(2);
+/// assert_eq!(cache.batch_size(), 0);
+/// assert_eq!(cache.num_layers(), 2);
+/// ```
+#[derive(Debug, Clone)]
+pub struct ActivationCache<L: LinAlg = CpuLinAlg> {
+    /// activations[layer_idx][batch_sample_idx] = neuron activations.
+    layers: Vec<Vec<L::Vector>>,
+}
+
+impl<L: LinAlg> ActivationCache<L> {
+    /// Creates a new empty cache with the given number of hidden layers.
+    ///
+    /// # Arguments
+    ///
+    /// * `num_layers` - Number of hidden layers to track.
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            layers: (0..num_layers).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    /// Returns the number of samples recorded so far.
+    pub fn batch_size(&self) -> usize {
+        self.layers.first().map_or(0, |l| l.len())
+    }
+
+    /// Returns the number of hidden layers in the cache.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Records hidden layer activations from a single inference.
+    ///
+    /// # Arguments
+    ///
+    /// * `hidden_states` - Per-layer activations from `InferResult::hidden_states`.
+    pub fn record(&mut self, hidden_states: &[L::Vector]) {
+        for (layer, state) in self.layers.iter_mut().zip(hidden_states.iter()) {
+            layer.push(state.clone());
+        }
+    }
+
+    /// Returns the recorded activations for a given layer.
+    ///
+    /// # Arguments
+    ///
+    /// * `layer_idx` - Index of the hidden layer.
+    pub fn layer(&self, layer_idx: usize) -> &[L::Vector] {
+        &self.layers[layer_idx]
+    }
+}
+
 /// Integrated PC Actor-Critic agent.
 ///
 /// Combines a predictive coding actor with an MLP critic for
@@ -1017,5 +1084,106 @@ mod tests {
             .map(|_: PcActorCritic| ())
             .unwrap_err();
         assert!(format!("{err}").contains("gamma"));
+    }
+
+    // ── Phase 4 Cycle 4.1: ActivationCache construction and recording ──
+
+    #[test]
+    fn test_activation_cache_new_creates_empty() {
+        let cache: ActivationCache = ActivationCache::new(3);
+        assert_eq!(cache.batch_size(), 0);
+    }
+
+    #[test]
+    fn test_activation_cache_record_increments_batch_size() {
+        let mut agent: PcActorCritic = make_agent();
+        let input = vec![0.5; 9];
+        let valid = vec![0, 1, 2];
+        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+
+        let num_hidden = infer.hidden_states.len();
+        let mut cache: ActivationCache = ActivationCache::new(num_hidden);
+        cache.record(&infer.hidden_states);
+        assert_eq!(cache.batch_size(), 1);
+    }
+
+    #[test]
+    fn test_activation_cache_record_multiple() {
+        let mut agent: PcActorCritic = make_agent();
+        let valid = vec![0, 1, 2];
+        let init_input = vec![0.5; 9];
+        let num_hidden = {
+            let (_, infer) = agent.act(&init_input, &valid, SelectionMode::Training);
+            infer.hidden_states.len()
+        };
+
+        let mut cache: ActivationCache = ActivationCache::new(num_hidden);
+        for i in 0..5 {
+            let input = vec![i as f64 * 0.1; 9];
+            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            cache.record(&infer.hidden_states);
+        }
+        assert_eq!(cache.batch_size(), 5);
+    }
+
+    #[test]
+    fn test_activation_cache_recorded_values_match_hidden_states() {
+        let mut agent: PcActorCritic = make_agent();
+        let input = vec![0.5; 9];
+        let valid = vec![0, 1, 2];
+        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+
+        let num_hidden = infer.hidden_states.len();
+        let mut cache: ActivationCache = ActivationCache::new(num_hidden);
+        cache.record(&infer.hidden_states);
+
+        // Verify recorded activations match
+        for (layer_idx, expected) in infer.hidden_states.iter().enumerate() {
+            let layer_data = cache.layer(layer_idx);
+            assert_eq!(layer_data.len(), 1);
+            assert_eq!(layer_data[0], *expected);
+        }
+    }
+
+    // ── Phase 4 Cycle 4.2: ActivationCache layer access ────────────
+
+    #[test]
+    fn test_activation_cache_layer_count() {
+        let mut agent: PcActorCritic = make_agent();
+        let input = vec![0.5; 9];
+        let valid = vec![0, 1, 2];
+        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+
+        let num_hidden = infer.hidden_states.len();
+        let mut cache: ActivationCache = ActivationCache::new(num_hidden);
+        cache.record(&infer.hidden_states);
+
+        assert_eq!(cache.num_layers(), num_hidden);
+    }
+
+    #[test]
+    fn test_activation_cache_layer_sample_count() {
+        let mut agent: PcActorCritic = make_agent();
+        let valid = vec![0, 1, 2];
+        let init_input = vec![0.5; 9];
+        let num_hidden = {
+            let (_, infer) = agent.act(&init_input, &valid, SelectionMode::Training);
+            infer.hidden_states.len()
+        };
+
+        let mut cache: ActivationCache = ActivationCache::new(num_hidden);
+        for i in 0..10 {
+            let input = vec![i as f64 * 0.1; 9];
+            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            cache.record(&infer.hidden_states);
+        }
+
+        for layer_idx in 0..num_hidden {
+            assert_eq!(
+                cache.layer(layer_idx).len(),
+                10,
+                "Layer {layer_idx} should have 10 samples"
+            );
+        }
     }
 }
