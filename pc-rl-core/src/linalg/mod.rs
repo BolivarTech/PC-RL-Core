@@ -77,6 +77,15 @@ pub trait LinAlg: Clone + Send + Sync + 'static {
     /// Panics if `cols_a != rows_b`.
     fn mat_mul(a: &Self::Matrix, b: &Self::Matrix) -> Self::Matrix;
 
+    /// Singular Value Decomposition: `M = U × diag(S) × V^T`.
+    ///
+    /// Returns `(U, S, V)` where:
+    /// - `U` is `(m, k)` with orthonormal columns,
+    /// - `S` is a vector of `k` non-negative singular values in descending order,
+    /// - `V` is `(n, k)` with orthonormal columns,
+    /// - `k = min(m, n)`.
+    fn svd(m: &Self::Matrix) -> (Self::Matrix, Self::Vector, Self::Matrix);
+
     /// Adds `scale * other` element-wise to `m` (in place).
     fn mat_scale_add(m: &mut Self::Matrix, other: &Self::Matrix, scale: f64);
 

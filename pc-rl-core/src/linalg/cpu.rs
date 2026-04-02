@@ -65,6 +65,136 @@ impl LinAlg for CpuLinAlg {
         result
     }
 
+    fn svd(m: &Self::Matrix) -> (Self::Matrix, Self::Vector, Self::Matrix) {
+        let rows = m.rows;
+        let cols = m.cols;
+        let k = rows.min(cols);
+
+        if k == 0 {
+            return (Matrix::zeros(rows, 0), vec![], Matrix::zeros(cols, 0));
+        }
+
+        // 1. Compute M^T × M (n×n symmetric matrix)
+        let mt = m.transpose();
+        let mtm = Self::mat_mul(&mt, m);
+        let n = cols;
+
+        // 2. Jacobi eigendecomposition of M^T × M → eigenvalues D, eigenvectors V
+        //    Initialize V = I
+        let mut v_mat = Matrix::zeros(n, n);
+        for i in 0..n {
+            v_mat.set(i, i, 1.0);
+        }
+        let mut d_mat = mtm.clone();
+
+        let max_iter = 100 * n * n;
+        let tol = 1e-12;
+
+        for _ in 0..max_iter {
+            // Find largest off-diagonal element
+            let mut max_val = 0.0_f64;
+            let mut p = 0;
+            let mut q = 1;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let val = d_mat.get(i, j).abs();
+                    if val > max_val {
+                        max_val = val;
+                        p = i;
+                        q = j;
+                    }
+                }
+            }
+
+            if max_val < tol {
+                break;
+            }
+
+            // Compute Jacobi rotation angle
+            let app = d_mat.get(p, p);
+            let aqq = d_mat.get(q, q);
+            let apq = d_mat.get(p, q);
+
+            let theta = if (app - aqq).abs() < 1e-15 {
+                std::f64::consts::FRAC_PI_4
+            } else {
+                0.5 * (2.0 * apq / (app - aqq)).atan()
+            };
+
+            let cos_t = theta.cos();
+            let sin_t = theta.sin();
+
+            // Apply rotation to d_mat: D' = G^T × D × G
+            // Update rows p and q
+            let mut new_dp = vec![0.0; n];
+            let mut new_dq = vec![0.0; n];
+            for j in 0..n {
+                new_dp[j] = cos_t * d_mat.get(p, j) + sin_t * d_mat.get(q, j);
+                new_dq[j] = -sin_t * d_mat.get(p, j) + cos_t * d_mat.get(q, j);
+            }
+            for j in 0..n {
+                d_mat.set(p, j, new_dp[j]);
+                d_mat.set(q, j, new_dq[j]);
+            }
+
+            // Update columns p and q
+            let mut new_cp = vec![0.0; n];
+            let mut new_cq = vec![0.0; n];
+            for i in 0..n {
+                new_cp[i] = cos_t * d_mat.get(i, p) + sin_t * d_mat.get(i, q);
+                new_cq[i] = -sin_t * d_mat.get(i, p) + cos_t * d_mat.get(i, q);
+            }
+            for i in 0..n {
+                d_mat.set(i, p, new_cp[i]);
+                d_mat.set(i, q, new_cq[i]);
+            }
+
+            // Accumulate eigenvectors: V = V × G
+            let mut new_vp = vec![0.0; n];
+            let mut new_vq = vec![0.0; n];
+            for i in 0..n {
+                new_vp[i] = cos_t * v_mat.get(i, p) + sin_t * v_mat.get(i, q);
+                new_vq[i] = -sin_t * v_mat.get(i, p) + cos_t * v_mat.get(i, q);
+            }
+            for i in 0..n {
+                v_mat.set(i, p, new_vp[i]);
+                v_mat.set(i, q, new_vq[i]);
+            }
+        }
+
+        // 3. Extract eigenvalues, compute S = sqrt(D), sort descending
+        let mut eigen_pairs: Vec<(f64, usize)> = (0..n)
+            .map(|i| {
+                let eigenval = d_mat.get(i, i).max(0.0);
+                (eigenval, i)
+            })
+            .collect();
+        eigen_pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+        let mut s_vec = vec![0.0; k];
+        let mut v_sorted = Matrix::zeros(n, k);
+        for (out_idx, &(eigenval, orig_idx)) in eigen_pairs.iter().take(k).enumerate() {
+            s_vec[out_idx] = eigenval.sqrt();
+            for row in 0..n {
+                v_sorted.set(row, out_idx, v_mat.get(row, orig_idx));
+            }
+        }
+
+        // 4. U = M × V × diag(1/S) for non-zero singular values
+        let mv = Self::mat_mul(m, &v_sorted);
+        let mut u_mat = Matrix::zeros(rows, k);
+        for (j, &sj) in s_vec.iter().enumerate() {
+            if sj > 1e-14 {
+                let inv_s = 1.0 / sj;
+                for i in 0..rows {
+                    u_mat.set(i, j, mv.get(i, j) * inv_s);
+                }
+            }
+        }
+
+        (u_mat, s_vec, v_sorted)
+    }
+
     fn mat_scale_add(m: &mut Self::Matrix, other: &Self::Matrix, scale: f64) {
         m.scale_add(other, scale);
     }
@@ -600,5 +730,245 @@ mod tests {
         let c = CpuLinAlg::mat_mul(&a, &b);
         assert_eq!(CpuLinAlg::mat_rows(&c), 4);
         assert_eq!(CpuLinAlg::mat_cols(&c), 5);
+    }
+
+    // ── Phase 2 Cycle 2.1: SVD of known matrices ────────────────
+
+    /// Helper: build matrix from row-major slice.
+    fn mat_from_rows(rows: usize, cols: usize, data: &[f64]) -> Matrix {
+        assert_eq!(data.len(), rows * cols);
+        let mut m = CpuLinAlg::zeros_mat(rows, cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                CpuLinAlg::mat_set(&mut m, r, c, data[r * cols + c]);
+            }
+        }
+        m
+    }
+
+    /// Helper: reconstruct M from U, S, V^T → U × diag(S) × V^T.
+    fn reconstruct_usv(u: &Matrix, s: &Vec<f64>, v: &Matrix) -> Matrix {
+        let rows = CpuLinAlg::mat_rows(u);
+        let cols = CpuLinAlg::mat_cols(v);
+        let k = CpuLinAlg::vec_len(s);
+        // diag(S) × V^T
+        let vt = CpuLinAlg::mat_transpose(v);
+        let mut sv = CpuLinAlg::zeros_mat(k, cols);
+        for i in 0..k {
+            for j in 0..cols {
+                CpuLinAlg::mat_set(
+                    &mut sv,
+                    i,
+                    j,
+                    CpuLinAlg::vec_get(s, i) * CpuLinAlg::mat_get(&vt, i, j),
+                );
+            }
+        }
+        // U × (diag(S) × V^T)
+        let mut result = CpuLinAlg::zeros_mat(rows, cols);
+        for i in 0..rows {
+            for j in 0..cols {
+                let mut sum = 0.0;
+                for l in 0..k {
+                    sum += CpuLinAlg::mat_get(u, i, l) * CpuLinAlg::mat_get(&sv, l, j);
+                }
+                CpuLinAlg::mat_set(&mut result, i, j, sum);
+            }
+        }
+        result
+    }
+
+    /// Helper: check if matrix is approximately identity.
+    fn assert_approx_identity(m: &Matrix, tol: f64) {
+        let n = CpuLinAlg::mat_rows(m);
+        assert_eq!(n, CpuLinAlg::mat_cols(m), "not square");
+        for r in 0..n {
+            for c in 0..n {
+                let expected = if r == c { 1.0 } else { 0.0 };
+                assert!(
+                    (CpuLinAlg::mat_get(m, r, c) - expected).abs() < tol,
+                    "at ({r},{c}): got {} expected {expected}",
+                    CpuLinAlg::mat_get(m, r, c)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_svd_2x2_diagonal() {
+        // diag(5, 3) → U≈I, S=[5,3], V≈I (up to sign)
+        let m = mat_from_rows(2, 2, &[5.0, 0.0, 0.0, 3.0]);
+        let (u, s, v) = CpuLinAlg::svd(&m);
+
+        // S values = [5, 3] sorted descending
+        assert!((CpuLinAlg::vec_get(&s, 0) - 5.0).abs() < 1e-10);
+        assert!((CpuLinAlg::vec_get(&s, 1) - 3.0).abs() < 1e-10);
+
+        // Reconstruction: U × diag(S) × V^T ≈ M
+        let recon = reconstruct_usv(&u, &s, &v);
+        for r in 0..2 {
+            for c in 0..2 {
+                assert!(
+                    (CpuLinAlg::mat_get(&recon, r, c) - CpuLinAlg::mat_get(&m, r, c)).abs() < 1e-10,
+                    "reconstruction mismatch at ({r},{c})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_svd_3x3_reconstruction() {
+        // Known 3×3 matrix
+        let m = mat_from_rows(3, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]);
+        let (u, s, v) = CpuLinAlg::svd(&m);
+
+        // Reconstruction within tolerance
+        let recon = reconstruct_usv(&u, &s, &v);
+        for r in 0..3 {
+            for c in 0..3 {
+                assert!(
+                    (CpuLinAlg::mat_get(&recon, r, c) - CpuLinAlg::mat_get(&m, r, c)).abs() < 1e-10,
+                    "reconstruction mismatch at ({r},{c}): got {} expected {}",
+                    CpuLinAlg::mat_get(&recon, r, c),
+                    CpuLinAlg::mat_get(&m, r, c)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_svd_rectangular_3x2_reconstruction() {
+        let m = mat_from_rows(3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let (u, s, v) = CpuLinAlg::svd(&m);
+
+        // U is 3×2, S has 2 elements, V is 2×2
+        assert_eq!(CpuLinAlg::mat_rows(&u), 3);
+        assert_eq!(CpuLinAlg::mat_cols(&u), 2);
+        assert_eq!(CpuLinAlg::vec_len(&s), 2);
+        assert_eq!(CpuLinAlg::mat_rows(&v), 2);
+        assert_eq!(CpuLinAlg::mat_cols(&v), 2);
+
+        let recon = reconstruct_usv(&u, &s, &v);
+        for r in 0..3 {
+            for c in 0..2 {
+                assert!(
+                    (CpuLinAlg::mat_get(&recon, r, c) - CpuLinAlg::mat_get(&m, r, c)).abs() < 1e-10,
+                    "reconstruction mismatch at ({r},{c})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_svd_singular_values_non_negative_descending() {
+        let m = mat_from_rows(3, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]);
+        let (_u, s, _v) = CpuLinAlg::svd(&m);
+
+        for i in 0..CpuLinAlg::vec_len(&s) {
+            assert!(
+                CpuLinAlg::vec_get(&s, i) >= 0.0,
+                "singular value {i} is negative: {}",
+                CpuLinAlg::vec_get(&s, i)
+            );
+        }
+        for i in 1..CpuLinAlg::vec_len(&s) {
+            assert!(
+                CpuLinAlg::vec_get(&s, i - 1) >= CpuLinAlg::vec_get(&s, i) - 1e-12,
+                "singular values not descending: s[{}]={} < s[{}]={}",
+                i - 1,
+                CpuLinAlg::vec_get(&s, i - 1),
+                i,
+                CpuLinAlg::vec_get(&s, i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_svd_orthonormal_columns() {
+        let m = mat_from_rows(3, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0]);
+        let (u, _s, v) = CpuLinAlg::svd(&m);
+
+        // U^T × U ≈ I
+        let utu = CpuLinAlg::mat_mul(&CpuLinAlg::mat_transpose(&u), &u);
+        assert_approx_identity(&utu, 1e-10);
+
+        // V^T × V ≈ I
+        let vtv = CpuLinAlg::mat_mul(&CpuLinAlg::mat_transpose(&v), &v);
+        assert_approx_identity(&vtv, 1e-10);
+    }
+
+    // ── Phase 2 Cycle 2.2: SVD edge cases ───────────────────────
+
+    #[test]
+    fn test_svd_1x1_matrix() {
+        let m = mat_from_rows(1, 1, &[7.0]);
+        let (_u, s, _v) = CpuLinAlg::svd(&m);
+        assert_eq!(CpuLinAlg::vec_len(&s), 1);
+        assert!((CpuLinAlg::vec_get(&s, 0) - 7.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_svd_1x1_negative() {
+        let m = mat_from_rows(1, 1, &[-3.0]);
+        let (u, s, v) = CpuLinAlg::svd(&m);
+        // S must be non-negative
+        assert!(CpuLinAlg::vec_get(&s, 0) >= 0.0);
+        assert!((CpuLinAlg::vec_get(&s, 0) - 3.0).abs() < 1e-10);
+        // Reconstruction
+        let recon = reconstruct_usv(&u, &s, &v);
+        assert!((CpuLinAlg::mat_get(&recon, 0, 0) - (-3.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_svd_zero_matrix() {
+        let m = CpuLinAlg::zeros_mat(3, 3);
+        let (_u, s, _v) = CpuLinAlg::svd(&m);
+        for i in 0..CpuLinAlg::vec_len(&s) {
+            assert!(
+                CpuLinAlg::vec_get(&s, i).abs() < 1e-12,
+                "expected zero singular value, got {}",
+                CpuLinAlg::vec_get(&s, i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_svd_repeated_singular_values() {
+        // diag(4, 4, 2) → S = [4, 4, 2]
+        let m = mat_from_rows(3, 3, &[4.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 2.0]);
+        let (u, s, v) = CpuLinAlg::svd(&m);
+        assert!((CpuLinAlg::vec_get(&s, 0) - 4.0).abs() < 1e-10);
+        assert!((CpuLinAlg::vec_get(&s, 1) - 4.0).abs() < 1e-10);
+        assert!((CpuLinAlg::vec_get(&s, 2) - 2.0).abs() < 1e-10);
+
+        let recon = reconstruct_usv(&u, &s, &v);
+        for r in 0..3 {
+            for c in 0..3 {
+                assert!(
+                    (CpuLinAlg::mat_get(&recon, r, c) - CpuLinAlg::mat_get(&m, r, c)).abs() < 1e-10,
+                    "reconstruction mismatch at ({r},{c})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_svd_16x16_reconstruction() {
+        // Deterministic 16×16 matrix
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let m = CpuLinAlg::xavier_mat(16, 16, &mut rng);
+        let (u, s, v) = CpuLinAlg::svd(&m);
+
+        let recon = reconstruct_usv(&u, &s, &v);
+        for r in 0..16 {
+            for c in 0..16 {
+                assert!(
+                    (CpuLinAlg::mat_get(&recon, r, c) - CpuLinAlg::mat_get(&m, r, c)).abs() < 1e-8,
+                    "reconstruction mismatch at ({r},{c}): got {} expected {}",
+                    CpuLinAlg::mat_get(&recon, r, c),
+                    CpuLinAlg::mat_get(&m, r, c)
+                );
+            }
+        }
     }
 }
