@@ -1051,7 +1051,7 @@ impl<L: LinAlg> PcActor<L> {
 
 /// Permute rows of a weight matrix according to a permutation.
 /// `perm[i]` = source row index for destination row i.
-fn permute_rows<L: LinAlg>(m: &L::Matrix, perm: &[usize], n: usize) -> L::Matrix {
+pub(crate) fn permute_rows<L: LinAlg>(m: &L::Matrix, perm: &[usize], n: usize) -> L::Matrix {
     let cols = L::mat_cols(m);
     let perm_len = perm.len();
     let mut result = L::zeros_mat(n, cols);
@@ -1074,7 +1074,7 @@ fn permute_rows<L: LinAlg>(m: &L::Matrix, perm: &[usize], n: usize) -> L::Matrix
 }
 
 /// Permute elements of a bias vector according to a permutation.
-fn permute_vec<L: LinAlg>(v: &L::Vector, perm: &[usize], n: usize) -> L::Vector {
+pub(crate) fn permute_vec<L: LinAlg>(v: &L::Vector, perm: &[usize], n: usize) -> L::Vector {
     let perm_len = perm.len();
     let mut result = L::zeros_vec(n);
     for (dst, &src) in perm.iter().enumerate().take(n.min(perm_len)) {
@@ -1097,7 +1097,7 @@ fn permute_vec<L: LinAlg>(v: &L::Vector, perm: &[usize], n: usize) -> L::Vector 
 /// * `parent_b` - (weights, bias, neuron_count) for parent B (already CCA-aligned).
 /// * `child_cols` - Number of columns (input size) for child layer.
 #[allow(clippy::too_many_arguments)]
-fn blend_layer_weights<L: LinAlg>(
+pub(crate) fn blend_layer_weights<L: LinAlg>(
     parent_a: (&L::Matrix, &L::Vector, usize),
     parent_b: (&L::Matrix, &L::Vector, usize),
     n_child: usize,
