@@ -629,8 +629,7 @@ impl<L: LinAlg> PcActor<L> {
                 let error = L::vec_sub(&prediction, &target);
                 error_vecs.push(error.clone());
 
-                let updated_target =
-                    L::vec_add(&target, &L::vec_scale(&error, self.config.alpha));
+                let updated_target = L::vec_add(&target, &L::vec_scale(&error, self.config.alpha));
                 if let Some(alpha_idx) = self.skip_alpha_index(i) {
                     tanh_components[i] = Some(updated_target.clone());
                     let alpha = self.rezero_alpha[alpha_idx];
