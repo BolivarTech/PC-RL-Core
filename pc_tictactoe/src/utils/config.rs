@@ -73,6 +73,9 @@ pub struct AgentSection {
     /// Whether to adaptively recalibrate surprise thresholds.
     #[serde(default)]
     pub adaptive_surprise: bool,
+    /// Size of the circular buffer for adaptive surprise (default: 100).
+    #[serde(default = "default_surprise_buffer_size")]
+    pub surprise_buffer_size: usize,
     /// Entropy regularization coefficient.
     #[serde(default = "default_entropy_coeff")]
     pub entropy_coeff: f64,
@@ -258,6 +261,9 @@ fn default_surprise_high() -> f64 {
 fn default_entropy_coeff() -> f64 {
     0.01
 }
+fn default_surprise_buffer_size() -> usize {
+    100
+}
 fn default_alpha() -> f64 {
     0.1
 }
@@ -347,6 +353,7 @@ impl Default for AgentSection {
             surprise_low: default_surprise_low(),
             surprise_high: default_surprise_high(),
             adaptive_surprise: false,
+            surprise_buffer_size: default_surprise_buffer_size(),
             entropy_coeff: default_entropy_coeff(),
         }
     }
@@ -554,6 +561,7 @@ impl AppConfig {
             surprise_low: self.agent.surprise_low,
             surprise_high: self.agent.surprise_high,
             adaptive_surprise: self.agent.adaptive_surprise,
+            surprise_buffer_size: self.agent.surprise_buffer_size,
             entropy_coeff: self.agent.entropy_coeff,
         })
     }

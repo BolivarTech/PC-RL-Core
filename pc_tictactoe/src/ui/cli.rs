@@ -460,6 +460,7 @@ gamma = 0.99
 surprise_low = 0.02
 surprise_high = 0.15
 adaptive_surprise = false
+surprise_buffer_size = 100
 entropy_coeff = 0.0
 
 [agent.actor]

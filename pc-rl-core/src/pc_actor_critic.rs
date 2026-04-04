@@ -22,6 +22,11 @@ use crate::linalg::LinAlg;
 use crate::mlp_critic::{MlpCritic, MlpCriticConfig};
 use crate::pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
 
+/// Default surprise buffer size for adaptive surprise.
+fn default_surprise_buffer_size() -> usize {
+    100
+}
+
 /// Configuration for the integrated PC Actor-Critic agent.
 ///
 /// # Examples
@@ -55,6 +60,7 @@ use crate::pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
 ///     surprise_low: 0.02,
 ///     surprise_high: 0.15,
 ///     adaptive_surprise: false,
+///     surprise_buffer_size: 100,
 ///     entropy_coeff: 0.01,
 /// };
 /// ```
@@ -72,6 +78,10 @@ pub struct PcActorCriticConfig {
     pub surprise_high: f64,
     /// Whether to adaptively recalibrate surprise thresholds.
     pub adaptive_surprise: bool,
+    /// Maximum number of surprise scores in the adaptive buffer.
+    /// Only used when `adaptive_surprise` is true. Default: 100.
+    #[serde(default = "default_surprise_buffer_size")]
+    pub surprise_buffer_size: usize,
     /// Entropy regularization coefficient.
     pub entropy_coeff: f64,
 }
@@ -600,9 +610,9 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
     }
 
-    /// Pushes a surprise score into the adaptive buffer (circular, max 100).
+    /// Pushes a surprise score into the adaptive buffer (circular).
     fn push_surprise(&mut self, surprise: f64) {
-        if self.surprise_buffer.len() >= 100 {
+        if self.surprise_buffer.len() >= self.config.surprise_buffer_size {
             self.surprise_buffer.pop_front();
         }
         self.surprise_buffer.push_back(surprise);
@@ -676,6 +686,7 @@ mod tests {
             surprise_low: 0.02,
             surprise_high: 0.15,
             adaptive_surprise: false,
+            surprise_buffer_size: 100,
             entropy_coeff: 0.01,
         }
     }
@@ -1104,6 +1115,7 @@ mod tests {
             surprise_low: 0.02,
             surprise_high: 0.15,
             adaptive_surprise: false,
+            surprise_buffer_size: 100,
             entropy_coeff: 0.0, // no entropy to isolate gradient effect
         };
         let mut agent: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
