@@ -243,7 +243,7 @@ impl GolubKahanSvd {
             if norm < self.tol {
                 let u_mat = make_identity(work_m, 1);
                 let v_mat = make_identity(1, 1);
-                return Self::finalize(u_mat, vec![0.0], v_mat, work_m, work_n, transposed);
+                return Self::finalize(u_mat, vec![0.0], v_mat, transposed);
             }
             let sign = if work_data[0] >= 0.0 { 1.0 } else { -1.0 };
             let mut u_data = vec![0.0; work_m];
@@ -260,7 +260,7 @@ impl GolubKahanSvd {
                 rows: 1,
                 cols: 1,
             };
-            return Self::finalize(u_mat, vec![norm], v_mat, work_m, work_n, transposed);
+            return Self::finalize(u_mat, vec![norm], v_mat, transposed);
         }
 
         // Phase 1: Householder bidiagonalization
@@ -333,25 +333,14 @@ impl GolubKahanSvd {
             }
         }
 
-        Self::finalize(u_thin, sorted_s, v_thin, work_m, work_n, transposed)
+        Self::finalize(u_thin, sorted_s, v_thin, transposed)
     }
 
     /// Swaps U and V if the input was transposed, returning the final result.
-    ///
-    /// # Arguments
-    ///
-    /// * `u` - Left singular vectors.
-    /// * `s` - Singular values.
-    /// * `v` - Right singular vectors.
-    /// * `work_m` - Working row count (after possible transpose).
-    /// * `work_n` - Working column count (after possible transpose).
-    /// * `transposed` - Whether the input was transposed.
     fn finalize(
         u: Matrix,
         s: Vec<f64>,
         v: Matrix,
-        _work_m: usize,
-        _work_n: usize,
         transposed: bool,
     ) -> Result<(Matrix, Vec<f64>, Matrix), SvdError> {
         if transposed {
@@ -359,6 +348,12 @@ impl GolubKahanSvd {
         } else {
             Ok((u, s, v))
         }
+    }
+}
+
+impl Default for GolubKahanSvd {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -883,12 +878,6 @@ fn zero_superdiag_col(
         } else {
             apply_givens_cols(v_acc, v_rows, v_rows, j, zero_idx, c, s);
         }
-    }
-}
-
-impl Default for GolubKahanSvd {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

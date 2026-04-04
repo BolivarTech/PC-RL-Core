@@ -66,9 +66,7 @@ impl LinAlg for CpuLinAlg {
     }
 
     fn svd(m: &Self::Matrix) -> crate::linalg::SvdResult<Self> {
-        let solver = crate::linalg::golub_kahan::GolubKahanSvd::new();
-        let (u_mat, s_vec, v_mat) = solver.compute(m)?;
-        Ok((u_mat, s_vec, v_mat))
+        Ok(crate::linalg::golub_kahan::GolubKahanSvd::new().compute(m)?)
     }
 
     fn mat_scale_add(m: &mut Self::Matrix, other: &Self::Matrix, scale: f64) {
