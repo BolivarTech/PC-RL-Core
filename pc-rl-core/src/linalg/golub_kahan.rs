@@ -108,9 +108,9 @@ impl From<SvdError> for PcError {
 #[derive(Debug, Clone)]
 pub struct GolubKahanSvd {
     /// Convergence tolerance for off-diagonal elements.
-    pub(crate) tol: f64,
+    pub tol: f64,
     /// Maximum iterations as a multiple of `min(rows, cols)`.
-    pub(crate) max_iter_factor: usize,
+    pub max_iter_factor: usize,
 }
 
 impl GolubKahanSvd {
@@ -1266,9 +1266,17 @@ mod tests {
     #[test]
     fn test_rank_deficient() {
         // B8: rank-2 in 3x3 (row 3 = row 1 + row 2)
-        let a = Matrix { data: vec![1.0,2.0,3.0, 4.0,5.0,6.0, 5.0,7.0,9.0], rows: 3, cols: 3 };
+        let a = Matrix {
+            data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 5.0, 7.0, 9.0],
+            rows: 3,
+            cols: 3,
+        };
         let (u, s, v) = GolubKahanSvd::new().compute(&a).unwrap();
-        assert!(s[2] < 1e-10, "third singular value should be ~0, got {}", s[2]);
+        assert!(
+            s[2] < 1e-10,
+            "third singular value should be ~0, got {}",
+            s[2]
+        );
         assert_reconstruction(&a, &u, &s, &v, 1e-10);
         assert_orthonormal_columns(&u, 1e-10);
         assert_orthonormal_columns(&v, 1e-10);
@@ -1278,12 +1286,20 @@ mod tests {
     #[test]
     fn test_rank_one() {
         // B9: outer product [1,2,3] * [4,5]
-        let a = Matrix { data: vec![4.0,5.0, 8.0,10.0, 12.0,15.0], rows: 3, cols: 2 };
+        let a = Matrix {
+            data: vec![4.0, 5.0, 8.0, 10.0, 12.0, 15.0],
+            rows: 3,
+            cols: 2,
+        };
         let (u, s, v) = GolubKahanSvd::new().compute(&a).unwrap();
         let norm_u = (1.0f64 + 4.0 + 9.0).sqrt();
         let norm_v = (16.0f64 + 25.0).sqrt();
         let expected_s0 = norm_u * norm_v;
-        assert!((s[0] - expected_s0).abs() < 1e-8, "expected s[0]={expected_s0}, got {}", s[0]);
+        assert!(
+            (s[0] - expected_s0).abs() < 1e-8,
+            "expected s[0]={expected_s0}, got {}",
+            s[0]
+        );
         assert!(s[1] < 1e-10, "expected s[1]~0, got {}", s[1]);
         assert_reconstruction(&a, &u, &s, &v, 1e-10);
     }
@@ -1291,7 +1307,11 @@ mod tests {
     #[test]
     fn test_repeated_singular_values() {
         // B10: diag(4, 4, 2)
-        let a = Matrix { data: vec![4.0,0.0,0.0, 0.0,4.0,0.0, 0.0,0.0,2.0], rows: 3, cols: 3 };
+        let a = Matrix {
+            data: vec![4.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 2.0],
+            rows: 3,
+            cols: 3,
+        };
         let (u, s, v) = GolubKahanSvd::new().compute(&a).unwrap();
         assert!((s[0] - 4.0).abs() < 1e-10);
         assert!((s[1] - 4.0).abs() < 1e-10);
@@ -1304,7 +1324,11 @@ mod tests {
     #[test]
     fn test_diagonal_with_zeros() {
         // B4, B8: diag(5, 0, 3)
-        let a = Matrix { data: vec![5.0,0.0,0.0, 0.0,0.0,0.0, 0.0,0.0,3.0], rows: 3, cols: 3 };
+        let a = Matrix {
+            data: vec![5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0],
+            rows: 3,
+            cols: 3,
+        };
         let (u, s, v) = GolubKahanSvd::new().compute(&a).unwrap();
         assert!((s[0] - 5.0).abs() < 1e-10);
         assert!((s[1] - 3.0).abs() < 1e-10);
@@ -1316,7 +1340,11 @@ mod tests {
     #[test]
     fn test_ill_conditioned() {
         // B11: condition number > 1e10
-        let a = Matrix { data: vec![1.0,0.0,0.0, 0.0,1e-12,0.0, 0.0,0.0,1e-6], rows: 3, cols: 3 };
+        let a = Matrix {
+            data: vec![1.0, 0.0, 0.0, 0.0, 1e-12, 0.0, 0.0, 0.0, 1e-6],
+            rows: 3,
+            cols: 3,
+        };
         let (u, s, v) = GolubKahanSvd::new().compute(&a).unwrap();
         assert!((s[0] - 1.0).abs() < 1e-8);
         assert_reconstruction(&a, &u, &s, &v, 1e-6);
@@ -1326,7 +1354,11 @@ mod tests {
     #[test]
     fn test_extreme_small_values() {
         // B12: values near underflow
-        let a = Matrix { data: vec![1e-300, 0.0, 0.0, 2e-300], rows: 2, cols: 2 };
+        let a = Matrix {
+            data: vec![1e-300, 0.0, 0.0, 2e-300],
+            rows: 2,
+            cols: 2,
+        };
         let (u, s, v) = GolubKahanSvd::new().compute(&a).unwrap();
         assert!(s[0].is_finite());
         assert!(s[1].is_finite());
@@ -1337,23 +1369,35 @@ mod tests {
     #[test]
     fn test_extreme_large_values() {
         // B12: values near overflow
-        let a = Matrix { data: vec![1e+150, 0.0, 0.0, 2e+150], rows: 2, cols: 2 };
+        let a = Matrix {
+            data: vec![1e+150, 0.0, 0.0, 2e+150],
+            rows: 2,
+            cols: 2,
+        };
         let (u, s, v) = GolubKahanSvd::new().compute(&a).unwrap();
         assert!(s[0].is_finite());
         assert!(s[1].is_finite());
-        for &val in &u.data { assert!(val.is_finite()); }
-        for &val in &v.data { assert!(val.is_finite()); }
+        for &val in &u.data {
+            assert!(val.is_finite());
+        }
+        for &val in &v.data {
+            assert!(val.is_finite());
+        }
         assert_singular_values_sorted(&s);
     }
 
     #[test]
     fn test_convergence_64x64() {
         // B15
-        use rand::SeedableRng;
         use rand::Rng;
+        use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let data: Vec<f64> = (0..64*64).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        let a = Matrix { data, rows: 64, cols: 64 };
+        let data: Vec<f64> = (0..64 * 64).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let a = Matrix {
+            data,
+            rows: 64,
+            cols: 64,
+        };
         let (u, s, v) = GolubKahanSvd::new().compute(&a).unwrap();
         assert_reconstruction(&a, &u, &s, &v, 1e-8);
         assert_orthonormal_columns(&u, 1e-8);
@@ -1364,11 +1408,15 @@ mod tests {
     #[test]
     fn test_convergence_128x128() {
         // B15
-        use rand::SeedableRng;
         use rand::Rng;
+        use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(123);
-        let data: Vec<f64> = (0..128*128).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        let a = Matrix { data, rows: 128, cols: 128 };
+        let data: Vec<f64> = (0..128 * 128).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let a = Matrix {
+            data,
+            rows: 128,
+            cols: 128,
+        };
         let (u, s, v) = GolubKahanSvd::new().compute(&a).unwrap();
         assert_reconstruction(&a, &u, &s, &v, 1e-8);
         assert_orthonormal_columns(&u, 1e-8);
@@ -1380,8 +1428,11 @@ mod tests {
     fn test_almost_bidiagonal() {
         // B16
         let a = Matrix {
-            data: vec![5.0,2.0,0.0,0.0, 0.0,4.0,1.0,0.0, 0.0,0.0,3.0,0.5, 0.0,0.0,0.0,1.0],
-            rows: 4, cols: 4,
+            data: vec![
+                5.0, 2.0, 0.0, 0.0, 0.0, 4.0, 1.0, 0.0, 0.0, 0.0, 3.0, 0.5, 0.0, 0.0, 0.0, 1.0,
+            ],
+            rows: 4,
+            cols: 4,
         };
         let (u, s, v) = GolubKahanSvd::new().compute(&a).unwrap();
         assert_reconstruction(&a, &u, &s, &v, 1e-10);
@@ -1391,15 +1442,26 @@ mod tests {
     #[test]
     fn test_custom_tolerance() {
         // B17
-        let a = Matrix { data: vec![1.0,2.0,3.0, 4.0,5.0,6.0, 7.0,8.0,10.0], rows: 3, cols: 3 };
-        let (u, s, v) = GolubKahanSvd::new().with_tolerance(1e-15).compute(&a).unwrap();
+        let a = Matrix {
+            data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0],
+            rows: 3,
+            cols: 3,
+        };
+        let (u, s, v) = GolubKahanSvd::new()
+            .with_tolerance(1e-15)
+            .compute(&a)
+            .unwrap();
         assert_reconstruction(&a, &u, &s, &v, 1e-12);
     }
 
     #[test]
     fn test_low_max_iter_triggers_error() {
         // B18: factor=0 -> max_iter=0, any non-trivial matrix must fail
-        let a = Matrix { data: vec![1.0,2.0,3.0, 4.0,5.0,6.0, 7.0,8.0,10.0], rows: 3, cols: 3 };
+        let a = Matrix {
+            data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0],
+            rows: 3,
+            cols: 3,
+        };
         let result = GolubKahanSvd::new().with_max_iter_factor(0).compute(&a);
         assert!(result.is_err(), "expected convergence error with factor=0");
         let err = result.unwrap_err();
@@ -1409,7 +1471,11 @@ mod tests {
     #[test]
     fn test_determinism() {
         // B19: same input -> identical output
-        let a = Matrix { data: vec![1.0,2.0,3.0, 4.0,5.0,6.0, 7.0,8.0,10.0], rows: 3, cols: 3 };
+        let a = Matrix {
+            data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0],
+            rows: 3,
+            cols: 3,
+        };
         let svd = GolubKahanSvd::new();
         let (u1, s1, v1) = svd.compute(&a).unwrap();
         let (u2, s2, v2) = svd.compute(&a).unwrap();

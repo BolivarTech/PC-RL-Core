@@ -31,6 +31,7 @@ pub use activation::Activation;
 pub use error::PcError;
 pub use layer::{Layer, LayerDef};
 pub use linalg::cpu::CpuLinAlg;
+pub use linalg::golub_kahan::{GolubKahanSvd, SvdError};
 pub use linalg::LinAlg;
 pub use matrix::{
     argmax_masked, cca_neuron_alignment, rms_error, sample_from_probs, softmax_masked, Matrix,
