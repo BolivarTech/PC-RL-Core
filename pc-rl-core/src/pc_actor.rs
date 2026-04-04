@@ -970,7 +970,84 @@ impl<L: LinAlg> PcActor<L> {
     /// Restores an actor from saved weights without requiring an RNG.
     ///
     /// Converts CPU-backed weight snapshots to the target backend `L`.
-    pub fn from_weights(config: PcActorConfig, weights: crate::serializer::PcActorWeights) -> Self {
+    /// Validates that all weight matrix dimensions and bias lengths match
+    /// the expected topology from `config`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::DimensionMismatch` if any weight matrix or bias
+    /// vector has dimensions inconsistent with the config topology.
+    pub fn from_weights(
+        config: PcActorConfig,
+        weights: crate::serializer::PcActorWeights,
+    ) -> Result<Self, PcError> {
+        let n_hidden = config.hidden_layers.len();
+        let expected_layers = n_hidden + 1;
+
+        if weights.layers.len() != expected_layers {
+            return Err(PcError::DimensionMismatch {
+                expected: expected_layers,
+                got: weights.layers.len(),
+                context: "actor layer count",
+            });
+        }
+
+        // Validate each layer's dimensions
+        let mut prev_size = config.input_size;
+        for (i, cpu_layer) in weights.layers.iter().enumerate() {
+            let (expected_rows, expected_cols) = if i < n_hidden {
+                (config.hidden_layers[i].size, prev_size)
+            } else {
+                (config.output_size, prev_size)
+            };
+
+            if cpu_layer.weights.rows != expected_rows {
+                return Err(PcError::DimensionMismatch {
+                    expected: expected_rows,
+                    got: cpu_layer.weights.rows,
+                    context: "actor layer weight rows",
+                });
+            }
+            if cpu_layer.weights.cols != expected_cols {
+                return Err(PcError::DimensionMismatch {
+                    expected: expected_cols,
+                    got: cpu_layer.weights.cols,
+                    context: "actor layer weight cols",
+                });
+            }
+            if cpu_layer.bias.len() != expected_rows {
+                return Err(PcError::DimensionMismatch {
+                    expected: expected_rows,
+                    got: cpu_layer.bias.len(),
+                    context: "actor layer bias length",
+                });
+            }
+
+            if i < n_hidden {
+                prev_size = config.hidden_layers[i].size;
+            }
+        }
+
+        // Validate residual components
+        if config.residual {
+            let expected_residual = n_hidden.saturating_sub(1);
+            if weights.rezero_alpha.len() != expected_residual {
+                return Err(PcError::DimensionMismatch {
+                    expected: expected_residual,
+                    got: weights.rezero_alpha.len(),
+                    context: "actor rezero_alpha count",
+                });
+            }
+            if weights.skip_projections.len() != expected_residual {
+                return Err(PcError::DimensionMismatch {
+                    expected: expected_residual,
+                    got: weights.skip_projections.len(),
+                    context: "actor skip_projections count",
+                });
+            }
+        }
+
+        // Convert layers
         let layers: Vec<Layer<L>> = weights
             .layers
             .into_iter()
@@ -1008,12 +1085,12 @@ impl<L: LinAlg> PcActor<L> {
                 })
             })
             .collect();
-        Self {
+        Ok(Self {
             layers,
             config,
             rezero_alpha: weights.rezero_alpha,
             skip_projections,
-        }
+        })
     }
 }
 
@@ -3231,6 +3308,119 @@ mod tests {
         assert!(
             result.is_err(),
             "Crossover with empty hidden_layers should return error"
+        );
+    }
+
+    // ── from_weights dimension validation tests ──────────────────────
+
+    /// Helper: build valid PcActorWeights from a config by constructing
+    /// an actor and extracting its weights.
+    fn valid_weights_for(config: &PcActorConfig) -> crate::serializer::PcActorWeights {
+        let mut rng = make_rng();
+        let actor = PcActor::<CpuLinAlg>::new(config.clone(), &mut rng).unwrap();
+        actor.to_weights()
+    }
+
+    #[test]
+    fn test_from_weights_valid_returns_ok() {
+        let config = default_config();
+        let weights = valid_weights_for(&config);
+        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_from_weights_wrong_weight_rows_returns_err() {
+        let config = default_config(); // input=9, hidden=[18], output=9
+        let mut weights = valid_weights_for(&config);
+        // Layer 0 should be 18x9; corrupt rows to 10x9
+        weights.layers[0].weights = crate::matrix::Matrix::zeros(10, 9);
+        weights.layers[0].bias = vec![0.0; 10];
+        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_weights_wrong_weight_cols_returns_err() {
+        let config = default_config(); // input=9, hidden=[18], output=9
+        let mut weights = valid_weights_for(&config);
+        // Layer 0 should be 18x9; corrupt cols to 18x5
+        weights.layers[0].weights = crate::matrix::Matrix::zeros(18, 5);
+        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_weights_wrong_bias_length_returns_err() {
+        let config = default_config(); // hidden=[18], so layer 0 bias should be len 18
+        let mut weights = valid_weights_for(&config);
+        weights.layers[0].bias = vec![0.0; 5]; // wrong length
+        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_weights_wrong_output_layer_dims_returns_err() {
+        let config = default_config(); // output layer should be 9x18
+        let mut weights = valid_weights_for(&config);
+        let last = weights.layers.len() - 1;
+        weights.layers[last].weights = crate::matrix::Matrix::zeros(9, 10); // wrong cols
+        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_weights_wrong_rezero_alpha_count_returns_err() {
+        let mut config = default_config();
+        config.hidden_layers = vec![
+            LayerDef { size: 18, activation: Activation::Tanh },
+            LayerDef { size: 18, activation: Activation::Tanh },
+        ];
+        config.residual = true;
+        let mut weights = valid_weights_for(&config);
+        // residual with 2 hidden layers expects 1 rezero_alpha; give 0
+        weights.rezero_alpha = vec![];
+        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_weights_wrong_skip_projections_count_returns_err() {
+        let mut config = default_config();
+        config.hidden_layers = vec![
+            LayerDef { size: 18, activation: Activation::Tanh },
+            LayerDef { size: 18, activation: Activation::Tanh },
+        ];
+        config.residual = true;
+        let mut weights = valid_weights_for(&config);
+        // Should have 1 skip_projection; give 3
+        weights.skip_projections = vec![None, None, None];
+        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch, got: {err}"
         );
     }
 }

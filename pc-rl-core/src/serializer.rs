@@ -147,28 +147,9 @@ pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError>
     let json = std::fs::read_to_string(path)?;
     let save_file: SaveFile = serde_json::from_str(&json)?;
 
-    // Validate actor layer count
-    let expected_actor_layers = save_file.config.actor.hidden_layers.len() + 1;
-    if save_file.actor_weights.layers.len() != expected_actor_layers {
-        return Err(PcError::DimensionMismatch {
-            expected: expected_actor_layers,
-            got: save_file.actor_weights.layers.len(),
-            context: "actor layer count",
-        });
-    }
-
-    // Validate critic layer count
-    let expected_critic_layers = save_file.config.critic.hidden_layers.len() + 1;
-    if save_file.critic_weights.layers.len() != expected_critic_layers {
-        return Err(PcError::DimensionMismatch {
-            expected: expected_critic_layers,
-            got: save_file.critic_weights.layers.len(),
-            context: "critic layer count",
-        });
-    }
-
-    let actor = PcActor::from_weights(save_file.config.actor.clone(), save_file.actor_weights);
-    let critic = MlpCritic::from_weights(save_file.config.critic.clone(), save_file.critic_weights);
+    let actor = PcActor::from_weights(save_file.config.actor.clone(), save_file.actor_weights)?;
+    let critic =
+        MlpCritic::from_weights(save_file.config.critic.clone(), save_file.critic_weights)?;
 
     use rand::SeedableRng;
     let rng = rand::rngs::StdRng::from_entropy();
@@ -200,29 +181,10 @@ pub fn load_agent_generic<L: LinAlg>(
     let json = std::fs::read_to_string(path)?;
     let save_file: SaveFile = serde_json::from_str(&json)?;
 
-    // Validate actor layer count
-    let expected_actor_layers = save_file.config.actor.hidden_layers.len() + 1;
-    if save_file.actor_weights.layers.len() != expected_actor_layers {
-        return Err(PcError::DimensionMismatch {
-            expected: expected_actor_layers,
-            got: save_file.actor_weights.layers.len(),
-            context: "actor layer count",
-        });
-    }
-
-    // Validate critic layer count
-    let expected_critic_layers = save_file.config.critic.hidden_layers.len() + 1;
-    if save_file.critic_weights.layers.len() != expected_critic_layers {
-        return Err(PcError::DimensionMismatch {
-            expected: expected_critic_layers,
-            got: save_file.critic_weights.layers.len(),
-            context: "critic layer count",
-        });
-    }
-
-    let actor = PcActor::<L>::from_weights(save_file.config.actor.clone(), save_file.actor_weights);
+    let actor =
+        PcActor::<L>::from_weights(save_file.config.actor.clone(), save_file.actor_weights)?;
     let critic =
-        MlpCritic::<L>::from_weights(save_file.config.critic.clone(), save_file.critic_weights);
+        MlpCritic::<L>::from_weights(save_file.config.critic.clone(), save_file.critic_weights)?;
 
     use rand::SeedableRng;
     let rng = rand::rngs::StdRng::from_entropy();

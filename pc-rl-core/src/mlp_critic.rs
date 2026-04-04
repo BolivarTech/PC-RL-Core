@@ -405,13 +405,68 @@ impl<L: LinAlg> MlpCritic<L> {
     /// Restores a critic from saved weights without requiring an RNG.
     ///
     /// Converts CPU layers to generic layers element-by-element for
-    /// backend-agnostic restoration.
+    /// backend-agnostic restoration. Validates that all weight matrix
+    /// dimensions and bias lengths match the expected topology.
     ///
     /// # Arguments
     ///
     /// * `config` - Must match the topology used when weights were saved.
     /// * `weights` - Previously saved weight snapshot.
-    pub fn from_weights(config: MlpCriticConfig, weights: MlpCriticWeights) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::DimensionMismatch` if any weight matrix or bias
+    /// vector has dimensions inconsistent with the config topology.
+    pub fn from_weights(
+        config: MlpCriticConfig,
+        weights: MlpCriticWeights,
+    ) -> Result<Self, PcError> {
+        let n_hidden = config.hidden_layers.len();
+        let expected_layers = n_hidden + 1;
+
+        if weights.layers.len() != expected_layers {
+            return Err(PcError::DimensionMismatch {
+                expected: expected_layers,
+                got: weights.layers.len(),
+                context: "critic layer count",
+            });
+        }
+
+        let mut prev_size = config.input_size;
+        for (i, cpu_layer) in weights.layers.iter().enumerate() {
+            let (expected_rows, expected_cols) = if i < n_hidden {
+                (config.hidden_layers[i].size, prev_size)
+            } else {
+                (1, prev_size) // output layer: 1 neuron
+            };
+
+            if cpu_layer.weights.rows != expected_rows {
+                return Err(PcError::DimensionMismatch {
+                    expected: expected_rows,
+                    got: cpu_layer.weights.rows,
+                    context: "critic layer weight rows",
+                });
+            }
+            if cpu_layer.weights.cols != expected_cols {
+                return Err(PcError::DimensionMismatch {
+                    expected: expected_cols,
+                    got: cpu_layer.weights.cols,
+                    context: "critic layer weight cols",
+                });
+            }
+            if cpu_layer.bias.len() != expected_rows {
+                return Err(PcError::DimensionMismatch {
+                    expected: expected_rows,
+                    got: cpu_layer.bias.len(),
+                    context: "critic layer bias length",
+                });
+            }
+
+            if i < n_hidden {
+                prev_size = config.hidden_layers[i].size;
+            }
+        }
+
         let generic_layers: Vec<Layer<L>> = weights
             .layers
             .into_iter()
@@ -437,10 +492,10 @@ impl<L: LinAlg> MlpCritic<L> {
                 }
             })
             .collect();
-        Self {
+        Ok(Self {
             layers: generic_layers,
             config,
-        }
+        })
     }
 }
 
@@ -610,7 +665,7 @@ mod tests {
         let original_output = critic.forward(&input);
 
         let weights = critic.to_weights();
-        let restored: MlpCritic = MlpCritic::from_weights(default_config(), weights);
+        let restored: MlpCritic = MlpCritic::from_weights(default_config(), weights).unwrap();
         let restored_output = restored.forward(&input);
 
         assert!(
@@ -911,5 +966,76 @@ mod tests {
             result.is_err(),
             "Crossover with empty hidden_layers should return error"
         );
+    }
+
+    // ── from_weights dimension validation tests ──────────────────────
+
+    /// Helper: build valid MlpCriticWeights from a config.
+    fn valid_weights_for(config: &MlpCriticConfig) -> MlpCriticWeights {
+        let mut rng = make_rng();
+        let critic = MlpCritic::<CpuLinAlg>::new(config.clone(), &mut rng).unwrap();
+        critic.to_weights()
+    }
+
+    #[test]
+    fn test_from_weights_valid_returns_ok() {
+        let config = default_config();
+        let weights = valid_weights_for(&config);
+        let result = MlpCritic::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_from_weights_wrong_weight_rows_returns_err() {
+        let config = default_config(); // input=27, hidden=[36], output=1
+        let mut weights = valid_weights_for(&config);
+        // Layer 0 should be 36x27; corrupt rows to 20x27
+        weights.layers[0].weights = crate::matrix::Matrix::zeros(20, 27);
+        weights.layers[0].bias = vec![0.0; 20];
+        let result = MlpCritic::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_weights_wrong_weight_cols_returns_err() {
+        let config = default_config(); // layer 0 should be 36x27
+        let mut weights = valid_weights_for(&config);
+        weights.layers[0].weights = crate::matrix::Matrix::zeros(36, 10); // wrong cols
+        let result = MlpCritic::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_weights_wrong_bias_length_returns_err() {
+        let config = default_config(); // layer 0 bias should be len 36
+        let mut weights = valid_weights_for(&config);
+        weights.layers[0].bias = vec![0.0; 5];
+        let result = MlpCritic::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_weights_wrong_output_layer_dims_returns_err() {
+        let config = default_config(); // output layer should be 1x36
+        let mut weights = valid_weights_for(&config);
+        let last = weights.layers.len() - 1;
+        weights.layers[last].weights = crate::matrix::Matrix::zeros(1, 10); // wrong cols
+        let result = MlpCritic::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_err());
     }
 }
