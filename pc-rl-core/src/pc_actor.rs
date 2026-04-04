@@ -3388,8 +3388,14 @@ mod tests {
     fn test_from_weights_wrong_rezero_alpha_count_returns_err() {
         let mut config = default_config();
         config.hidden_layers = vec![
-            LayerDef { size: 18, activation: Activation::Tanh },
-            LayerDef { size: 18, activation: Activation::Tanh },
+            LayerDef {
+                size: 18,
+                activation: Activation::Tanh,
+            },
+            LayerDef {
+                size: 18,
+                activation: Activation::Tanh,
+            },
         ];
         config.residual = true;
         let mut weights = valid_weights_for(&config);
@@ -3408,8 +3414,14 @@ mod tests {
     fn test_from_weights_wrong_skip_projections_count_returns_err() {
         let mut config = default_config();
         config.hidden_layers = vec![
-            LayerDef { size: 18, activation: Activation::Tanh },
-            LayerDef { size: 18, activation: Activation::Tanh },
+            LayerDef {
+                size: 18,
+                activation: Activation::Tanh,
+            },
+            LayerDef {
+                size: 18,
+                activation: Activation::Tanh,
+            },
         ];
         config.residual = true;
         let mut weights = valid_weights_for(&config);

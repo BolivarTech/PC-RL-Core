@@ -9,6 +9,7 @@
 //! is provided by [`cpu::CpuLinAlg`] in the [`cpu`] submodule.
 
 pub mod cpu;
+pub mod golub_kahan;
 
 use crate::activation::Activation;
 use crate::error::PcError;
