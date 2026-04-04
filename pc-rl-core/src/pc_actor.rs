@@ -584,130 +584,83 @@ impl<L: LinAlg> PcActor<L> {
         for step in 0..self.config.max_steps {
             steps_used = step + 1;
 
-            if self.config.synchronous {
-                // Snapshot mode: freeze all states
-                let snapshot: Vec<L::Vector> = hidden_states.clone();
-                let tanh_snap: Vec<Option<L::Vector>> = tanh_components.clone();
-
-                let mut error_vecs: Vec<L::Vector> = Vec::new();
-
-                for i in (0..n_hidden).rev() {
-                    // For top-down prediction, use tanh_component of layer above
-                    // (not the full residual sum) when it is a skip layer.
-                    let state_above = if i == n_hidden - 1 {
-                        &y
-                    } else if let Some(ref tc) = tanh_snap[i + 1] {
-                        tc
-                    } else {
-                        &snapshot[i + 1]
-                    };
-
-                    // Top-down prediction targets tanh_component for skip layers
-                    let target = if let Some(ref tc) = tanh_snap[i] {
-                        tc
-                    } else {
-                        &snapshot[i]
-                    };
-
-                    let prediction = self.layers[i + 1]
-                        .transpose_forward(state_above, self.config.hidden_layers[i].activation);
-
-                    let error = L::vec_sub(&prediction, target);
-                    error_vecs.push(error.clone());
-
-                    // Update tanh_component or hidden_state
-                    let updated_target =
-                        L::vec_add(target, &L::vec_scale(&error, self.config.alpha));
-                    if let Some(alpha_idx) = self.skip_alpha_index(i) {
-                        tanh_components[i] = Some(updated_target.clone());
-                        let alpha = self.rezero_alpha[alpha_idx];
-                        let prev_h = if i > 0 {
-                            &hidden_states[i - 1]
-                        } else {
-                            &input_vec
-                        };
-                        let skip_path = if let Some(ref proj) = self.skip_projections[alpha_idx] {
-                            L::mat_vec_mul(proj, prev_h)
-                        } else {
-                            prev_h.clone()
-                        };
-                        hidden_states[i] =
-                            L::vec_add(&skip_path, &L::vec_scale(&updated_target, alpha));
-                    } else {
-                        hidden_states[i] = updated_target;
-                    }
-                }
-
-                let top_hidden = if n_hidden > 0 {
-                    &hidden_states[n_hidden - 1]
-                } else {
-                    &input_vec
-                };
-                y = self.layers[n_hidden].forward(top_hidden);
-
-                let refs: Vec<&L::Vector> = error_vecs.iter().collect();
-                surprise_score = L::rms_error(&refs);
-                last_errors = error_vecs;
+            // Synchronous mode freezes states before updating (snapshot);
+            // in-place mode reads live states that include prior updates.
+            // Both modes need an owned copy of target[i] since we write
+            // hidden_states[i] within the loop body.
+            let snap_h: Vec<L::Vector>;
+            let snap_tc: Vec<Option<L::Vector>>;
+            let use_snapshot = self.config.synchronous;
+            if use_snapshot {
+                snap_h = hidden_states.clone();
+                snap_tc = tanh_components.clone();
             } else {
-                // In-place mode: updates immediately visible
-                let mut error_vecs: Vec<L::Vector> = Vec::new();
-
-                for i in (0..n_hidden).rev() {
-                    // For top-down prediction, use tanh_component of layer above
-                    // (not the full residual sum) when it is a skip layer.
-                    let state_above = if i == n_hidden - 1 {
-                        &y
-                    } else if let Some(ref tc) = tanh_components[i + 1] {
-                        tc
-                    } else {
-                        &hidden_states[i + 1]
-                    };
-
-                    let target = if let Some(ref tc) = tanh_components[i] {
-                        tc.clone()
-                    } else {
-                        hidden_states[i].clone()
-                    };
-
-                    let prediction = self.layers[i + 1]
-                        .transpose_forward(state_above, self.config.hidden_layers[i].activation);
-
-                    let error = L::vec_sub(&prediction, &target);
-                    error_vecs.push(error.clone());
-
-                    let updated_target =
-                        L::vec_add(&target, &L::vec_scale(&error, self.config.alpha));
-                    if let Some(alpha_idx) = self.skip_alpha_index(i) {
-                        tanh_components[i] = Some(updated_target.clone());
-                        let alpha = self.rezero_alpha[alpha_idx];
-                        let prev_h = if i > 0 {
-                            &hidden_states[i - 1]
-                        } else {
-                            &input_vec
-                        };
-                        let skip_path = if let Some(ref proj) = self.skip_projections[alpha_idx] {
-                            L::mat_vec_mul(proj, prev_h)
-                        } else {
-                            prev_h.clone()
-                        };
-                        hidden_states[i] =
-                            L::vec_add(&skip_path, &L::vec_scale(&updated_target, alpha));
-                    } else {
-                        hidden_states[i] = updated_target;
-                    }
-                }
-
-                let top_hidden = if n_hidden > 0 {
-                    &hidden_states[n_hidden - 1]
-                } else {
-                    &input_vec
-                };
-                y = self.layers[n_hidden].forward(top_hidden);
-
-                let refs: Vec<&L::Vector> = error_vecs.iter().collect();
-                surprise_score = L::rms_error(&refs);
-                last_errors = error_vecs;
+                snap_h = Vec::new();
+                snap_tc = Vec::new();
             }
+
+            let mut error_vecs: Vec<L::Vector> = Vec::new();
+
+            for i in (0..n_hidden).rev() {
+                // state_above: sync reads frozen snapshot, in-place reads live
+                let state_above = if i == n_hidden - 1 {
+                    &y
+                } else if use_snapshot {
+                    snap_tc[i + 1].as_ref().unwrap_or(&snap_h[i + 1])
+                } else {
+                    tanh_components[i + 1]
+                        .as_ref()
+                        .unwrap_or(&hidden_states[i + 1])
+                };
+
+                // target: always read pre-update value (clone to own it)
+                let target = if use_snapshot {
+                    snap_tc[i].as_ref().unwrap_or(&snap_h[i]).clone()
+                } else {
+                    tanh_components[i]
+                        .as_ref()
+                        .unwrap_or(&hidden_states[i])
+                        .clone()
+                };
+
+                let prediction = self.layers[i + 1]
+                    .transpose_forward(state_above, self.config.hidden_layers[i].activation);
+
+                let error = L::vec_sub(&prediction, &target);
+                error_vecs.push(error.clone());
+
+                let updated_target =
+                    L::vec_add(&target, &L::vec_scale(&error, self.config.alpha));
+                if let Some(alpha_idx) = self.skip_alpha_index(i) {
+                    tanh_components[i] = Some(updated_target.clone());
+                    let alpha = self.rezero_alpha[alpha_idx];
+                    let prev_h = if i > 0 {
+                        &hidden_states[i - 1]
+                    } else {
+                        &input_vec
+                    };
+                    let skip_path = if let Some(ref proj) = self.skip_projections[alpha_idx] {
+                        L::mat_vec_mul(proj, prev_h)
+                    } else {
+                        prev_h.clone()
+                    };
+                    hidden_states[i] =
+                        L::vec_add(&skip_path, &L::vec_scale(&updated_target, alpha));
+                } else {
+                    hidden_states[i] = updated_target;
+                }
+            }
+
+            let top_hidden = if n_hidden > 0 {
+                &hidden_states[n_hidden - 1]
+            } else {
+                &input_vec
+            };
+            y = self.layers[n_hidden].forward(top_hidden);
+
+            let refs: Vec<&L::Vector> = error_vecs.iter().collect();
+            surprise_score = L::rms_error(&refs);
+            last_errors = error_vecs;
 
             // Convergence check (alpha must be > 0 for meaningful convergence)
             if self.config.alpha > 0.0
