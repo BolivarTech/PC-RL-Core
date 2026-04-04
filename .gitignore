@@ -23,6 +23,7 @@ model.json
 # Session files
 .remember/
 experiment.txt
+Experiments/
 
 # Ralph-Loop
 /plans
