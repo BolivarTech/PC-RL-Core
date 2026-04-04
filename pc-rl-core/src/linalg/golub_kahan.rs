@@ -816,6 +816,11 @@ fn golub_kahan_step(
 
 /// Zeros a superdiagonal element when a diagonal entry is zero,
 /// chasing the bulge rightward via left rotations.
+///
+/// When `diag[zero_idx] ≈ 0`, the left rotation `G^T * B` between rows
+/// `zero_idx` and `j+1` zeros the fill-in but creates a new bulge from
+/// `superdiag[j+1]`. The bulge is tracked explicitly and passed forward
+/// to the next iteration rather than stored back into `superdiag`.
 fn zero_superdiag_row(
     diag: &mut [f64],
     superdiag: &mut [f64],
@@ -824,28 +829,34 @@ fn zero_superdiag_row(
     zero_idx: usize,
     block_end: usize,
 ) {
+    let mut bulge = superdiag[zero_idx];
+    superdiag[zero_idx] = 0.0;
+
     for j in zero_idx..block_end - 1 {
-        let (c, s) = givens_rotation(diag[j + 1], superdiag[j]);
-        diag[j + 1] = c * diag[j + 1] + s * superdiag[j];
-        superdiag[j] = 0.0;
+        let (c, s) = givens_rotation(diag[j + 1], bulge);
+        diag[j + 1] = c * diag[j + 1] + s * bulge;
+        // bulge position is now zero by construction
         if j + 1 < block_end - 1 {
             let old_e = superdiag[j + 1];
             superdiag[j + 1] = c * old_e;
-            // The new bulge element
-            let bulge = -s * old_e;
-            apply_givens_cols(u_acc, u_rows, u_rows, j, j + 1, c, s);
+            bulge = -s * old_e;
+            apply_givens_cols(u_acc, u_rows, u_rows, j + 1, zero_idx, c, s);
             if bulge.abs() < 1e-300 {
                 break;
             }
-            superdiag[j] = bulge;
         } else {
-            apply_givens_cols(u_acc, u_rows, u_rows, j, j + 1, c, s);
+            apply_givens_cols(u_acc, u_rows, u_rows, j + 1, zero_idx, c, s);
         }
     }
 }
 
 /// Zeros a superdiagonal element when a diagonal entry is zero,
 /// chasing the bulge leftward via right rotations.
+///
+/// When `diag[zero_idx] ≈ 0`, the right rotation `B * G` between columns
+/// `zero_idx` and `j` zeros the fill-in but creates a new bulge from
+/// `superdiag[j-1]`. The bulge is tracked explicitly and passed backward
+/// to the next iteration rather than stored back into `superdiag`.
 fn zero_superdiag_col(
     diag: &mut [f64],
     superdiag: &mut [f64],
@@ -854,19 +865,21 @@ fn zero_superdiag_col(
     zero_idx: usize,
     block_start: usize,
 ) {
+    let mut bulge = superdiag[zero_idx - 1];
+    superdiag[zero_idx - 1] = 0.0;
+
     for j in (block_start..zero_idx).rev() {
-        let (c, s) = givens_rotation(diag[j], superdiag[j]);
-        diag[j] = c * diag[j] + s * superdiag[j];
-        superdiag[j] = 0.0;
+        let (c, s) = givens_rotation(diag[j], bulge);
+        diag[j] = c * diag[j] + s * bulge;
+        // bulge position is now zero by construction
         if j > block_start {
             let old_e = superdiag[j - 1];
             superdiag[j - 1] = c * old_e;
-            let bulge = -s * old_e;
+            bulge = -s * old_e;
             apply_givens_cols(v_acc, v_rows, v_rows, j, zero_idx, c, s);
             if bulge.abs() < 1e-300 {
                 break;
             }
-            superdiag[j] = bulge;
         } else {
             apply_givens_cols(v_acc, v_rows, v_rows, j, zero_idx, c, s);
         }
@@ -1374,6 +1387,34 @@ mod tests {
         assert_reconstruction(&a, &u, &s, &v, 1e-10);
         assert_singular_values_sorted(&s);
     }
-}
 
-// placeholder
+    #[test]
+    fn test_custom_tolerance() {
+        // B17
+        let a = Matrix { data: vec![1.0,2.0,3.0, 4.0,5.0,6.0, 7.0,8.0,10.0], rows: 3, cols: 3 };
+        let (u, s, v) = GolubKahanSvd::new().with_tolerance(1e-15).compute(&a).unwrap();
+        assert_reconstruction(&a, &u, &s, &v, 1e-12);
+    }
+
+    #[test]
+    fn test_low_max_iter_triggers_error() {
+        // B18: factor=0 -> max_iter=0, any non-trivial matrix must fail
+        let a = Matrix { data: vec![1.0,2.0,3.0, 4.0,5.0,6.0, 7.0,8.0,10.0], rows: 3, cols: 3 };
+        let result = GolubKahanSvd::new().with_max_iter_factor(0).compute(&a);
+        assert!(result.is_err(), "expected convergence error with factor=0");
+        let err = result.unwrap_err();
+        assert!(matches!(err, SvdError::Convergence { .. }));
+    }
+
+    #[test]
+    fn test_determinism() {
+        // B19: same input -> identical output
+        let a = Matrix { data: vec![1.0,2.0,3.0, 4.0,5.0,6.0, 7.0,8.0,10.0], rows: 3, cols: 3 };
+        let svd = GolubKahanSvd::new();
+        let (u1, s1, v1) = svd.compute(&a).unwrap();
+        let (u2, s2, v2) = svd.compute(&a).unwrap();
+        assert_eq!(s1, s2, "singular values differ");
+        assert_eq!(u1.data, u2.data, "U differs");
+        assert_eq!(v1.data, v2.data, "V differs");
+    }
+}
