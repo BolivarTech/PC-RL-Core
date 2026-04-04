@@ -70,10 +70,10 @@ pub struct AgentSection {
     /// Surprise threshold above which learning rate is increased.
     #[serde(default = "default_surprise_high")]
     pub surprise_high: f64,
-    /// Whether to adaptively recalibrate surprise thresholds.
-    #[serde(default)]
+    /// Whether to adaptively recalibrate surprise thresholds. Default: true.
+    #[serde(default = "default_adaptive_surprise")]
     pub adaptive_surprise: bool,
-    /// Size of the circular buffer for adaptive surprise (default: 100).
+    /// Size of the circular buffer for adaptive surprise (default: 400).
     #[serde(default = "default_surprise_buffer_size")]
     pub surprise_buffer_size: usize,
     /// Entropy regularization coefficient.
@@ -258,11 +258,14 @@ fn default_surprise_low() -> f64 {
 fn default_surprise_high() -> f64 {
     0.15
 }
+fn default_adaptive_surprise() -> bool {
+    true
+}
 fn default_entropy_coeff() -> f64 {
     0.01
 }
 fn default_surprise_buffer_size() -> usize {
-    100
+    400
 }
 fn default_alpha() -> f64 {
     0.1
@@ -352,7 +355,7 @@ impl Default for AgentSection {
             gamma: default_gamma(),
             surprise_low: default_surprise_low(),
             surprise_high: default_surprise_high(),
-            adaptive_surprise: false,
+            adaptive_surprise: default_adaptive_surprise(),
             surprise_buffer_size: default_surprise_buffer_size(),
             entropy_coeff: default_entropy_coeff(),
         }

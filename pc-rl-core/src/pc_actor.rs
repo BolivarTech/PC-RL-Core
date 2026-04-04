@@ -55,23 +55,30 @@ pub struct PcActorConfig {
     pub output_activation: Activation,
     /// Inference learning rate for PC loop state updates (`h += alpha * error`).
     /// Set to 0.0 to disable PC inference (network behaves as standard MLP).
-    /// Active regardless of `residual` setting.
+    /// Active regardless of `residual` setting. Default: 0.1.
+    #[serde(default = "default_alpha")]
     pub alpha: f64,
     /// Convergence threshold for RMS prediction error.
     /// PC loop exits early when surprise < tol (after at least `min_steps`).
-    /// Active regardless of `residual` setting.
+    /// Active regardless of `residual` setting. Default: 0.01.
+    #[serde(default = "default_tol")]
     pub tol: f64,
     /// Minimum PC inference steps before convergence check is allowed.
-    /// Active regardless of `residual` setting.
+    /// Active regardless of `residual` setting. Default: 1.
+    #[serde(default = "default_min_steps")]
     pub min_steps: usize,
     /// Maximum PC inference steps per action.
-    /// Active regardless of `residual` setting.
+    /// Active regardless of `residual` setting. Default: 20.
+    #[serde(default = "default_max_steps")]
     pub max_steps: usize,
-    /// Base learning rate for weight updates.
+    /// Base learning rate for weight updates. Default: 0.01.
+    #[serde(default = "default_lr_weights")]
     pub lr_weights: f64,
-    /// If true, use synchronous snapshot mode; otherwise in-place.
+    /// If true, use synchronous snapshot mode; otherwise in-place. Default: true.
+    #[serde(default = "default_synchronous")]
     pub synchronous: bool,
-    /// Softmax temperature for action selection.
+    /// Softmax temperature for action selection. Default: 1.0.
+    #[serde(default = "default_temperature")]
     pub temperature: f64,
     /// Blend factor for hidden layer weight updates, range `[0.0, 1.0]`.
     ///
@@ -107,14 +114,49 @@ pub struct PcActorConfig {
     pub rezero_init: f64,
 }
 
-/// Default rezero_init: 0.001 (near-identity at start).
-fn default_rezero_init() -> f64 {
-    0.001
+/// Default PC inference learning rate.
+fn default_alpha() -> f64 {
+    0.1
+}
+
+/// Default convergence tolerance for PC loop.
+fn default_tol() -> f64 {
+    0.01
+}
+
+/// Default minimum PC inference steps.
+fn default_min_steps() -> usize {
+    1
+}
+
+/// Default maximum PC inference steps.
+fn default_max_steps() -> usize {
+    20
+}
+
+/// Default base learning rate for weight updates.
+fn default_lr_weights() -> f64 {
+    0.01
+}
+
+/// Default synchronous mode (snapshot).
+fn default_synchronous() -> bool {
+    true
+}
+
+/// Default softmax temperature.
+fn default_temperature() -> f64 {
+    1.0
 }
 
 /// Default local_lambda: 1.0 (pure backprop).
 fn default_local_lambda() -> f64 {
     1.0
+}
+
+/// Default rezero_init: 0.001 (near-identity at start).
+fn default_rezero_init() -> f64 {
+    0.001
 }
 
 /// Result of the predictive coding inference loop.

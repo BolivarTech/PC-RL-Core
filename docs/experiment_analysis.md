@@ -757,6 +757,283 @@ The +1 in the exponent accounts for the additional gradient path introduced by s
 
 **Hypothesis** -- supported by 2 data points (1 and 3 layers) with N=35 seeds each. Updated from `1 - 10^(-L)` to `1 - 10^(-(L+1))` based on Phase 19 results showing λ=0.9999 outperforms λ=0.999 for 3 layers. Requires validation at additional depths (2, 4, 5+ layers) and with extended training budgets to confirm the exponential scaling relationship.
 
+## Phase 20: Adaptive Surprise Exploration (N=35 seeds, [27,27,18] softsign, λ=0.9999, 200k episodes)
+
+### Motivation
+
+The fixed surprise thresholds (low=0.02, high=0.15) were determined empirically and remain constant throughout training. As the agent improves, the surprise distribution shifts downward, meaning the thresholds may not track the agent's evolving competence. Adaptive surprise recalculates thresholds dynamically as `mean ± k*std` of a circular buffer of recent surprise scores, potentially providing better-calibrated learning rate modulation throughout the curriculum.
+
+### Configuration
+
+All experiments use the best 3-layer config from Phase 19:
+- Topology: [27,27,18] softsign, residual with skip projection
+- λ=0.9999, α=0.03, lr=0.005, 200k episodes
+- `surprise_low=0.02, surprise_high=0.15` (used as fallback for first 10 steps)
+- Adaptive formula: `low = max(0, mean - 0.5*std)`, `high = mean + 1.5*std`
+
+### Baseline Reanalysis (experiment.500.txt)
+
+The original baseline stats in CLAUDE.md (mean 7.69, D=9 40%) are confirmed from experiment.500.txt. However, closer examination of D=9 quality reveals a critical insight:
+
+**Baseline D=9 quality breakdown (14 seeds at depth 9):**
+
+| Pattern | Count | % of D=9 |
+|---------|-------|----------|
+| 0% win / 100% loss / 0% draw (collapsed) | 9 | 64% |
+| 0% win / 50% loss / 50% draw | 4 | 29% |
+| 50% win / 0% loss / 50% draw (perfect) | 1 | 7% |
+| Near-perfect (>99% draw) | 0 | 0% |
+
+**9 of 14 baseline D=9 seeds (64%) have 100% loss rate** — they advanced to depth 9 via the curriculum threshold but immediately collapsed, unable to actually play at that level. Only 5 of 14 (36%) are functional D=9 models, giving an **effective D=9 rate of 14%** (5/35 seeds).
+
+### Experiment 20.1: Buffer Size 200
+
+| Metric | Baseline (fixed) | Adaptive (buffer=200) |
+|--------|------------------|-----------------------|
+| N | 35 | 35 |
+| Mean depth | 7.69 | 7.34 |
+| StdDev | 1.45 | 0.79 |
+| Min | 2 | 6 |
+| Max | 9 | 9 |
+| D>=8 | 54% | 26% |
+| D=9 (nominal) | 40% | 14% |
+| D=9 (quality, non-collapsed) | **14%** | **14%** |
+
+**Depth distribution:**
+
+| Depth | Baseline | Adaptive buf=200 |
+|-------|----------|------------------|
+| 2 | 1 (3%) | 0 |
+| 6 | 4 (11%) | 2 (6%) |
+| 7 | 11 (31%) | 24 (69%) |
+| 8 | 5 (14%) | 4 (11%) |
+| 9 | 14 (40%) | 5 (14%) |
+
+**D=9 quality (buffer=200):**
+
+| Pattern | Count | % of D=9 |
+|---------|-------|----------|
+| Collapsed (100% loss) | 0 | 0% |
+| Near-perfect (>99% draw) | 5 | 100% |
+
+**Result**: Adaptive surprise with buffer=200 produces the **same number of quality D=9 models** (5/35 = 14%) as the baseline, but **eliminates all collapsed D=9 seeds**. Every D=9 model is functional with >99.8% draw rate. The nominal D=9 rate drops from 40% to 14% because the 26% "false positive" D=9s are filtered out. Variance is significantly lower (0.79 vs 1.45), and no seed drops below depth 6 (baseline had one at depth 2).
+
+**Conclusion**: Adaptive surprise with buffer=200 acts as a **quality filter**, not a performance degrader. The apparent performance drop is entirely due to the elimination of collapsed D=9 models that inflate the baseline's nominal rate.
+
+### Experiment 20.2: Buffer Size 50
+
+| Metric | Baseline (fixed) | buf=200 | buf=50 |
+|--------|-----------------|---------|--------|
+| N | 35 | 35 | 35 |
+| Mean depth | 7.69 | 7.34 | 7.29 |
+| StdDev | 1.45 | 0.79 | 0.94 |
+| Min | 2 | 6 | 6 |
+| Max | 9 | 9 | 9 |
+| D>=8 | 54% | 26% | 29% |
+| D=9 (nominal) | 40% | 14% | 17% |
+| D=9 (quality) | 14% | 14% | 14% |
+
+**Depth distribution:**
+
+| Depth | Baseline | buf=200 | buf=50 |
+|-------|----------|---------|--------|
+| 2 | 1 (3%) | 0 | 0 |
+| 6 | 4 (11%) | 2 (6%) | 6 (17%) |
+| 7 | 11 (31%) | 24 (69%) | 19 (54%) |
+| 8 | 5 (14%) | 4 (11%) | 4 (11%) |
+| 9 | 14 (40%) | 5 (14%) | 6 (17%) |
+
+**D=9 quality (buffer=50):**
+
+| Pattern | Count | % of D=9 |
+|---------|-------|----------|
+| Collapsed (100% loss) | 1 | 17% |
+| Near-perfect (>99% draw) | 4 | 67% |
+| Perfect (100% draw or 50W/0L/50D) | 2 | 33% |
+
+**Result**: Buffer=50 is more reactive than buf=200. It produces 6 D=9 seeds (vs 5), including 2 with perfect play (one 100% draw, one 50W/0L/50D — theoretically optimal). However, 1 collapsed D=9 leaked through, and 6 seeds fell to depth 6 (vs 2 for buf=200). The shorter buffer amplifies both successes and failures.
+
+**Key finding**: The shorter buffer captures curriculum transition windows more aggressively, producing the highest-quality individual models (perfect play), but at the cost of more instability at the low end.
+
+### Experiment 20.3: Buffer Size 100
+
+| Metric | Baseline (fixed) | buf=200 | buf=50 | buf=100 |
+|--------|-----------------|---------|--------|---------|
+| N | 35 | 35 | 35 | 35 |
+| Mean depth | 7.69 | 7.34 | 7.29 | 7.11 |
+| StdDev | 1.45 | 0.79 | 0.94 | 1.49 |
+| Min | 2 | 6 | 6 | 2 |
+| Max | 9 | 9 | 9 | 9 |
+| D>=8 | 54% | 26% | 29% | 31% |
+| D=9 (nominal) | 40% | 14% | 17% | 14% |
+| D=9 (functional) | 14% | 14% | 14% | 9% |
+
+**Depth distribution:**
+
+| Depth | Baseline | buf=200 | buf=50 | buf=100 |
+|-------|----------|---------|--------|---------|
+| 2 | 1 (3%) | 0 | 0 | 2 (6%) |
+| 6 | 4 (11%) | 2 (6%) | 6 (17%) | 2 (6%) |
+| 7 | 11 (31%) | 24 (69%) | 19 (54%) | 20 (57%) |
+| 8 | 5 (14%) | 4 (11%) | 4 (11%) | 6 (17%) |
+| 9 | 14 (40%) | 5 (14%) | 6 (17%) | 5 (14%) |
+
+**D=9 quality (buffer=100):**
+
+| Pattern | Count | % of D=9 |
+|---------|-------|----------|
+| Collapsed (100% loss) | 2 | 40% |
+| 50% loss / 50% draw | 1 | 20% |
+| Near-perfect (>99% draw) | 1 | 20% |
+| Perfect (100% draw) | 1 | 20% |
+
+**Result**: Buffer=100 is the **worst of the three adaptive sizes**. It reintroduces catastrophic drops to depth 2 (2 seeds), allows 2 D=9 collapses, and yields only 3 functional D=9 models (9% — worse than the 14% seen in all other configs). Its damping time constant (~100 episodes) appears to coincide poorly with the curriculum transition dynamics, creating a resonance-like effect that amplifies instability rather than damping it.
+
+### Experiment 20.4: Buffer Size 300
+
+| Metric | Baseline (fixed) | buf=200 | buf=50 | buf=100 | buf=300 |
+|--------|-----------------|---------|--------|---------|---------|
+| N | 35 | 35 | 35 | 35 | 35 |
+| Mean depth | 7.69 | 7.34 | 7.29 | 7.11 | 7.43 |
+| StdDev | 1.45 | 0.79 | 0.94 | 1.49 | 0.90 |
+| Min | 2 | 6 | 6 | 2 | 6 |
+| Max | 9 | 9 | 9 | 9 | 9 |
+| D>=8 | 54% | 26% | 29% | 31% | 31% |
+| D=9 (nominal) | 40% | 14% | 17% | 14% | 20% |
+| D=9 (functional) | 14% | 14% | 14% | 9% | **20%** |
+
+**Depth distribution:**
+
+| Depth | Baseline | buf=200 | buf=50 | buf=100 | buf=300 |
+|-------|----------|---------|--------|---------|---------|
+| 2 | 1 (3%) | 0 | 0 | 2 (6%) | 0 |
+| 6 | 4 (11%) | 2 (6%) | 6 (17%) | 2 (6%) | 3 (9%) |
+| 7 | 11 (31%) | 24 (69%) | 19 (54%) | 20 (57%) | 21 (60%) |
+| 8 | 5 (14%) | 4 (11%) | 4 (11%) | 6 (17%) | 4 (11%) |
+| 9 | 14 (40%) | 5 (14%) | 6 (17%) | 5 (14%) | 7 (20%) |
+
+**D=9 quality (buffer=300):**
+
+| Pattern | Count | % of D=9 |
+|---------|-------|----------|
+| Collapsed (100% loss) | 0 | 0% |
+| Near-perfect (>99% draw) | 5 | 71% |
+| Perfect (100% draw) | 2 | 29% |
+
+**Result**: Buffer=300 is the **best performer across all configurations tested**. It is the first configuration to break the ~14% functional D=9 ceiling, achieving **20% (7/35 seeds)** — all with >99.9% draw rate and zero collapses. It combines the stability of buf=200 (no collapses, no depth=2 drops) with a higher D=9 yield. The longer damping window (~300 episodes) provides extended protection during curriculum transitions, allowing more seeds to successfully complete the depth 8→9 transition.
+
+### Experiment 20.5: Buffer Size 500
+
+*In progress.*
+
+### Phase 20 Summary (preliminary)
+
+The most important discovery of Phase 20 is that **the baseline D=9 rate of 40% was misleading**. 64% of those D=9 models had 100% loss rate — they collapsed immediately after advancing. The true effective D=9 rate (functional models) was ~14% until buffer=300 broke through to 20%.
+
+Adaptive surprise with appropriate buffer size both **eliminates false positives** and **improves the rate of quality D=9 models**.
+
+### Experiment 20.5: Buffer Size 500
+
+| Metric | Baseline (fixed) | buf=200 | buf=300 | buf=500 |
+|--------|-----------------|---------|---------|---------|
+| N | 35 | 35 | 35 | 35 |
+| Mean depth | 7.69 | 7.34 | 7.43 | 7.23 |
+| StdDev | 1.45 | 0.79 | 0.90 | 0.76 |
+| Min | 2 | 6 | 6 | 6 |
+| D>=8 | 54% | 26% | 31% | 26% |
+| D=9 (nominal) | 40% | 14% | 20% | 9% |
+| D=9 (functional) | 14% | 14% | 20% | 6% |
+
+**D=9 quality (buffer=500):**
+
+| Pattern | Count | % of D=9 |
+|---------|-------|----------|
+| Semi-collapsed (50% loss) | 1 | 33% |
+| Near-perfect (>99% draw) | 1 | 33% |
+| Perfect (100% draw) | 1 | 33% |
+
+**Result**: Buffer=500 **over-damps**. Only 3 D=9 nominal, 2 functional (6%) — tied with buf=100 as worst. The buffer is so long that adaptive thresholds cannot recalibrate quickly enough after curriculum transitions. The LR boost that the agent needs to adapt to a stronger opponent gets diluted before it takes effect.
+
+### Experiment 20.6: Buffer Size 400
+
+| Metric | Baseline (fixed) | buf=200 | buf=300 | buf=400 | buf=500 |
+|--------|-----------------|---------|---------|---------|---------|
+| N | 35 | 35 | 35 | 35 | 35 |
+| Mean depth | 7.69 | 7.34 | 7.43 | 7.63 | 7.23 |
+| StdDev | 1.45 | 0.79 | 0.90 | 0.90 | 0.76 |
+| Min | 2 | 6 | 6 | 6 | 6 |
+| D>=8 | 54% | 26% | 31% | 40% | 26% |
+| D=9 (nominal) | 40% | 14% | 20% | 26% | 9% |
+| D=9 (functional) | 14% | 14% | 20% | **23%** | 6% |
+
+**D=9 quality (buffer=400):**
+
+| Pattern | Count | % of D=9 |
+|---------|-------|----------|
+| Collapsed (100% loss) | 1 | 11% |
+| Near-perfect (>99% draw) | 5 | 56% |
+| Perfect (100% draw or 50W/0L/50D) | 3 | 33% |
+
+**Result**: Buffer=400 is the **new overall best**. It achieves the highest functional D=9 rate (23%, 8/35 seeds), produces 3 perfect-play models (including one with 50W/0L/50D — theoretically optimal), and has the highest mean depth of any adaptive config (7.63, nearly matching the baseline's 7.69). Only 1 seed dropped to depth 6 — the best low-end stability of all configs. One D=9 collapsed, breaking the perfect record of buf=300, but the 3 additional functional D=9 models more than compensate.
+
+**Quality D=9 comparison (all experiments):**
+
+| Config | D=9 total | D=9 collapsed | D=9 functional | D=9 near-perfect | D=9 perfect |
+|--------|-----------|---------------|----------------|------------------|-------------|
+| Baseline (fixed) | 14 | 9 (64%) | 5 (14%) | 0 | 1 |
+| Adaptive buf=50 | 6 | 1 (17%) | 5 (14%) | 4 | 2 |
+| Adaptive buf=100 | 5 | 2 (40%) | 3 (9%) | 1 | 1 |
+| Adaptive buf=200 | 5 | 0 (0%) | 5 (14%) | 5 | 0 |
+| Adaptive buf=300 | 7 | 0 (0%) | 7 (20%) | 5 | 2 |
+| **Adaptive buf=400** | **9** | **1 (11%)** | **8 (23%)** | **5** | **3** |
+| Adaptive buf=500 | 3 | 1 (33%) | 2 (6%) | 1 | 1 |
+
+**D=9 functional rate by buffer size:**
+
+```
+D=9 functional (%)
+  23% |                   *
+      |                  (400)
+  20% |              *
+      |             (300)
+  14% |   *    *
+      | (50) (200)
+   9% |        *
+      |       (100)
+   6% |                         *
+      |                       (500)
+      +---+----+----+----+----+---→ buffer size
+         50  100  200  300  400  500
+```
+
+The optimal range is a plateau between 300-400 (30-40% of curriculum window_size=1000), with buf=400 slightly ahead. The relationship `optimal_buffer ≈ 0.3-0.4 * curriculum_window` suggests a general tuning heuristic.
+
+**Buffer size trade-off:**
+- **buf=400**: Best overall — highest functional D=9 rate (23%), 3 perfect models, mean 7.63. 1 collapse.
+- **buf=300**: Cleanest — zero collapses, 20% functional D=9, 2 perfect models.
+- **buf=200**: Conservative safe default — zero collapses, 14% functional D=9.
+- **buf=50**: Aggressive — 14% functional D=9 but more variance and collapses.
+- **buf=100**: Avoid — resonance with curriculum dynamics.
+- **buf=500**: Avoid — over-damped.
+
+### Why Adaptive Surprise Prevents D=9 Collapse
+
+The baseline produces 14 D=9 seeds but 9 (64%) collapse to 100% loss. Adaptive surprise eliminates most or all of these collapses. The mechanism is the **buffer-mediated transition damping** during curriculum advancement:
+
+**1. Pre-transition steady state.** The agent dominates depth N. Surprise scores are low and stable. The adaptive buffer reflects this distribution, producing low thresholds (e.g., low=0.005, high=0.03). The LR scale stays in the normal 0.1-2.0 interpolation range. Weights are consolidated.
+
+**2. Curriculum advancement trigger.** The agent passes the 95% non-loss threshold and advances to depth N+1. The new minimax opponent is stronger. Surprise spikes immediately — the agent's internal model cannot predict the new opponent's behavior.
+
+**3. Buffer-mediated damping (the key mechanism).** The surprise buffer still contains ~buffer_size entries from the old depth level. The adaptive thresholds are still calibrated to the old, lower surprise distribution. The sudden spike in surprise falls far above `high`, triggering the maximum 2x LR boost. But as new surprise scores enter the buffer, the thresholds gradually rise to reflect the new regime. This creates a **decaying LR envelope**: aggressive learning at the start of the transition (when the agent needs to adapt fastest), tapering to normal as the buffer absorbs the new distribution.
+
+**4. Why this prevents collapse.** With fixed thresholds, the LR boost is binary: surprise > 0.15 = 2x, sustained indefinitely if the agent keeps struggling. A fragile agent post-transition receives sustained high-LR updates that can destroy previously learned weights — catastrophic forgetting. With adaptive thresholds, the boost is self-limiting: as the buffer updates, the thresholds rise to match the new surprise level, and the LR naturally returns to the normal range. The agent gets a strong initial push to adapt, followed by stabilization.
+
+**5. Buffer size controls the damping rate.** Buffer=200 takes ~200 episodes to fully transition, providing long-lasting protection. Buffer=50 transitions in ~50 episodes — faster adaptation but shorter protection window, which explains why 1 collapse leaked through with buf=50 but 0 with buf=200.
+
+The analogy is an RC circuit in electronics: the buffer is the capacitor, surprise spikes are voltage transients, and the LR scale is the output. A larger capacitor (buffer) absorbs bigger transients and releases them more gradually. A smaller capacitor responds faster but provides less filtering.
+
+**On the D=9 rate ceiling.** Initially it appeared that ~14% of seeds could reach functional D=9 regardless of configuration, suggesting a fundamental limit in the weight initialization landscape. However, buffer=300 broke through to 20%, demonstrating that the adaptive surprise mechanism with optimal damping can rescue seeds that would otherwise stall. The buffer-mediated transition damping does not just filter false positives — at the right time constant, it actively helps borderline seeds survive curriculum transitions that would otherwise destroy their learned representations.
+
 ## References
 
 - Millidge, B., Seth, A., & Buckley, C. L. (2022). [Predictive Coding Approximates Backprop Along Arbitrary Computation Graphs](https://direct.mit.edu/neco/article/34/6/1329/107068). *Neural Computation*, 34(6), 1329-1368.

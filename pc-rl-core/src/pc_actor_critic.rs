@@ -22,9 +22,34 @@ use crate::linalg::LinAlg;
 use crate::mlp_critic::{MlpCritic, MlpCriticConfig};
 use crate::pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
 
+/// Default discount factor.
+fn default_gamma() -> f64 {
+    0.95
+}
+
+/// Default surprise low threshold.
+fn default_surprise_low() -> f64 {
+    0.02
+}
+
+/// Default surprise high threshold.
+fn default_surprise_high() -> f64 {
+    0.15
+}
+
+/// Default for adaptive surprise (enabled).
+fn default_adaptive_surprise() -> bool {
+    true
+}
+
 /// Default surprise buffer size for adaptive surprise.
 fn default_surprise_buffer_size() -> usize {
-    100
+    400
+}
+
+/// Default entropy regularization coefficient.
+fn default_entropy_coeff() -> f64 {
+    0.01
 }
 
 /// Configuration for the integrated PC Actor-Critic agent.
@@ -59,8 +84,8 @@ fn default_surprise_buffer_size() -> usize {
 ///     gamma: 0.95,
 ///     surprise_low: 0.02,
 ///     surprise_high: 0.15,
-///     adaptive_surprise: false,
-///     surprise_buffer_size: 100,
+///     adaptive_surprise: true,
+///     surprise_buffer_size: 400,
 ///     entropy_coeff: 0.01,
 /// };
 /// ```
@@ -70,19 +95,24 @@ pub struct PcActorCriticConfig {
     pub actor: PcActorConfig,
     /// Critic (MLP value function) configuration.
     pub critic: MlpCriticConfig,
-    /// Discount factor for computing returns.
+    /// Discount factor for computing returns. Default: 0.95.
+    #[serde(default = "default_gamma")]
     pub gamma: f64,
-    /// Surprise threshold below which learning rate is scaled down.
+    /// Surprise threshold below which learning rate is scaled down. Default: 0.02.
+    #[serde(default = "default_surprise_low")]
     pub surprise_low: f64,
-    /// Surprise threshold above which learning rate is scaled up.
+    /// Surprise threshold above which learning rate is scaled up. Default: 0.15.
+    #[serde(default = "default_surprise_high")]
     pub surprise_high: f64,
-    /// Whether to adaptively recalibrate surprise thresholds.
+    /// Whether to adaptively recalibrate surprise thresholds. Default: true.
+    #[serde(default = "default_adaptive_surprise")]
     pub adaptive_surprise: bool,
     /// Maximum number of surprise scores in the adaptive buffer.
-    /// Only used when `adaptive_surprise` is true. Default: 100.
+    /// Only used when `adaptive_surprise` is true. Default: 400.
     #[serde(default = "default_surprise_buffer_size")]
     pub surprise_buffer_size: usize,
-    /// Entropy regularization coefficient.
+    /// Entropy regularization coefficient. Default: 0.01.
+    #[serde(default = "default_entropy_coeff")]
     pub entropy_coeff: f64,
 }
 

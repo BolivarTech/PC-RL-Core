@@ -16,6 +16,11 @@ use crate::layer::{Layer, LayerDef};
 use crate::linalg::cpu::CpuLinAlg;
 use crate::linalg::LinAlg;
 
+/// Default critic learning rate.
+fn default_critic_lr() -> f64 {
+    0.005
+}
+
 /// Configuration for the MLP critic network.
 ///
 /// # Examples
@@ -40,7 +45,8 @@ pub struct MlpCriticConfig {
     pub hidden_layers: Vec<LayerDef>,
     /// Activation for the single-neuron output layer.
     pub output_activation: Activation,
-    /// Learning rate for weight updates.
+    /// Learning rate for weight updates. Default: 0.005.
+    #[serde(default = "default_critic_lr")]
     pub lr: f64,
 }
 
