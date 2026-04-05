@@ -1039,6 +1039,20 @@ impl<L: LinAlg> PcActor<L> {
                     context: "actor skip_projections count",
                 });
             }
+            // Validate skip projection dimensions (rows/cols)
+            for (i, proj_opt) in weights.skip_projections.iter().enumerate() {
+                if let Some(ref proj) = proj_opt {
+                    let expected_rows = config.hidden_layers[i + 1].size;
+                    let expected_cols = config.hidden_layers[i].size;
+                    if proj.rows != expected_rows || proj.cols != expected_cols {
+                        return Err(PcError::DimensionMismatch {
+                            expected: expected_rows * expected_cols,
+                            got: proj.rows * proj.cols,
+                            context: "actor skip_projection dimensions",
+                        });
+                    }
+                }
+            }
         }
 
         // Convert layers
@@ -3395,6 +3409,33 @@ mod tests {
         let mut weights = valid_weights_for(&config);
         // residual with 2 hidden layers expects 1 rezero_alpha; give 0
         weights.rezero_alpha = vec![];
+        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_from_weights_wrong_skip_projection_dims_returns_err() {
+        // N1: skip projection dimensions (rows/cols) should be validated
+        let mut config = default_config();
+        config.hidden_layers = vec![
+            LayerDef {
+                size: 27,
+                activation: Activation::Softsign,
+            },
+            LayerDef {
+                size: 18,
+                activation: Activation::Softsign,
+            },
+        ];
+        config.residual = true;
+        let mut weights = valid_weights_for(&config);
+        // Skip projection should be 18x27; corrupt to 10x5
+        weights.skip_projections[0] = Some(crate::matrix::Matrix::zeros(10, 5));
         let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
         assert!(result.is_err());
         let err = result.unwrap_err();

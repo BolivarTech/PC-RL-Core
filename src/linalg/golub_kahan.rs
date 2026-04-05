@@ -94,7 +94,7 @@ impl From<SvdError> for PcError {
 /// # Fields
 ///
 /// * `tol` - Convergence tolerance for off-diagonal elements (default: 1e-14).
-/// * `max_iter_factor` - Maximum iterations = `factor * n` where `n = min(rows, cols)` (default: 30).
+/// * `max_iter_factor` - Maximum iterations = `factor * n²` where `n = min(rows, cols)` (default: 30).
 ///
 /// # Examples
 ///
@@ -109,7 +109,7 @@ impl From<SvdError> for PcError {
 pub struct GolubKahanSvd {
     /// Convergence tolerance for off-diagonal elements.
     pub tol: f64,
-    /// Maximum iterations as a multiple of `min(rows, cols)`.
+    /// Maximum iterations as a multiple of `min(rows, cols)²`.
     pub max_iter_factor: usize,
 }
 
@@ -154,7 +154,7 @@ impl GolubKahanSvd {
 
     /// Sets a custom maximum iteration factor.
     ///
-    /// Total maximum iterations will be `factor * min(rows, cols)`.
+    /// Total maximum iterations will be `factor * min(rows, cols)²`.
     ///
     /// # Arguments
     ///
@@ -309,11 +309,7 @@ impl GolubKahanSvd {
 
         // Sort by descending singular value
         let mut indices: Vec<usize> = (0..k).collect();
-        indices.sort_by(|&a_idx, &b_idx| {
-            diag[b_idx]
-                .partial_cmp(&diag[a_idx])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        indices.sort_by(|&a_idx, &b_idx| diag[b_idx].total_cmp(&diag[a_idx]));
 
         let sorted_s: Vec<f64> = indices.iter().map(|&i| diag[i]).collect();
 

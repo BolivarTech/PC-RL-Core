@@ -692,7 +692,7 @@ The [27,27,18] configuration with λ=0.9999 and 200k episodes is the first 3-lay
 
 ```bash
 # Run the full experiment (35 seeds x 6 lambdas = 210 runs)
-cargo run --release -- experiment -n 35 -c pc_tictactoe/config.toml
+cargo run --release -- experiment -n 35 -c config.toml
 
 # Results are saved to experiment.txt with summary table
 ```

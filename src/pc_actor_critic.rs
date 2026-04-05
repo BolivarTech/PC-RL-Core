@@ -250,6 +250,12 @@ impl<L: LinAlg> PcActorCritic<L> {
                 config.gamma
             )));
         }
+        if config.adaptive_surprise && config.surprise_buffer_size < 10 {
+            return Err(PcError::ConfigValidation(format!(
+                "surprise_buffer_size must be >= 10 when adaptive_surprise is enabled, got {}",
+                config.surprise_buffer_size
+            )));
+        }
 
         use rand::SeedableRng;
         let mut rng = StdRng::seed_from_u64(seed);
@@ -1240,6 +1246,20 @@ mod tests {
             .map(|_: PcActorCritic| ())
             .unwrap_err();
         assert!(format!("{err}").contains("gamma"));
+    }
+
+    #[test]
+    fn test_new_returns_error_surprise_buffer_size_zero() {
+        let mut config = default_config();
+        config.adaptive_surprise = true;
+        config.surprise_buffer_size = 0;
+        let result = PcActorCritic::new(config, 42).map(|_: PcActorCritic| ());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err}").contains("surprise_buffer_size"),
+            "Expected surprise_buffer_size error, got: {err}"
+        );
     }
 
     // ── Phase 4 Cycle 4.1: ActivationCache construction and recording ──
