@@ -6,7 +6,6 @@ Cargo.lock
 .claude/
 CLAUDE.md
 CLAUDE.local.md
-CLAUDE.local.tictactoe.md
 
 # Superpowers
 docs/superpowers/

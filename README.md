@@ -16,7 +16,7 @@ The library is **backend-agnostic**: all linear algebra operations are abstracte
 
 ```toml
 [dependencies]
-pc-rl-core = "1.2.1"
+pc-rl-core = "1.2.2"
 ```
 
 ## Quick Start
@@ -53,15 +53,15 @@ let config = PcActorCriticConfig {
     ..Default::default()
 };
 
-let mut agent = PcActorCriticCpu::new(config);
+let mut agent = PcActorCriticCpu::new(config, 42)?;
 
-// Training loop
-let action = agent.act(&state, SelectionMode::Training);
-// ... execute action in environment, collect rewards ...
-agent.learn_episode(&states, &actions, &rewards);
+// Training loop: act, collect trajectory steps, learn
+let (action, infer_result) = agent.act(&state, &valid_actions, SelectionMode::Training);
+// ... execute action in environment, collect TrajectoryStep per timestep ...
+let avg_loss = agent.learn(&trajectory);
 
 // Evaluation (deterministic)
-let action = agent.act(&state, SelectionMode::Play);
+let (action, _) = agent.act(&state, &valid_actions, SelectionMode::Play);
 ```
 
 ## Architecture
@@ -88,7 +88,7 @@ let action = agent.act(&state, SelectionMode::Play);
 ### Type Aliases
 
 ```rust
-type PcActorCpu = PcActorCritic<CpuLinAlg>;
+type PcActorCpu = PcActor<CpuLinAlg>;
 type MlpCriticCpu = MlpCritic<CpuLinAlg>;
 type PcActorCriticCpu = PcActorCritic<CpuLinAlg>;
 type LayerCpu = Layer<CpuLinAlg>;
