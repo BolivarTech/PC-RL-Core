@@ -32,25 +32,35 @@ let actor_config = PcActorConfig {
     input_size: 9,
     output_size: 9,
     hidden_layers: vec![LayerDef { size: 27, activation: Activation::Softsign }],
+    output_activation: Activation::Linear,
     alpha: 0.03,
+    tol: 0.01,
+    min_steps: 1,
     max_steps: 5,
     lr_weights: 0.005,
+    synchronous: true,
+    temperature: 1.0,
     local_lambda: 0.99,
-    output_activation: Activation::Linear,
-    ..Default::default()
+    residual: false,
+    rezero_init: 0.001,
 };
 
 let critic_config = MlpCriticConfig {
     input_size: 36,  // state_dim + latent_dim
     hidden_layers: vec![LayerDef { size: 36, activation: Activation::Softsign }],
+    output_activation: Activation::Linear,
     lr: 0.005,
-    ..Default::default()
 };
 
 let config = PcActorCriticConfig {
     actor: actor_config,
     critic: critic_config,
-    ..Default::default()
+    gamma: 0.99,
+    surprise_low: 0.02,
+    surprise_high: 0.15,
+    adaptive_surprise: true,
+    surprise_buffer_size: 400,
+    entropy_coeff: 0.0,
 };
 
 let mut agent = PcActorCriticCpu::new(config, 42)?;
