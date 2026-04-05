@@ -1,12 +1,12 @@
 # Build
 /target
-.claude/tdd-guard/data/
 Cargo.lock
 
 # Claude Files
 .claude/
 CLAUDE.md
 CLAUDE.local.md
+CLAUDE.local.tictactoe.md
 
 # Superpowers
 docs/superpowers/
@@ -16,18 +16,5 @@ docs/superpowers/
 *.swp
 *.swo
 
-# Model files
-model.json
-*.json.bak
-
 # Session files
 .remember/
-experiment.txt
-Experiments/
-
-# Ralph-Loop
-/plans
-/scripts
-/planning
-BLOCKED.md
-run-tests.sh
