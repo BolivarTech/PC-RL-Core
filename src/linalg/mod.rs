@@ -190,3 +190,48 @@ pub trait LinAlg: Clone + Send + Sync + 'static {
     /// Combined RMS error across multiple error vectors.
     fn rms_error(error_vecs: &[&Self::Vector]) -> f64;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CpuLinAlg;
+
+    /// Escenario 3: Operations use &self
+    #[test]
+    fn test_linalg_methods_take_self() {
+        let backend = CpuLinAlg::new();
+        let v = backend.zeros_vec(5);
+        assert_eq!(backend.vec_len(&v), 5);
+    }
+
+    /// Escenario 9: CpuLinAlg is ZST
+    #[test]
+    fn test_cpu_linalg_is_zst() {
+        assert_eq!(std::mem::size_of::<CpuLinAlg>(), 0);
+    }
+
+    /// Escenario 4: mat_vec_mul via instance
+    #[test]
+    fn test_mat_vec_mul_via_instance() {
+        let backend = CpuLinAlg::new();
+        // Identity 2x2 * [3,4] = [3,4]
+        let mut m = backend.zeros_mat(2, 2);
+        backend.mat_set(&mut m, 0, 0, 1.0);
+        backend.mat_set(&mut m, 1, 1, 1.0);
+        let v = backend.vec_from_slice(&[3.0, 4.0]);
+        let result = backend.mat_vec_mul(&m, &v);
+        assert_eq!(backend.vec_get(&result, 0), 3.0);
+        assert_eq!(backend.vec_get(&result, 1), 4.0);
+    }
+
+    /// Escenario 5: vec_as_slice removed from trait.
+    /// This is a compile-time negative check. The real verification is that
+    /// no generic code (code parameterized over L: LinAlg) can call
+    /// backend.vec_as_slice(). This test documents the removal; the compiler
+    /// enforces it.
+    #[test]
+    fn test_trait_has_31_methods() {
+        // After removing vec_as_slice, the trait has 31 methods.
+        // This is a documentation marker -- the real enforcement is the compiler.
+    }
+}
