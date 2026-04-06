@@ -15,5 +15,9 @@ docs/superpowers/
 *.swp
 *.swo
 
+# SBTDD runtime
+.claude/tdd-guard/data/
+BLOCKED.md
+
 # Session files
 .remember/
