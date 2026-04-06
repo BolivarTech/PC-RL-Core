@@ -255,8 +255,8 @@ impl<L: LinAlg> MlpCritic<L> {
                 let vb = parent_a.backend.mat_get(&b_out_permuted, 0, c);
                 parent_a.backend.mat_set(&mut weights, 0, c, alpha * va + (1.0 - alpha) * vb);
             }
-            let ba = self.backend.vec_get(&a_out.bias, 0);
-            let bb = self.backend.vec_get(&b_out.bias, 0);
+            let ba = parent_a.backend.vec_get(&a_out.bias, 0);
+            let bb = parent_a.backend.vec_get(&b_out.bias, 0);
             parent_a.backend.vec_set(&mut biases, 0, alpha * ba + (1.0 - alpha) * bb);
             layers.push(Layer {
                 weights,
@@ -501,7 +501,7 @@ impl<L: LinAlg> MlpCritic<L> {
                         );
                     }
                 }
-                let generic_bias = self.backend.vec_from_slice(&cpu_layer.bias);
+                let generic_bias = backend.vec_from_slice(&cpu_layer.bias);
                 Layer {
                     weights: generic_weights,
                     bias: generic_bias,

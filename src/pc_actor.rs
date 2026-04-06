@@ -240,6 +240,8 @@ pub struct PcActor<L: LinAlg = CpuLinAlg> {
     /// Projection matrices for skip connections between layers of different sizes.
     /// One entry per skip layer: `None` for identity (same size), `Some(Matrix)` for projection.
     pub(crate) skip_projections: Vec<Option<L::Matrix>>,
+    /// Backend used for linear algebra operations.
+    pub(crate) backend: L,
 }
 
 impl<L: LinAlg> PcActor<L> {
@@ -254,7 +256,7 @@ impl<L: LinAlg> PcActor<L> {
     ///
     /// Returns `PcError::ConfigValidation` if `input_size`, `output_size`,
     /// or `temperature` are invalid.
-    pub fn new(config: PcActorConfig, rng: &mut impl Rng) -> Result<Self, PcError> {
+    pub fn new(backend: L, config: PcActorConfig, rng: &mut impl Rng) -> Result<Self, PcError> {
         if config.input_size == 0 {
             return Err(PcError::ConfigValidation("input_size must be > 0".into()));
         }
@@ -283,7 +285,7 @@ impl<L: LinAlg> PcActor<L> {
         let mut prev_size = config.input_size;
 
         for def in &config.hidden_layers {
-            layers.push(Layer::<L>::new(prev_size, def.size, def.activation, rng));
+            layers.push(Layer::<L>::new(prev_size, def.size, def.activation, &backend, rng));
             prev_size = def.size;
         }
 
@@ -292,6 +294,7 @@ impl<L: LinAlg> PcActor<L> {
             prev_size,
             config.output_size,
             config.output_activation,
+            &backend,
             rng,
         ));
 
@@ -302,7 +305,7 @@ impl<L: LinAlg> PcActor<L> {
             for i in 1..config.hidden_layers.len() {
                 alphas.push(config.rezero_init);
                 if config.hidden_layers[i].size != config.hidden_layers[i - 1].size {
-                    projs.push(Some(L::xavier_mat(
+                    projs.push(Some(backend.xavier_mat(
                         config.hidden_layers[i].size,
                         config.hidden_layers[i - 1].size,
                         rng,
@@ -321,6 +324,7 @@ impl<L: LinAlg> PcActor<L> {
             config,
             rezero_alpha,
             skip_projections,
+            backend,
         })
     }
 
@@ -372,14 +376,14 @@ impl<L: LinAlg> PcActor<L> {
         {
             let cache_a_0 = caches_a.first();
             let cache_b_0 = caches_b.first();
-            let (layer, perm) = cca_align_and_blend_layer::<L>(
+            let (layer, perm) = cca_align_and_blend_layer(&parent_a.backend,
                 &parent_a.layers[0],
                 &parent_b.layers[0],
                 cache_a_0,
                 cache_b_0,
                 None, // No previous perm for first layer
                 child_h0.size,
-                L::mat_cols(&parent_a.layers[0].weights),
+                parent_a.backend.mat_cols(&parent_a.layers[0].weights),
                 child_h0.activation,
                 alpha,
                 rng,
@@ -391,6 +395,7 @@ impl<L: LinAlg> PcActor<L> {
                 child_config.input_size,
                 child_h0.size,
                 child_h0.activation,
+                &parent_a.backend,
                 rng,
             ));
         }
@@ -406,7 +411,7 @@ impl<L: LinAlg> PcActor<L> {
             if a_has && b_has {
                 let cache_a_h = caches_a.get(h_idx);
                 let cache_b_h = caches_b.get(h_idx);
-                let (layer, perm) = cca_align_and_blend_layer::<L>(
+                let (layer, perm) = cca_align_and_blend_layer(&parent_a.backend,
                     &parent_a.layers[h_idx],
                     &parent_b.layers[h_idx],
                     cache_a_h,
@@ -425,6 +430,7 @@ impl<L: LinAlg> PcActor<L> {
                     prev_child_size,
                     child_def.size,
                     child_def.activation,
+                    &parent_a.backend,
                     rng,
                 ));
                 prev_perm = None;
@@ -435,42 +441,44 @@ impl<L: LinAlg> PcActor<L> {
         let last_child_hidden = child_config.hidden_layers.last().map(|d| d.size).unwrap();
         let a_out = parent_a.layers.last().unwrap();
         let b_out = parent_b.layers.last().unwrap();
-        let a_out_in = L::mat_cols(&a_out.weights);
-        let b_out_in = L::mat_cols(&b_out.weights);
+        let a_out_in = parent_a.backend.mat_cols(&a_out.weights);
+        let b_out_in = parent_a.backend.mat_cols(&b_out.weights);
 
         if a_out_in == last_child_hidden && b_out_in == last_child_hidden {
             // Positional crossover with column permutation from last hidden layer
             let b_out_permuted = if let Some(ref pp) = prev_perm {
-                permute_cols::<L>(&b_out.weights, pp)
+                permute_cols(&parent_a.backend, &b_out.weights, pp)
             } else {
                 b_out.weights.clone()
             };
             let out_rows = child_config.output_size;
-            let mut weights = L::zeros_mat(out_rows, last_child_hidden);
-            let mut biases = L::zeros_vec(out_rows);
+            let mut weights = parent_a.backend.zeros_mat(out_rows, last_child_hidden);
+            let mut biases = parent_a.backend.zeros_vec(out_rows);
             let blend_rows = out_rows
-                .min(L::mat_rows(&a_out.weights))
-                .min(L::mat_rows(&b_out_permuted));
+                .min(parent_a.backend.mat_rows(&a_out.weights))
+                .min(parent_a.backend.mat_rows(&b_out_permuted));
             for r in 0..blend_rows {
                 for c in 0..last_child_hidden {
-                    let va = L::mat_get(&a_out.weights, r, c);
-                    let vb = L::mat_get(&b_out_permuted, r, c);
-                    L::mat_set(&mut weights, r, c, alpha * va + (1.0 - alpha) * vb);
+                    let va = parent_a.backend.mat_get(&a_out.weights, r, c);
+                    let vb = parent_a.backend.mat_get(&b_out_permuted, r, c);
+                    parent_a.backend.mat_set(&mut weights, r, c, alpha * va + (1.0 - alpha) * vb);
                 }
-                let ba = L::vec_get(&a_out.bias, r);
-                let bb = L::vec_get(&b_out.bias, r);
-                L::vec_set(&mut biases, r, alpha * ba + (1.0 - alpha) * bb);
+                let ba = parent_a.backend.vec_get(&a_out.bias, r);
+                let bb = parent_a.backend.vec_get(&b_out.bias, r);
+                parent_a.backend.vec_set(&mut biases, r, alpha * ba + (1.0 - alpha) * bb);
             }
             layers.push(Layer {
                 weights,
                 bias: biases,
                 activation: child_config.output_activation,
+                backend: parent_a.backend.clone(),
             });
         } else {
             layers.push(Layer::<L>::new(
                 last_child_hidden,
                 child_config.output_size,
                 child_config.output_activation,
+                &parent_a.backend,
                 rng,
             ));
         }
@@ -508,26 +516,26 @@ impl<L: LinAlg> PcActor<L> {
                         .get(i - 1)
                         .and_then(|p| p.as_ref());
                     if let (Some(ap), Some(bp)) = (a_proj, b_proj) {
-                        if L::mat_rows(ap) == cur_size
-                            && L::mat_cols(ap) == prev_size
-                            && L::mat_rows(bp) == cur_size
-                            && L::mat_cols(bp) == prev_size
+                        if parent_a.backend.mat_rows(ap) == cur_size
+                            && parent_a.backend.mat_cols(ap) == prev_size
+                            && parent_a.backend.mat_rows(bp) == cur_size
+                            && parent_a.backend.mat_cols(bp) == prev_size
                         {
                             // Blend projections
-                            let mut proj = L::zeros_mat(cur_size, prev_size);
+                            let mut proj = parent_a.backend.zeros_mat(cur_size, prev_size);
                             for r in 0..cur_size {
                                 for c in 0..prev_size {
-                                    let va = L::mat_get(ap, r, c);
-                                    let vb = L::mat_get(bp, r, c);
-                                    L::mat_set(&mut proj, r, c, alpha * va + (1.0 - alpha) * vb);
+                                    let va = parent_a.backend.mat_get(ap, r, c);
+                                    let vb = parent_a.backend.mat_get(bp, r, c);
+                                    parent_a.backend.mat_set(&mut proj, r, c, alpha * va + (1.0 - alpha) * vb);
                                 }
                             }
                             projs.push(Some(proj));
                         } else {
-                            projs.push(Some(L::xavier_mat(cur_size, prev_size, rng)));
+                            projs.push(Some(parent_a.backend.xavier_mat(cur_size, prev_size, rng)));
                         }
                     } else {
-                        projs.push(Some(L::xavier_mat(cur_size, prev_size, rng)));
+                        projs.push(Some(parent_a.backend.xavier_mat(cur_size, prev_size, rng)));
                     }
                 } else {
                     projs.push(None);
@@ -543,6 +551,7 @@ impl<L: LinAlg> PcActor<L> {
             config: child_config,
             rezero_alpha,
             skip_projections,
+            backend: parent_a.backend.clone(),
         })
     }
 
@@ -584,7 +593,7 @@ impl<L: LinAlg> PcActor<L> {
             self.config.input_size
         );
 
-        let input_vec = L::vec_from_slice(input);
+        let input_vec = self.backend.vec_from_slice(input);
         let n_hidden = self.config.hidden_layers.len();
 
         // Forward pass to initialize hidden states and output
@@ -595,13 +604,13 @@ impl<L: LinAlg> PcActor<L> {
             let tanh_out = layer.forward(&prev);
             if let Some(alpha_idx) = self.skip_alpha_index(i) {
                 let alpha = self.rezero_alpha[alpha_idx];
-                let scaled = L::vec_scale(&tanh_out, alpha);
+                let scaled = self.backend.vec_scale(&tanh_out, alpha);
                 let skip_path = if let Some(ref proj) = self.skip_projections[alpha_idx] {
-                    L::mat_vec_mul(proj, &prev)
+                    self.backend.mat_vec_mul(proj, &prev)
                 } else {
                     prev.clone()
                 };
-                prev = L::vec_add(&skip_path, &scaled);
+                prev = self.backend.vec_add(&skip_path, &scaled);
                 tanh_components.push(Some(tanh_out));
             } else {
                 prev = tanh_out;
@@ -668,10 +677,10 @@ impl<L: LinAlg> PcActor<L> {
                 let prediction = self.layers[i + 1]
                     .transpose_forward(state_above, self.config.hidden_layers[i].activation);
 
-                let error = L::vec_sub(&prediction, &target);
+                let error = self.backend.vec_sub(&prediction, &target);
                 error_vecs.push(error.clone());
 
-                let updated_target = L::vec_add(&target, &L::vec_scale(&error, self.config.alpha));
+                let updated_target = self.backend.vec_add(&target, &self.backend.vec_scale(&error, self.config.alpha));
                 if let Some(alpha_idx) = self.skip_alpha_index(i) {
                     tanh_components[i] = Some(updated_target.clone());
                     let alpha = self.rezero_alpha[alpha_idx];
@@ -681,12 +690,12 @@ impl<L: LinAlg> PcActor<L> {
                         &input_vec
                     };
                     let skip_path = if let Some(ref proj) = self.skip_projections[alpha_idx] {
-                        L::mat_vec_mul(proj, prev_h)
+                        self.backend.mat_vec_mul(proj, prev_h)
                     } else {
                         prev_h.clone()
                     };
                     hidden_states[i] =
-                        L::vec_add(&skip_path, &L::vec_scale(&updated_target, alpha));
+                        self.backend.vec_add(&skip_path, &self.backend.vec_scale(&updated_target, alpha));
                 } else {
                     hidden_states[i] = updated_target;
                 }
@@ -700,7 +709,7 @@ impl<L: LinAlg> PcActor<L> {
             y = self.layers[n_hidden].forward(top_hidden);
 
             let refs: Vec<&L::Vector> = error_vecs.iter().collect();
-            surprise_score = L::rms_error(&refs);
+            surprise_score = self.backend.rms_error(&refs);
             last_errors = error_vecs;
 
             // Convergence check (alpha must be > 0 for meaningful convergence)
@@ -716,9 +725,9 @@ impl<L: LinAlg> PcActor<L> {
         // Build latent_concat (uses vec_to_vec for GPU compatibility)
         let mut latent_raw: Vec<f64> = Vec::new();
         for h in &hidden_states {
-            latent_raw.extend_from_slice(&L::vec_to_vec(h));
+            latent_raw.extend_from_slice(&self.backend.vec_to_vec(h));
         }
-        let latent_concat = L::vec_from_slice(&latent_raw);
+        let latent_concat = self.backend.vec_from_slice(&latent_raw);
 
         InferResult {
             y_conv: y,
@@ -754,13 +763,13 @@ impl<L: LinAlg> PcActor<L> {
         assert!(!valid_actions.is_empty(), "valid_actions must not be empty");
 
         // Scale logits by temperature
-        let scaled = L::vec_scale(y_conv, 1.0 / self.config.temperature);
+        let scaled = self.backend.vec_scale(y_conv, 1.0 / self.config.temperature);
 
-        let probs = L::softmax_masked(&scaled, valid_actions);
+        let probs = self.backend.softmax_masked(&scaled, valid_actions);
 
         match mode {
-            SelectionMode::Play => L::argmax_masked(&probs, valid_actions),
-            SelectionMode::Training => L::sample_from_probs(&probs, valid_actions, rng),
+            SelectionMode::Play => self.backend.argmax_masked(&probs, valid_actions),
+            SelectionMode::Training => self.backend.sample_from_probs(&probs, valid_actions, rng),
         }
     }
 
@@ -821,8 +830,8 @@ impl<L: LinAlg> PcActor<L> {
         surprise_scale: f64,
         lambda: f64,
     ) {
-        let input_vec = L::vec_from_slice(input);
-        let output_delta_vec = L::vec_from_slice(output_delta);
+        let input_vec = self.backend.vec_from_slice(input);
+        let output_delta_vec = self.backend.vec_from_slice(output_delta);
         let n_hidden = self.config.hidden_layers.len();
         let n_layers = self.layers.len();
 
@@ -858,9 +867,9 @@ impl<L: LinAlg> PcActor<L> {
             } else {
                 let error_idx = n_hidden - 1 - i;
                 let pc_error = &infer_result.prediction_errors[error_idx];
-                let bp_scaled = L::vec_scale(&bp_delta, lambda);
-                let pc_scaled = L::vec_scale(pc_error, 1.0 - lambda);
-                L::vec_add(&bp_scaled, &pc_scaled)
+                let bp_scaled = self.backend.vec_scale(&bp_delta, lambda);
+                let pc_scaled = self.backend.vec_scale(pc_error, 1.0 - lambda);
+                self.backend.vec_add(&bp_scaled, &pc_scaled)
             };
 
             if let Some(alpha_idx) = self.skip_alpha_index(i) {
@@ -871,7 +880,7 @@ impl<L: LinAlg> PcActor<L> {
                 let effective_lr = self.config.lr_weights * surprise_scale;
 
                 // Scale delta by rezero_alpha for the nonlinear path
-                let scaled_delta = L::vec_scale(&effective_delta, alpha);
+                let scaled_delta = self.backend.vec_scale(&effective_delta, alpha);
 
                 // Backward through the layer using tanh_out (not hidden_states[i])
                 let propagated = self.layers[i].backward(
@@ -883,21 +892,21 @@ impl<L: LinAlg> PcActor<L> {
                 );
 
                 // Update rezero_alpha: dL/d(alpha) = delta · tanh_out
-                let grad_alpha: f64 = L::vec_dot(&effective_delta, tanh_out);
+                let grad_alpha: f64 = self.backend.vec_dot(&effective_delta, tanh_out);
                 self.rezero_alpha[alpha_idx] -= effective_lr * grad_alpha;
 
                 // Propagated delta = nonlinear path + skip path (identity or projection)
                 if let Some(ref mut proj) = self.skip_projections[alpha_idx] {
                     // Projection path: W_proj^T × delta
-                    let proj_t = L::mat_transpose(proj);
-                    let skip_delta = L::mat_vec_mul(&proj_t, &effective_delta);
+                    let proj_t = self.backend.mat_transpose(proj);
+                    let skip_delta = self.backend.mat_vec_mul(&proj_t, &effective_delta);
                     // Update projection: W_proj -= lr × outer(delta, layer_input)
-                    let dw_proj = L::outer_product(&effective_delta, layer_input);
-                    L::mat_scale_add(proj, &dw_proj, -effective_lr);
-                    bp_delta = L::vec_add(&propagated, &skip_delta);
+                    let dw_proj = self.backend.outer_product(&effective_delta, layer_input);
+                    self.backend.mat_scale_add(proj, &dw_proj, -effective_lr);
+                    bp_delta = self.backend.vec_add(&propagated, &skip_delta);
                 } else {
                     // Identity path: + delta
-                    bp_delta = L::vec_add(&propagated, &effective_delta);
+                    bp_delta = self.backend.vec_add(&propagated, &effective_delta);
                 }
             } else {
                 // Standard layer: use hidden_states[i] as output
@@ -921,19 +930,20 @@ impl<L: LinAlg> PcActor<L> {
             .layers
             .iter()
             .map(|layer| {
-                let rows = L::mat_rows(&layer.weights);
-                let cols = L::mat_cols(&layer.weights);
+                let rows = self.backend.mat_rows(&layer.weights);
+                let cols = self.backend.mat_cols(&layer.weights);
                 let mut cpu_weights = crate::matrix::Matrix::zeros(rows, cols);
                 for r in 0..rows {
                     for c in 0..cols {
-                        cpu_weights.set(r, c, L::mat_get(&layer.weights, r, c));
+                        cpu_weights.set(r, c, self.backend.mat_get(&layer.weights, r, c));
                     }
                 }
-                let bias_data = L::vec_to_vec(&layer.bias);
+                let bias_data = self.backend.vec_to_vec(&layer.bias);
                 Layer {
                     weights: cpu_weights,
                     bias: bias_data,
                     activation: layer.activation,
+                    backend: CpuLinAlg::new(),
                 }
             })
             .collect();
@@ -942,12 +952,12 @@ impl<L: LinAlg> PcActor<L> {
             .iter()
             .map(|opt| {
                 opt.as_ref().map(|m| {
-                    let rows = L::mat_rows(m);
-                    let cols = L::mat_cols(m);
+                    let rows = self.backend.mat_rows(m);
+                    let cols = self.backend.mat_cols(m);
                     let mut cpu_m = crate::matrix::Matrix::zeros(rows, cols);
                     for r in 0..rows {
                         for c in 0..cols {
-                            cpu_m.set(r, c, L::mat_get(m, r, c));
+                            cpu_m.set(r, c, self.backend.mat_get(m, r, c));
                         }
                     }
                     cpu_m
@@ -972,6 +982,7 @@ impl<L: LinAlg> PcActor<L> {
     /// Returns `PcError::DimensionMismatch` if any weight matrix or bias
     /// vector has dimensions inconsistent with the config topology.
     pub fn from_weights(
+        backend: L,
         config: PcActorConfig,
         weights: crate::serializer::PcActorWeights,
     ) -> Result<Self, PcError> {
@@ -1062,17 +1073,18 @@ impl<L: LinAlg> PcActor<L> {
             .map(|cpu_layer| {
                 let rows = cpu_layer.weights.rows;
                 let cols = cpu_layer.weights.cols;
-                let mut mat = L::zeros_mat(rows, cols);
+                let mut mat = backend.zeros_mat(rows, cols);
                 for r in 0..rows {
                     for c in 0..cols {
-                        L::mat_set(&mut mat, r, c, cpu_layer.weights.get(r, c));
+                        backend.mat_set(&mut mat, r, c, cpu_layer.weights.get(r, c));
                     }
                 }
-                let bias = L::vec_from_slice(&cpu_layer.bias);
+                let bias = backend.vec_from_slice(&cpu_layer.bias);
                 Layer {
                     weights: mat,
                     bias,
                     activation: cpu_layer.activation,
+                    backend: backend.clone(),
                 }
             })
             .collect();
@@ -1083,10 +1095,10 @@ impl<L: LinAlg> PcActor<L> {
                 opt.map(|cpu_m| {
                     let rows = cpu_m.rows;
                     let cols = cpu_m.cols;
-                    let mut mat = L::zeros_mat(rows, cols);
+                    let mut mat = backend.zeros_mat(rows, cols);
                     for r in 0..rows {
                         for c in 0..cols {
-                            L::mat_set(&mut mat, r, c, cpu_m.get(r, c));
+                            backend.mat_set(&mut mat, r, c, cpu_m.get(r, c));
                         }
                     }
                     mat
@@ -1098,28 +1110,29 @@ impl<L: LinAlg> PcActor<L> {
             config,
             rezero_alpha: weights.rezero_alpha,
             skip_projections,
+            backend,
         })
     }
 }
 
 /// Permute columns of a weight matrix according to a permutation.
 /// `perm[i]` = source column index for destination column i.
-pub(crate) fn permute_cols<L: LinAlg>(m: &L::Matrix, perm: &[usize]) -> L::Matrix {
-    let rows = L::mat_rows(m);
-    let cols = L::mat_cols(m);
+pub(crate) fn permute_cols<L: LinAlg>(backend: &L, m: &L::Matrix, perm: &[usize]) -> L::Matrix {
+    let rows = backend.mat_rows(m);
+    let cols = backend.mat_cols(m);
     let perm_len = perm.len();
-    let mut result = L::zeros_mat(rows, cols);
+    let mut result = backend.zeros_mat(rows, cols);
     for (dst, &src) in perm.iter().enumerate().take(cols.min(perm_len)) {
         if src < cols {
             for r in 0..rows {
-                L::mat_set(&mut result, r, dst, L::mat_get(m, r, src));
+                backend.mat_set(&mut result, r, dst, backend.mat_get(m, r, src));
             }
         }
     }
     // Copy remaining columns (beyond permutation length) in original order
     for dst in perm_len..cols {
         for r in 0..rows {
-            L::mat_set(&mut result, r, dst, L::mat_get(m, r, dst));
+            backend.mat_set(&mut result, r, dst, backend.mat_get(m, r, dst));
         }
     }
     result
@@ -1127,22 +1140,22 @@ pub(crate) fn permute_cols<L: LinAlg>(m: &L::Matrix, perm: &[usize]) -> L::Matri
 
 /// Permute rows of a weight matrix according to a permutation.
 /// `perm[i]` = source row index for destination row i.
-pub(crate) fn permute_rows<L: LinAlg>(m: &L::Matrix, perm: &[usize], n: usize) -> L::Matrix {
-    let cols = L::mat_cols(m);
+pub(crate) fn permute_rows<L: LinAlg>(backend: &L, m: &L::Matrix, perm: &[usize], n: usize) -> L::Matrix {
+    let cols = backend.mat_cols(m);
     let perm_len = perm.len();
-    let mut result = L::zeros_mat(n, cols);
+    let mut result = backend.zeros_mat(n, cols);
     for (dst, &src) in perm.iter().enumerate().take(n.min(perm_len)) {
-        if src < L::mat_rows(m) {
+        if src < backend.mat_rows(m) {
             for c in 0..cols {
-                L::mat_set(&mut result, dst, c, L::mat_get(m, src, c));
+                backend.mat_set(&mut result, dst, c, backend.mat_get(m, src, c));
             }
         }
     }
     // Copy remaining rows (unmatched) in original order
     for dst in perm_len..n {
-        if dst < L::mat_rows(m) {
+        if dst < backend.mat_rows(m) {
             for c in 0..cols {
-                L::mat_set(&mut result, dst, c, L::mat_get(m, dst, c));
+                backend.mat_set(&mut result, dst, c, backend.mat_get(m, dst, c));
             }
         }
     }
@@ -1150,17 +1163,17 @@ pub(crate) fn permute_rows<L: LinAlg>(m: &L::Matrix, perm: &[usize], n: usize) -
 }
 
 /// Permute elements of a bias vector according to a permutation.
-pub(crate) fn permute_vec<L: LinAlg>(v: &L::Vector, perm: &[usize], n: usize) -> L::Vector {
+pub(crate) fn permute_vec<L: LinAlg>(backend: &L, v: &L::Vector, perm: &[usize], n: usize) -> L::Vector {
     let perm_len = perm.len();
-    let mut result = L::zeros_vec(n);
+    let mut result = backend.zeros_vec(n);
     for (dst, &src) in perm.iter().enumerate().take(n.min(perm_len)) {
-        if src < L::vec_len(v) {
-            L::vec_set(&mut result, dst, L::vec_get(v, src));
+        if src < backend.vec_len(v) {
+            backend.vec_set(&mut result, dst, backend.vec_get(v, src));
         }
     }
     for dst in perm_len..n {
-        if dst < L::vec_len(v) {
-            L::vec_set(&mut result, dst, L::vec_get(v, dst));
+        if dst < backend.vec_len(v) {
+            backend.vec_set(&mut result, dst, backend.vec_get(v, dst));
         }
     }
     result
@@ -1174,6 +1187,7 @@ pub(crate) fn permute_vec<L: LinAlg>(v: &L::Vector, perm: &[usize], n: usize) ->
 /// * `child_cols` - Number of columns (input size) for child layer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn blend_layer_weights<L: LinAlg>(
+    backend: &L,
     parent_a: (&L::Matrix, &L::Vector, usize),
     parent_b: (&L::Matrix, &L::Vector, usize),
     n_child: usize,
@@ -1185,24 +1199,24 @@ pub(crate) fn blend_layer_weights<L: LinAlg>(
     let (b_weights, b_biases, n_b) = parent_b;
     let n_min = n_a.min(n_b);
     let n_max = n_a.max(n_b);
-    let a_cols = L::mat_cols(a_weights);
-    let b_cols = L::mat_cols(b_weights);
+    let a_cols = backend.mat_cols(a_weights);
+    let b_cols = backend.mat_cols(b_weights);
     let use_cols = child_cols.min(a_cols).min(b_cols);
 
-    let mut weights = L::zeros_mat(n_child, child_cols);
-    let mut biases = L::zeros_vec(n_child);
+    let mut weights = backend.zeros_mat(n_child, child_cols);
+    let mut biases = backend.zeros_vec(n_child);
 
     // Blending zone [0..min(n_min, n_child))
     let blend_end = n_min.min(n_child);
     for r in 0..blend_end {
         for c in 0..use_cols {
-            let va = L::mat_get(a_weights, r, c);
-            let vb = L::mat_get(b_weights, r, c);
-            L::mat_set(&mut weights, r, c, alpha * va + (1.0 - alpha) * vb);
+            let va = backend.mat_get(a_weights, r, c);
+            let vb = backend.mat_get(b_weights, r, c);
+            backend.mat_set(&mut weights, r, c, alpha * va + (1.0 - alpha) * vb);
         }
-        let ba = L::vec_get(a_biases, r);
-        let bb = L::vec_get(b_biases, r);
-        L::vec_set(&mut biases, r, alpha * ba + (1.0 - alpha) * bb);
+        let ba = backend.vec_get(a_biases, r);
+        let bb = backend.vec_get(b_biases, r);
+        backend.vec_set(&mut biases, r, alpha * ba + (1.0 - alpha) * bb);
     }
 
     // Copy zone [n_min..min(n_max, n_child)) from the larger parent
@@ -1213,21 +1227,21 @@ pub(crate) fn blend_layer_weights<L: LinAlg>(
         } else {
             (b_weights, b_biases)
         };
-        let larger_cols = L::mat_cols(larger_w);
+        let larger_cols = backend.mat_cols(larger_w);
         for r in blend_end..copy_end {
             for c in 0..child_cols.min(larger_cols) {
-                L::mat_set(&mut weights, r, c, L::mat_get(larger_w, r, c));
+                backend.mat_set(&mut weights, r, c, backend.mat_get(larger_w, r, c));
             }
-            L::vec_set(&mut biases, r, L::vec_get(larger_b, r));
+            backend.vec_set(&mut biases, r, backend.vec_get(larger_b, r));
         }
     }
 
     // Xavier zone [n_max..n_child) for new neurons
     if n_child > n_max {
-        let xavier = L::xavier_mat(n_child - n_max, child_cols, rng);
+        let xavier = backend.xavier_mat(n_child - n_max, child_cols, rng);
         for r in n_max..n_child {
             for c in 0..child_cols {
-                L::mat_set(&mut weights, r, c, L::mat_get(&xavier, r - n_max, c));
+                backend.mat_set(&mut weights, r, c, backend.mat_get(&xavier, r - n_max, c));
             }
             // biases stay zero for Xavier zone
         }
@@ -1246,6 +1260,7 @@ pub(crate) fn blend_layer_weights<L: LinAlg>(
 ///   Pass `None` to skip column propagation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cca_align_and_blend_layer<L: LinAlg>(
+    backend: &L,
     a_layer: &Layer<L>,
     b_layer: &Layer<L>,
     cache_a: Option<&L::Matrix>,
@@ -1257,36 +1272,36 @@ pub(crate) fn cca_align_and_blend_layer<L: LinAlg>(
     alpha: f64,
     rng: &mut impl Rng,
 ) -> Result<(Layer<L>, Option<Vec<usize>>), crate::error::PcError> {
-    let n_a = L::mat_rows(&a_layer.weights);
-    let n_b = L::mat_rows(&b_layer.weights);
+    let n_a = backend.mat_rows(&a_layer.weights);
+    let n_b = backend.mat_rows(&b_layer.weights);
 
     // CCA alignment
     let perm = if let (Some(ca), Some(cb)) = (cache_a, cache_b) {
-        Some(crate::matrix::cca_neuron_alignment::<L>(ca, cb)?)
+        Some(crate::matrix::cca_neuron_alignment(backend, ca, cb)?)
     } else {
         None
     };
 
     // Apply previous layer's permutation to columns of parent B
     let b_weights_col = if let Some(pp) = prev_perm {
-        permute_cols::<L>(&b_layer.weights, pp)
+        permute_cols(backend, &b_layer.weights, pp)
     } else {
         b_layer.weights.clone()
     };
 
     // Apply CCA row permutation to parent B
     let b_weights_aligned = if let Some(ref p) = perm {
-        permute_rows::<L>(&b_weights_col, p, n_b)
+        permute_rows(backend, &b_weights_col, p, n_b)
     } else {
         b_weights_col
     };
     let b_bias_aligned = if let Some(ref p) = perm {
-        permute_vec::<L>(&b_layer.bias, p, n_b)
+        permute_vec(backend, &b_layer.bias, p, n_b)
     } else {
         b_layer.bias.clone()
     };
 
-    let (weights, biases) = blend_layer_weights::<L>(
+    let (weights, biases) = blend_layer_weights(backend, 
         (&a_layer.weights, &a_layer.bias, n_a),
         (&b_weights_aligned, &b_bias_aligned, n_b),
         child_rows,
@@ -1300,6 +1315,7 @@ pub(crate) fn cca_align_and_blend_layer<L: LinAlg>(
             weights,
             bias: biases,
             activation: child_activation,
+            backend: backend.clone(),
         },
         perm,
     ))
@@ -1376,7 +1392,7 @@ mod tests {
             min_steps: 3,
             ..default_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert!(result.steps_used >= 3);
     }
@@ -1388,7 +1404,7 @@ mod tests {
             alpha: 0.0,
             ..default_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert!(!result.converged);
         assert_eq!(result.steps_used, 20);
@@ -1480,7 +1496,7 @@ mod tests {
             synchronous: false,
             ..default_config()
         };
-        let inplace_actor: PcActor = PcActor::new(inplace_config, &mut rng2).unwrap();
+        let inplace_actor: PcActor = PcActor::new(CpuLinAlg::new(), inplace_config, &mut rng2).unwrap();
         let sync_result = sync_actor.infer(&[0.0; 9]);
         let inplace_result = inplace_actor.infer(&[0.0; 9]);
         // Both should complete without panic; at least one should converge or use all steps
@@ -1508,13 +1524,13 @@ mod tests {
             max_steps: 3,
             ..default_config()
         };
-        let sync_actor: PcActor = PcActor::new(config.clone(), &mut rng).unwrap();
+        let sync_actor: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng).unwrap();
         let mut rng2 = make_rng();
         let inplace_config = PcActorConfig {
             synchronous: false,
             ..config
         };
-        let inplace_actor: PcActor = PcActor::new(inplace_config, &mut rng2).unwrap();
+        let inplace_actor: PcActor = PcActor::new(CpuLinAlg::new(), inplace_config, &mut rng2).unwrap();
         let input = [1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
         let sync_result = sync_actor.infer(&input);
         let inplace_result = inplace_actor.infer(&input);
@@ -1572,7 +1588,7 @@ mod tests {
             temperature: 5.0,
             ..default_config()
         };
-        let actor: PcActor = PcActor::new(hot_config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), hot_config, &mut rng).unwrap();
         // With high temperature, sampling should visit more actions
         let logits = vec![10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         let valid: Vec<usize> = (0..9).collect();
@@ -1666,7 +1682,7 @@ mod tests {
             hidden_layers: vec![],
             ..default_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let result = actor.infer(&[0.5; 9]);
         assert_eq!(result.y_conv.len(), 9);
         assert!(result.y_conv.iter().all(|v| v.is_finite()));
@@ -1683,7 +1699,7 @@ mod tests {
             input_size: 0,
             ..default_config()
         };
-        let result: Result<PcActor, _> = PcActor::new(config, &mut rng);
+        let result: Result<PcActor, _> = PcActor::new(CpuLinAlg::new(), config, &mut rng);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, crate::error::PcError::ConfigValidation(_)));
@@ -1696,7 +1712,7 @@ mod tests {
             output_size: 0,
             ..default_config()
         };
-        let result: Result<PcActor, _> = PcActor::new(config, &mut rng);
+        let result: Result<PcActor, _> = PcActor::new(CpuLinAlg::new(), config, &mut rng);
         assert!(result.is_err());
     }
 
@@ -1707,7 +1723,7 @@ mod tests {
             temperature: 0.0,
             ..default_config()
         };
-        let result: Result<PcActor, _> = PcActor::new(config, &mut rng);
+        let result: Result<PcActor, _> = PcActor::new(CpuLinAlg::new(), config, &mut rng);
         assert!(result.is_err());
     }
 
@@ -1718,7 +1734,7 @@ mod tests {
             temperature: -1.0,
             ..default_config()
         };
-        let result: Result<PcActor, _> = PcActor::new(config, &mut rng);
+        let result: Result<PcActor, _> = PcActor::new(CpuLinAlg::new(), config, &mut rng);
         assert!(result.is_err());
     }
 
@@ -1744,7 +1760,7 @@ mod tests {
             rezero_init: -0.1,
             ..default_config()
         };
-        let result: Result<PcActor, _> = PcActor::new(config, &mut rng);
+        let result: Result<PcActor, _> = PcActor::new(CpuLinAlg::new(), config, &mut rng);
         assert!(result.is_err());
     }
 
@@ -1765,7 +1781,7 @@ mod tests {
             ],
             ..default_config()
         };
-        let result: Result<PcActor, _> = PcActor::new(config, &mut rng);
+        let result: Result<PcActor, _> = PcActor::new(CpuLinAlg::new(), config, &mut rng);
         assert!(result.is_ok());
     }
 
@@ -1791,7 +1807,7 @@ mod tests {
             ],
             ..default_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         // 2 skips: layer 1 (identity) + layer 2 (projection)
         assert_eq!(actor.rezero_alpha.len(), 2);
     }
@@ -1814,7 +1830,7 @@ mod tests {
             ],
             ..default_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         assert_eq!(actor.rezero_alpha.len(), 1);
         assert_eq!(actor.skip_projections.len(), 1);
         assert!(actor.skip_projections[0].is_some());
@@ -1853,7 +1869,7 @@ mod tests {
             ],
             ..default_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let result = actor.infer(&[0.5; 9]);
         for &v in &result.y_conv {
             assert!(v.is_finite());
@@ -1879,7 +1895,7 @@ mod tests {
             ],
             ..default_config()
         };
-        let result: Result<PcActor, _> = PcActor::new(config, &mut rng);
+        let result: Result<PcActor, _> = PcActor::new(CpuLinAlg::new(), config, &mut rng);
         assert!(result.is_ok());
     }
 
@@ -1935,7 +1951,7 @@ mod tests {
             ],
             ..default_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         assert_eq!(actor.rezero_alpha.len(), 2);
     }
 
@@ -1946,7 +1962,7 @@ mod tests {
             rezero_init: 0.005,
             ..residual_two_hidden_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         assert!((actor.rezero_alpha[0] - 0.005).abs() < 1e-12);
     }
 
@@ -1957,7 +1973,7 @@ mod tests {
             residual: true,
             ..default_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         assert!(actor.rezero_alpha.is_empty());
     }
 
@@ -1968,7 +1984,7 @@ mod tests {
             residual: true,
             ..default_config()
         };
-        let result: Result<PcActor, _> = PcActor::new(config, &mut rng);
+        let result: Result<PcActor, _> = PcActor::new(CpuLinAlg::new(), config, &mut rng);
         assert!(result.is_ok());
     }
 
@@ -1988,7 +2004,7 @@ mod tests {
             residual: false,
             ..two_hidden_config()
         };
-        let actor2: PcActor = PcActor::new(config2, &mut rng2).unwrap();
+        let actor2: PcActor = PcActor::new(CpuLinAlg::new(), config2, &mut rng2).unwrap();
         let result2 = actor2.infer(&input);
 
         for (a, b) in result1.y_conv.iter().zip(result2.y_conv.iter()) {
@@ -2004,7 +2020,7 @@ mod tests {
             alpha: 0.0,
             ..residual_two_hidden_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let result = actor.infer(&[0.5; 9]);
         let h0 = &result.hidden_states[0];
         let h1 = &result.hidden_states[1];
@@ -2046,7 +2062,7 @@ mod tests {
             max_steps: 5,
             ..residual_two_hidden_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let result = actor.infer(&[0.5; 9]);
         assert!(result.steps_used > 0);
         assert!(result.steps_used <= 5);
@@ -2098,7 +2114,7 @@ mod tests {
             ],
             ..default_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let result = actor.infer(&[0.5; 9]);
         for &v in &result.y_conv {
             assert!(v.is_finite());
@@ -2132,7 +2148,7 @@ mod tests {
             min_steps: 1,
             ..residual_two_hidden_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let result = actor.infer(&[1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5]);
         // With proper PC predictions, surprise should be finite and non-negative
         assert!(result.surprise_score.is_finite());
@@ -2162,7 +2178,7 @@ mod tests {
             residual: false,
             ..two_hidden_config()
         };
-        let mut actor2: PcActor = PcActor::new(config2, &mut rng2).unwrap();
+        let mut actor2: PcActor = PcActor::new(CpuLinAlg::new(), config2, &mut rng2).unwrap();
         let infer2 = actor2.infer(&input);
         actor2.update_weights(&delta, &infer2, &input, 1.0);
 
@@ -2240,7 +2256,7 @@ mod tests {
             ],
             ..default_config()
         };
-        let mut actor1: PcActor = PcActor::new(config1, &mut rng1).unwrap();
+        let mut actor1: PcActor = PcActor::new(CpuLinAlg::new(), config1, &mut rng1).unwrap();
         let w0_before1 = actor1.layers[0].weights.data.clone();
         let infer1 = actor1.infer(&input);
         actor1.update_weights(&delta, &infer1, &input, 1.0);
@@ -2258,7 +2274,7 @@ mod tests {
             rezero_init: 1.0,
             ..residual_two_hidden_config()
         };
-        let mut actor2: PcActor = PcActor::new(config2, &mut rng2).unwrap();
+        let mut actor2: PcActor = PcActor::new(CpuLinAlg::new(), config2, &mut rng2).unwrap();
         let w0_before2 = actor2.layers[0].weights.data.clone();
         let infer2 = actor2.infer(&input);
         actor2.update_weights(&delta, &infer2, &input, 1.0);
@@ -2283,7 +2299,7 @@ mod tests {
             local_lambda: 0.99,
             ..residual_two_hidden_config()
         };
-        let mut actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let input = vec![0.5; 9];
         let infer_result = actor.infer(&input);
         let w0_before = actor.layers[0].weights.data.clone();
@@ -2321,7 +2337,7 @@ mod tests {
             hidden_layers: vec![],
             ..default_config()
         };
-        let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let result = actor.infer(&[0.5; 9]);
         assert!(result.prediction_errors.is_empty());
     }
@@ -2352,7 +2368,7 @@ mod tests {
         let mut rng = make_rng();
         let config = local_learning_config();
         assert!((config.local_lambda).abs() < f64::EPSILON);
-        let actor: Result<PcActor, _> = PcActor::new(config, &mut rng);
+        let actor: Result<PcActor, _> = PcActor::new(CpuLinAlg::new(), config, &mut rng);
         assert!(actor.is_ok());
     }
 
@@ -2393,7 +2409,7 @@ mod tests {
             local_lambda: 0.0,
             ..two_hidden_config()
         };
-        let mut actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let input = vec![0.5; 9];
         let infer_result = actor.infer(&input);
         let w0_before = actor.layers[0].weights.data.clone();
@@ -2556,7 +2572,7 @@ mod tests {
     fn test_local_lambda_negative_returns_error() {
         let mut rng = make_rng();
         let config = hybrid_config(-0.1);
-        let result: Result<PcActor, _> = PcActor::new(config, &mut rng);
+        let result: Result<PcActor, _> = PcActor::new(CpuLinAlg::new(), config, &mut rng);
         assert!(result.is_err());
     }
 
@@ -2564,7 +2580,7 @@ mod tests {
     fn test_local_lambda_above_one_returns_error() {
         let mut rng = make_rng();
         let config = hybrid_config(1.1);
-        let result: Result<PcActor, _> = PcActor::new(config, &mut rng);
+        let result: Result<PcActor, _> = PcActor::new(CpuLinAlg::new(), config, &mut rng);
         assert!(result.is_err());
     }
 
@@ -2615,10 +2631,10 @@ mod tests {
         let samples = &cache_layers[layer_idx];
         let batch_size = samples.len();
         let n_neurons = samples[0].len();
-        let mut mat = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let mut mat = CpuLinAlg::new().zeros_mat(batch_size, n_neurons);
         for (r, sample) in samples.iter().enumerate() {
             for (c, &val) in sample.iter().enumerate() {
-                CpuLinAlg::mat_set(&mut mat, r, c, val);
+                CpuLinAlg::new().mat_set(&mut mat, r, c, val);
             }
         }
         mat
@@ -2629,8 +2645,8 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = crossover_config_27();
-        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 50);
         let caches_b = make_caches_for_actor(&actor_b, 50);
@@ -2653,12 +2669,12 @@ mod tests {
         assert_eq!(child.layers.len(), actor_a.layers.len());
         for (i, layer) in child.layers.iter().enumerate() {
             assert_eq!(
-                CpuLinAlg::mat_rows(&layer.weights),
-                CpuLinAlg::mat_rows(&actor_a.layers[i].weights)
+                CpuLinAlg::new().mat_rows(&layer.weights),
+                CpuLinAlg::new().mat_rows(&actor_a.layers[i].weights)
             );
             assert_eq!(
-                CpuLinAlg::mat_cols(&layer.weights),
-                CpuLinAlg::mat_cols(&actor_a.layers[i].weights)
+                CpuLinAlg::new().mat_cols(&layer.weights),
+                CpuLinAlg::new().mat_cols(&actor_a.layers[i].weights)
             );
         }
     }
@@ -2668,8 +2684,8 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = crossover_config_27();
-        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 50);
         let caches_b = make_caches_for_actor(&actor_b, 50);
@@ -2698,8 +2714,8 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = crossover_config_27();
-        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 50);
         let caches_b = make_caches_for_actor(&actor_b, 50);
@@ -2737,8 +2753,8 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = crossover_config_27();
-        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 50);
         let caches_b = make_caches_for_actor(&actor_b, 50);
@@ -2786,8 +2802,8 @@ mod tests {
             ],
             ..crossover_config_27()
         };
-        let actor_a: PcActor = PcActor::new(config_27.clone(), &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config_27, &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config_27.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config_27, &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 50);
         let caches_b = make_caches_for_actor(&actor_b, 50);
@@ -2822,8 +2838,8 @@ mod tests {
 
         // Child hidden layers have 18 neurons
         use crate::linalg::LinAlg;
-        assert_eq!(CpuLinAlg::mat_rows(&child.layers[0].weights), 18);
-        assert_eq!(CpuLinAlg::mat_rows(&child.layers[1].weights), 18);
+        assert_eq!(CpuLinAlg::new().mat_rows(&child.layers[0].weights), 18);
+        assert_eq!(CpuLinAlg::new().mat_rows(&child.layers[1].weights), 18);
     }
 
     // ── Phase 5 Cycle 5.3: Crossover parents differ ─────────────
@@ -2841,8 +2857,8 @@ mod tests {
             ..crossover_config_27()
         }; // [18]
 
-        let actor_a: PcActor = PcActor::new(config_a, &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config_b, &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config_a, &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config_b, &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 50);
         let caches_b = make_caches_for_actor(&actor_b, 50);
@@ -2865,7 +2881,7 @@ mod tests {
 
         use crate::linalg::LinAlg;
         // Child has correct dimensions [27]
-        assert_eq!(CpuLinAlg::mat_rows(&child.layers[0].weights), 27);
+        assert_eq!(CpuLinAlg::new().mat_rows(&child.layers[0].weights), 27);
         // All weights finite
         for &w in &child.layers[0].weights.data {
             assert!(w.is_finite());
@@ -2885,8 +2901,8 @@ mod tests {
             }],
             ..crossover_config_27()
         };
-        let actor_a: PcActor = PcActor::new(config_18.clone(), &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config_18, &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config_18.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config_18, &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 50);
         let caches_b = make_caches_for_actor(&actor_b, 50);
@@ -2908,15 +2924,15 @@ mod tests {
         .unwrap();
 
         use crate::linalg::LinAlg;
-        assert_eq!(CpuLinAlg::mat_rows(&child.layers[0].weights), 27);
+        assert_eq!(CpuLinAlg::new().mat_rows(&child.layers[0].weights), 27);
         // All weights finite
         for &w in &child.layers[0].weights.data {
             assert!(w.is_finite());
         }
         // Xavier zone weights are not all zero (random init)
         let xavier_zone_nonzero = (18..27).any(|r| {
-            (0..CpuLinAlg::mat_cols(&child.layers[0].weights))
-                .any(|c| CpuLinAlg::mat_get(&child.layers[0].weights, r, c).abs() > 1e-15)
+            (0..CpuLinAlg::new().mat_cols(&child.layers[0].weights))
+                .any(|c| CpuLinAlg::new().mat_get(&child.layers[0].weights, r, c).abs() > 1e-15)
         });
         assert!(
             xavier_zone_nonzero,
@@ -2943,8 +2959,8 @@ mod tests {
             ],
             ..crossover_config_27()
         };
-        let actor_a: PcActor = PcActor::new(config_2l.clone(), &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config_2l, &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config_2l.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config_2l, &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 50);
         let caches_b = make_caches_for_actor(&actor_b, 50);
@@ -2986,7 +3002,7 @@ mod tests {
         // Child has 4 layers (3 hidden + 1 output)
         assert_eq!(child.layers.len(), 4);
         // Layer 2 (new) has 18 rows
-        assert_eq!(CpuLinAlg::mat_rows(&child.layers[2].weights), 18);
+        assert_eq!(CpuLinAlg::new().mat_rows(&child.layers[2].weights), 18);
         // All weights finite
         for (i, layer) in child.layers.iter().enumerate() {
             for &w in &layer.weights.data {
@@ -3016,8 +3032,8 @@ mod tests {
             ],
             ..crossover_config_27()
         };
-        let actor_a: PcActor = PcActor::new(config_3l.clone(), &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config_3l, &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config_3l.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config_3l, &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 50);
         let caches_b = make_caches_for_actor(&actor_b, 50);
@@ -3055,7 +3071,7 @@ mod tests {
         // Child has 3 layers (2 hidden + 1 output)
         assert_eq!(child.layers.len(), 3);
         // Output layer input_size = 27 (last hidden size)
-        assert_eq!(CpuLinAlg::mat_cols(&child.layers[2].weights), 27);
+        assert_eq!(CpuLinAlg::new().mat_cols(&child.layers[2].weights), 27);
     }
 
     // ── Phase 5 Cycle 5.6: Crossover residual components ────────
@@ -3079,8 +3095,8 @@ mod tests {
             rezero_init: 0.1,
             ..crossover_config_27()
         };
-        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 50);
         let caches_b = make_caches_for_actor(&actor_b, 50);
@@ -3127,8 +3143,8 @@ mod tests {
             rezero_init: 0.1,
             ..crossover_config_27()
         };
-        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 50);
         let caches_b = make_caches_for_actor(&actor_b, 50);
@@ -3195,8 +3211,8 @@ mod tests {
             output_size: 4,
             ..crossover_config_27()
         };
-        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config.clone(), &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 100);
         let caches_b = make_caches_for_actor(&actor_b, 100);
@@ -3241,14 +3257,14 @@ mod tests {
         // We verify by checking that the column permutation was actually applied:
         // parent B's layer 1 columns should be reordered by perm0.
         let b_layer1 = &actor_b.layers[1];
-        let b_cols = CpuLinAlg::mat_cols(&b_layer1.weights);
+        let b_cols = CpuLinAlg::new().mat_cols(&b_layer1.weights);
 
         // Expected: child layer 1 col[c] = 0.5 * A.layer1.col[c] + 0.5 * B.layer1.col[perm0[c]]
         // If column permutation is NOT applied, it would be:
         // child layer 1 col[c] = 0.5 * A.layer1.col[c] + 0.5 * B.layer1.col[c]  (wrong!)
         let a_layer1 = &actor_a.layers[1];
         let child_layer1 = &child.layers[1];
-        let n_rows = CpuLinAlg::mat_rows(&child_layer1.weights);
+        let n_rows = CpuLinAlg::new().mat_rows(&child_layer1.weights);
 
         let mut has_col_permutation = false;
         for (c, &src_col) in perm0.iter().enumerate().take(b_cols.min(perm0.len())) {
@@ -3258,10 +3274,10 @@ mod tests {
             // Check if child col c matches the permuted blend (correct)
             // vs the unpermuted blend (broken)
             for r in 0..n_rows {
-                let a_val = CpuLinAlg::mat_get(&a_layer1.weights, r, c);
-                let b_val_permuted = CpuLinAlg::mat_get(&b_layer1.weights, r, src_col);
-                let b_val_unpermuted = CpuLinAlg::mat_get(&b_layer1.weights, r, c);
-                let child_val = CpuLinAlg::mat_get(&child_layer1.weights, r, c);
+                let a_val = CpuLinAlg::new().mat_get(&a_layer1.weights, r, c);
+                let b_val_permuted = CpuLinAlg::new().mat_get(&b_layer1.weights, r, src_col);
+                let b_val_unpermuted = CpuLinAlg::new().mat_get(&b_layer1.weights, r, c);
+                let child_val = CpuLinAlg::new().mat_get(&child_layer1.weights, r, c);
 
                 let expected_permuted = 0.5 * a_val + 0.5 * b_val_permuted;
                 let expected_unpermuted = 0.5 * a_val + 0.5 * b_val_unpermuted;
@@ -3289,8 +3305,8 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = crossover_config_27();
-        let actor_a: PcActor = PcActor::new(config.clone(), &mut rng_a).unwrap();
-        let actor_b: PcActor = PcActor::new(config, &mut rng_b).unwrap();
+        let actor_a: PcActor = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let actor_b: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng_b).unwrap();
 
         let caches_a = make_caches_for_actor(&actor_a, 50);
         let caches_b = make_caches_for_actor(&actor_b, 50);
@@ -3333,7 +3349,7 @@ mod tests {
     fn test_from_weights_valid_returns_ok() {
         let config = default_config();
         let weights = valid_weights_for(&config);
-        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        let result = PcActor::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_ok());
     }
 
@@ -3344,7 +3360,7 @@ mod tests {
         // Layer 0 should be 18x9; corrupt rows to 10x9
         weights.layers[0].weights = crate::matrix::Matrix::zeros(10, 9);
         weights.layers[0].bias = vec![0.0; 10];
-        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        let result = PcActor::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3359,7 +3375,7 @@ mod tests {
         let mut weights = valid_weights_for(&config);
         // Layer 0 should be 18x9; corrupt cols to 18x5
         weights.layers[0].weights = crate::matrix::Matrix::zeros(18, 5);
-        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        let result = PcActor::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3373,7 +3389,7 @@ mod tests {
         let config = default_config(); // hidden=[18], so layer 0 bias should be len 18
         let mut weights = valid_weights_for(&config);
         weights.layers[0].bias = vec![0.0; 5]; // wrong length
-        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        let result = PcActor::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3388,7 +3404,7 @@ mod tests {
         let mut weights = valid_weights_for(&config);
         let last = weights.layers.len() - 1;
         weights.layers[last].weights = crate::matrix::Matrix::zeros(9, 10); // wrong cols
-        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        let result = PcActor::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_err());
     }
 
@@ -3409,7 +3425,7 @@ mod tests {
         let mut weights = valid_weights_for(&config);
         // residual with 2 hidden layers expects 1 rezero_alpha; give 0
         weights.rezero_alpha = vec![];
-        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        let result = PcActor::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3436,7 +3452,7 @@ mod tests {
         let mut weights = valid_weights_for(&config);
         // Skip projection should be 18x27; corrupt to 10x5
         weights.skip_projections[0] = Some(crate::matrix::Matrix::zeros(10, 5));
-        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        let result = PcActor::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -3462,7 +3478,7 @@ mod tests {
         let mut weights = valid_weights_for(&config);
         // Should have 1 skip_projection; give 3
         weights.skip_projections = vec![None, None, None];
-        let result = PcActor::<CpuLinAlg>::from_weights(config, weights);
+        let result = PcActor::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
