@@ -21,3 +21,9 @@ BLOCKED.md
 
 # Session files
 .remember/
+
+# Development files
+sbtdd/
+planning/
+Makefile
+run-tests.py
