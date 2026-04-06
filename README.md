@@ -111,7 +111,7 @@ type LayerCpu = Layer<CpuLinAlg>;
 PC-RL-Core/
 ├── src/
 │   ├── linalg/
-│   │   ├── mod.rs                  # LinAlg trait (32 methods, backend-agnostic)
+│   │   ├── mod.rs                  # LinAlg trait (31 methods, backend-agnostic)
 │   │   ├── cpu.rs                  # CpuLinAlg (Vec<f64> + Matrix)
 │   │   └── golub_kahan.rs          # Golub-Kahan SVD (O(n^3))
 │   ├── activation.rs               # Tanh, ReLU, Sigmoid, ELU, Softsign, Linear
@@ -154,7 +154,7 @@ No PyTorch, TensorFlow, or any ML framework. Pure Rust from scratch.
 
 ## Testing
 
-384 unit tests + 20 doctests:
+391 unit tests + 20 doctests:
 
 ```bash
 cargo nextest run

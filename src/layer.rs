@@ -42,6 +42,16 @@ pub struct LayerDef {
 ///
 /// Weights have shape `[output_size × input_size]`. Bias has length `output_size`.
 ///
+/// # Serde and the `backend` field
+///
+/// The `backend` field is annotated with `#[serde(skip, default)]` so it is
+/// **not** included in the JSON format. On deserialization, `L::default()` is
+/// used to fill the field. However, direct serde deserialization of
+/// `Layer<GpuLinAlg>` is **not** the intended usage path. Use
+/// [`PcActor::from_weights`](crate::pc_actor::PcActor::from_weights) or
+/// [`MlpCritic::from_weights`](crate::mlp_critic::MlpCritic::from_weights)
+/// instead, which inject the correct backend instance into every layer.
+///
 /// # Examples
 ///
 /// ```

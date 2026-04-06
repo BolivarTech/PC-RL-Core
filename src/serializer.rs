@@ -682,4 +682,19 @@ mod tests {
         }
         let _ = fs::remove_file(&path);
     }
+
+    /// Escenario 10: v1.2.3 JSON loads in v2.0 (backward compat).
+    #[test]
+    fn test_v1_fixture_loads_in_v2() {
+        let backend = crate::linalg::cpu::CpuLinAlg::new();
+        let (mut agent, metadata) = load_agent("tests/fixtures/v1_model.json", backend).unwrap();
+        // Verify metadata is valid
+        assert!(!metadata.version.is_empty());
+        assert_eq!(metadata.episode, 100);
+        // Verify agent produces valid inference
+        let state = vec![0.5; 9];
+        let valid: Vec<usize> = (0..9).collect();
+        let (action, _) = agent.act(&state, &valid, crate::pc_actor::SelectionMode::Play);
+        assert!(action < 9, "Action must be in valid range");
+    }
 }

@@ -8,7 +8,7 @@
 - All struct constructors (`PcActorCritic::new`, `PcActor::new`, `MlpCritic::new`) now take `backend: L` as first parameter
 - `load_agent` and `load_agent_generic` now take `backend` as second parameter
 - `PcActorCritic::from_parts` now takes `backend: L` as last parameter
-- Generic functions in `matrix.rs` (`cca_neuron_alignment`, `standardize_columns`, `compute_matrix_sqrtm`, `generic_svd_alignment`) now take `backend: &L` as first parameter
+- Generic functions in `matrix.rs` (`cca_neuron_alignment`, `standardize_columns`) now take `backend: &L` as first parameter
 - `LinAlg` backends used with serde-derived structs must implement `Default`
 
 ### Migration Guide
