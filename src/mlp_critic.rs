@@ -73,6 +73,7 @@ pub struct MlpCriticWeights {
 /// ```
 /// use pc_rl_core::activation::Activation;
 /// use pc_rl_core::layer::LayerDef;
+/// use pc_rl_core::linalg::cpu::CpuLinAlg;
 /// use pc_rl_core::mlp_critic::{MlpCritic, MlpCriticConfig};
 /// use rand::SeedableRng;
 /// use rand::rngs::StdRng;
