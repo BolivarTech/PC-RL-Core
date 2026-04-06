@@ -16,7 +16,7 @@ The library is **backend-agnostic**: all linear algebra operations are abstracte
 
 ```toml
 [dependencies]
-pc-rl-core = "1.2.3"
+pc-rl-core = "2.0"
 ```
 
 ## Quick Start
