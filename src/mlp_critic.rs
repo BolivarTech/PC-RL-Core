@@ -123,14 +123,30 @@ impl<L: LinAlg> MlpCritic<L> {
         let mut prev_size = config.input_size;
 
         for def in &config.hidden_layers {
-            layers.push(Layer::<L>::new(prev_size, def.size, def.activation, &backend, rng));
+            layers.push(Layer::<L>::new(
+                prev_size,
+                def.size,
+                def.activation,
+                &backend,
+                rng,
+            ));
             prev_size = def.size;
         }
 
         // Output layer: 1 neuron
-        layers.push(Layer::<L>::new(prev_size, 1, config.output_activation, &backend, rng));
+        layers.push(Layer::<L>::new(
+            prev_size,
+            1,
+            config.output_activation,
+            &backend,
+            rng,
+        ));
 
-        Ok(Self { layers, config, backend })
+        Ok(Self {
+            layers,
+            config,
+            backend,
+        })
     }
 
     /// Creates a child critic by crossing over two parent critics using CCA neuron alignment.
@@ -180,7 +196,8 @@ impl<L: LinAlg> MlpCritic<L> {
         if parent_a.config.input_size == child_config.input_size
             && parent_b.config.input_size == child_config.input_size
         {
-            let (layer, perm) = cca_align_and_blend_layer(&parent_a.backend,
+            let (layer, perm) = cca_align_and_blend_layer(
+                &parent_a.backend,
                 &parent_a.layers[0],
                 &parent_b.layers[0],
                 caches_a.first(),
@@ -210,7 +227,8 @@ impl<L: LinAlg> MlpCritic<L> {
             let prev_child_size = child_config.hidden_layers[h_idx - 1].size;
 
             if h_idx < num_a_hidden && h_idx < num_b_hidden {
-                let (layer, perm) = cca_align_and_blend_layer(&parent_a.backend,
+                let (layer, perm) = cca_align_and_blend_layer(
+                    &parent_a.backend,
                     &parent_a.layers[h_idx],
                     &parent_b.layers[h_idx],
                     caches_a.get(h_idx),
@@ -254,11 +272,15 @@ impl<L: LinAlg> MlpCritic<L> {
             for c in 0..last_child_hidden {
                 let va = parent_a.backend.mat_get(&a_out.weights, 0, c);
                 let vb = parent_a.backend.mat_get(&b_out_permuted, 0, c);
-                parent_a.backend.mat_set(&mut weights, 0, c, alpha * va + (1.0 - alpha) * vb);
+                parent_a
+                    .backend
+                    .mat_set(&mut weights, 0, c, alpha * va + (1.0 - alpha) * vb);
             }
             let ba = parent_a.backend.vec_get(&a_out.bias, 0);
             let bb = parent_a.backend.vec_get(&b_out.bias, 0);
-            parent_a.backend.vec_set(&mut biases, 0, alpha * ba + (1.0 - alpha) * bb);
+            parent_a
+                .backend
+                .vec_set(&mut biases, 0, alpha * ba + (1.0 - alpha) * bb);
             layers.push(Layer {
                 weights,
                 bias: biases,
@@ -550,7 +572,8 @@ mod tests {
     #[test]
     fn test_forward_returns_finite_scalar() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![0.0; 27];
         let v = critic.forward(&input);
         assert!(v.is_finite(), "forward output {v} is not finite");
@@ -559,7 +582,8 @@ mod tests {
     #[test]
     fn test_forward_different_inputs_give_different_outputs() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let a = critic.forward(&vec![0.0; 27]);
         let mut input_b = vec![0.0; 27];
         input_b[0] = 1.0;
@@ -597,7 +621,8 @@ mod tests {
     #[test]
     fn test_forward_extreme_input_still_finite() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input: Vec<f64> = (0..27)
             .map(|i| if i % 2 == 0 { 1e6 } else { -1e6 })
             .collect();
@@ -609,7 +634,8 @@ mod tests {
     #[should_panic]
     fn test_forward_panics_wrong_input_size() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let _ = critic.forward(&[0.0; 10]); // wrong size
     }
 
@@ -618,7 +644,8 @@ mod tests {
     #[test]
     fn test_update_loss_decreases_over_30_iterations() {
         let mut rng = make_rng();
-        let mut critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
+        let mut critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![0.1; 27];
         let target = 0.5;
         let initial_loss = critic.update(&input, target);
@@ -635,7 +662,8 @@ mod tests {
     #[test]
     fn test_update_returns_finite_nonneg_loss() {
         let mut rng = make_rng();
-        let mut critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
+        let mut critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let loss = critic.update(&vec![0.0; 27], 1.0);
         assert!(loss.is_finite(), "Loss {loss} is not finite");
         assert!(loss >= 0.0, "Loss {loss} is negative");
@@ -644,7 +672,8 @@ mod tests {
     #[test]
     fn test_update_changes_weights() {
         let mut rng = make_rng();
-        let mut critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
+        let mut critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let w_before = critic.layers[0].weights.get(0, 0);
         let _ = critic.update(&vec![0.1; 27], 1.0);
         let w_after = critic.layers[0].weights.get(0, 0);
@@ -657,7 +686,8 @@ mod tests {
     #[test]
     fn test_update_clips_weights() {
         let mut rng = make_rng();
-        let mut critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
+        let mut critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         // Extreme update to force clipping
         for _ in 0..100 {
             let _ = critic.update(&vec![10.0; 27], 1e6);
@@ -680,12 +710,14 @@ mod tests {
     #[test]
     fn test_serde_roundtrip_preserves_weights() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![0.3; 27];
         let original_output = critic.forward(&input);
 
         let weights = critic.to_weights();
-        let restored: MlpCritic = MlpCritic::from_weights(CpuLinAlg::new(), default_config(), weights).unwrap();
+        let restored: MlpCritic =
+            MlpCritic::from_weights(CpuLinAlg::new(), default_config(), weights).unwrap();
         let restored_output = restored.forward(&input);
 
         assert!(
@@ -715,8 +747,10 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = default_config();
-        let critic_a: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
+        let critic_a: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let critic_b: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(36, 50)];
         let cache_b = vec![make_critic_cache(36, 50)];
@@ -746,8 +780,10 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = default_config();
-        let critic_a: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
+        let critic_a: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let critic_b: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(36, 50)];
         let cache_b = vec![make_critic_cache(36, 50)];
@@ -780,8 +816,10 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = default_config();
-        let critic_a: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
+        let critic_a: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let critic_b: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(36, 50)];
         let cache_b = vec![make_critic_cache(36, 50)];
@@ -819,7 +857,8 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config_36 = default_config(); // hidden [36]
-        let critic_a: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config_36.clone(), &mut rng_a).unwrap();
+        let critic_a: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config_36.clone(), &mut rng_a).unwrap();
         let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config_36, &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(36, 50)];
@@ -867,7 +906,8 @@ mod tests {
             output_activation: Activation::Linear,
             lr: 0.005,
         };
-        let critic_a: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config_48.clone(), &mut rng_a).unwrap();
+        let critic_a: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config_48.clone(), &mut rng_a).unwrap();
         let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config_48, &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(48, 50)];
@@ -900,7 +940,8 @@ mod tests {
     #[test]
     fn test_forward_with_hidden_returns_value_and_states() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![0.3; 27];
         let (value, hidden_states) = critic.forward_with_hidden(&input);
 
@@ -914,7 +955,8 @@ mod tests {
     #[test]
     fn test_forward_with_hidden_matches_forward() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![0.3; 27];
         let value_plain = critic.forward(&input);
         let (value_hidden, _) = critic.forward_with_hidden(&input);
@@ -960,7 +1002,8 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = default_config();
-        let critic_a: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let critic_a: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
         let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config, &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(36, 50)];
@@ -994,7 +1037,8 @@ mod tests {
     /// Helper: build valid MlpCriticWeights from a config.
     fn valid_weights_for(config: &MlpCriticConfig) -> MlpCriticWeights {
         let mut rng = make_rng();
-        let critic = MlpCritic::<CpuLinAlg>::new(CpuLinAlg::new(), config.clone(), &mut rng).unwrap();
+        let critic =
+            MlpCritic::<CpuLinAlg>::new(CpuLinAlg::new(), config.clone(), &mut rng).unwrap();
         critic.to_weights()
     }
 

@@ -734,7 +734,8 @@ mod tests {
     }
 
     fn make_agent() -> PcActorCritic {
-        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), default_config(), 42).unwrap();
+        let agent: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), default_config(), 42).unwrap();
         agent
     }
 
@@ -909,8 +910,10 @@ mod tests {
     fn test_learn_continuous_terminal_and_nonterminal_produce_different_updates() {
         // Create two identical agents
         let config = default_config();
-        let mut agent_term: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
-        let mut agent_nonterm: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        let mut agent_term: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_nonterm: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
         let input = vec![0.5; 9];
         let next_input = vec![-0.5; 9];
@@ -1397,8 +1400,10 @@ mod tests {
     #[test]
     fn test_agent_crossover_produces_valid_agent() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1417,8 +1422,10 @@ mod tests {
     #[test]
     fn test_agent_crossover_actor_weights_differ() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1441,8 +1448,10 @@ mod tests {
     #[test]
     fn test_agent_crossover_critic_weights_differ() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1467,8 +1476,10 @@ mod tests {
     #[test]
     fn test_agent_crossover_child_can_infer() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1487,8 +1498,10 @@ mod tests {
     #[test]
     fn test_agent_crossover_child_can_learn() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1506,8 +1519,10 @@ mod tests {
     #[test]
     fn test_agent_crossover_mismatched_batch_size_error() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, _cc_b) = build_caches_for_agent(&mut agent_b, 30); // different batch
@@ -1533,8 +1548,10 @@ mod tests {
     #[test]
     fn test_agent_crossover_with_separate_critic_caches() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1550,8 +1567,10 @@ mod tests {
     #[test]
     fn test_agent_crossover_critic_uses_own_caches() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1574,8 +1593,10 @@ mod tests {
     #[test]
     fn test_agent_crossover_mismatched_critic_batch_error() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, _) = build_caches_for_agent(&mut agent_b, 50);
@@ -1613,6 +1634,7 @@ mod tests {
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
         let mat = CpuLinAlg::new().zeros_mat(10, 3);
-        let _perm = crate::matrix::cca_neuron_alignment::<CpuLinAlg>(&CpuLinAlg::new(), &mat, &mat).unwrap();
+        let _perm = crate::matrix::cca_neuron_alignment::<CpuLinAlg>(&CpuLinAlg::new(), &mat, &mat)
+            .unwrap();
     }
 }

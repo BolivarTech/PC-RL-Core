@@ -173,12 +173,7 @@ impl LinAlg for CpuLinAlg {
         crate::matrix::argmax_masked(values, mask)
     }
 
-    fn sample_from_probs(
-        &self,
-        probs: &Self::Vector,
-        mask: &[usize],
-        rng: &mut impl Rng,
-    ) -> usize {
+    fn sample_from_probs(&self, probs: &Self::Vector, mask: &[usize], rng: &mut impl Rng) -> usize {
         crate::matrix::sample_from_probs(probs, mask, rng)
     }
 
@@ -275,7 +270,7 @@ mod tests {
         let owned = backend.vec_to_vec(&v);
         assert_eq!(owned, vec![1.0, 2.0, 3.0]);
     }
-#[test]
+    #[test]
     fn test_vec_len_matches_creation_size() {
         let backend = CpuLinAlg::new();
         let v = backend.zeros_vec(7);
@@ -623,10 +618,7 @@ mod tests {
         assert_eq!(backend.mat_cols(&result), 2);
         for r in 0..3 {
             for c in 0..2 {
-                assert!(
-                    (backend.mat_get(&result, r, c) - backend.mat_get(&m, r, c)).abs()
-                        < 1e-10
-                );
+                assert!((backend.mat_get(&result, r, c) - backend.mat_get(&m, r, c)).abs() < 1e-10);
             }
         }
     }
@@ -653,10 +645,7 @@ mod tests {
         assert_eq!(backend.mat_cols(&result), 3);
         for r in 0..2 {
             for c in 0..3 {
-                assert!(
-                    (backend.mat_get(&result, r, c) - backend.mat_get(&m, r, c)).abs()
-                        < 1e-10
-                );
+                assert!((backend.mat_get(&result, r, c) - backend.mat_get(&m, r, c)).abs() < 1e-10);
             }
         }
     }
@@ -948,9 +937,7 @@ mod tests {
         let recon = reconstruct_usv(&u, &s, &v);
         for r in 0..2 {
             for c in 0..2 {
-                assert!(
-                    (backend.mat_get(&recon, r, c) - backend.mat_get(&m, r, c)).abs() < 1e-10
-                );
+                assert!((backend.mat_get(&recon, r, c) - backend.mat_get(&m, r, c)).abs() < 1e-10);
             }
         }
     }

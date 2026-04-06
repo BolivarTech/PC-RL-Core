@@ -725,7 +725,11 @@ fn greedy_match<L: crate::linalg::LinAlg>(
         // Find neuron in A with largest |u_k| coefficient
         let mut best_a = 0;
         let mut best_a_val = 0.0_f64;
-        for (i, &is_matched) in matched_a.iter().enumerate().take(n_a.min(backend.mat_rows(u))) {
+        for (i, &is_matched) in matched_a
+            .iter()
+            .enumerate()
+            .take(n_a.min(backend.mat_rows(u)))
+        {
             let val = backend.mat_get(u, i, col).abs();
             if val > best_a_val && !is_matched {
                 best_a_val = val;
@@ -736,7 +740,11 @@ fn greedy_match<L: crate::linalg::LinAlg>(
         // Find neuron in B with largest |v_k| coefficient
         let mut best_b = 0;
         let mut best_b_val = 0.0_f64;
-        for (i, &is_matched) in matched_b.iter().enumerate().take(n_b.min(backend.mat_rows(v))) {
+        for (i, &is_matched) in matched_b
+            .iter()
+            .enumerate()
+            .take(n_b.min(backend.mat_rows(v)))
+        {
             let val = backend.mat_get(v, i, col).abs();
             if val > best_b_val && !is_matched {
                 best_b_val = val;

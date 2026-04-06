@@ -294,7 +294,8 @@ mod tests {
 
     fn make_agent() -> PcActorCritic {
         use crate::linalg::cpu::CpuLinAlg;
-        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), default_config(), 42).unwrap();
+        let agent: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), default_config(), 42).unwrap();
         agent
     }
 
@@ -393,7 +394,10 @@ mod tests {
 
     #[test]
     fn test_load_nonexistent_returns_error() {
-        let result = load_agent("/nonexistent/path/agent.json", crate::linalg::cpu::CpuLinAlg::new());
+        let result = load_agent(
+            "/nonexistent/path/agent.json",
+            crate::linalg::cpu::CpuLinAlg::new(),
+        );
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(
@@ -544,7 +548,8 @@ mod tests {
             },
             ..default_config()
         };
-        let mut agent: PcActorCritic = PcActorCritic::new(crate::linalg::cpu::CpuLinAlg::new(), config, 42).unwrap();
+        let mut agent: PcActorCritic =
+            PcActorCritic::new(crate::linalg::cpu::CpuLinAlg::new(), config, 42).unwrap();
         // Train one step to modify rezero_alpha
         let input = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
@@ -596,8 +601,11 @@ mod tests {
         save_agent(&agent, &path, 10, None).unwrap();
 
         let (loaded_default, _) = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
-        let (loaded_generic, _) =
-            load_agent_generic::<crate::linalg::cpu::CpuLinAlg>(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
+        let (loaded_generic, _) = load_agent_generic::<crate::linalg::cpu::CpuLinAlg>(
+            &path,
+            crate::linalg::cpu::CpuLinAlg::new(),
+        )
+        .unwrap();
 
         let input = vec![0.5, -0.5, 1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0];
         let r1 = loaded_default.infer(&input);
@@ -634,7 +642,8 @@ mod tests {
             },
             ..default_config()
         };
-        let mut agent: PcActorCritic = PcActorCritic::new(crate::linalg::cpu::CpuLinAlg::new(), config, 42).unwrap();
+        let mut agent: PcActorCritic =
+            PcActorCritic::new(crate::linalg::cpu::CpuLinAlg::new(), config, 42).unwrap();
         // Train to modify projection weights
         let input = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
@@ -673,5 +682,4 @@ mod tests {
         }
         let _ = fs::remove_file(&path);
     }
-
 }

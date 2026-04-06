@@ -163,7 +163,8 @@ impl<L: LinAlg> Layer<L> {
         let dw = self.backend.outer_product(&grad, input);
 
         // 6. Update weights (scale_add includes WEIGHT_CLIP clamping)
-        self.backend.mat_scale_add(&mut self.weights, &dw, -effective_lr);
+        self.backend
+            .mat_scale_add(&mut self.weights, &dw, -effective_lr);
 
         // 7. Update bias with clamping
         let bias_update = self.backend.vec_scale(&grad, effective_lr);
