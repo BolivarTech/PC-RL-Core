@@ -42,23 +42,35 @@ pub struct LayerDef {
 ///
 /// Weights have shape `[output_size × input_size]`. Bias has length `output_size`.
 ///
+/// # Serde and the `backend` field
+///
+/// The `backend` field is annotated with `#[serde(skip, default)]` so it is
+/// **not** included in the JSON format. On deserialization, `L::default()` is
+/// used to fill the field. However, direct serde deserialization of
+/// `Layer<GpuLinAlg>` is **not** the intended usage path. Use
+/// [`PcActor::from_weights`](crate::pc_actor::PcActor::from_weights) or
+/// [`MlpCritic::from_weights`](crate::mlp_critic::MlpCritic::from_weights)
+/// instead, which inject the correct backend instance into every layer.
+///
 /// # Examples
 ///
 /// ```
 /// use pc_rl_core::activation::Activation;
 /// use pc_rl_core::layer::Layer;
+/// use pc_rl_core::linalg::cpu::CpuLinAlg;
 /// use rand::SeedableRng;
 /// use rand::rngs::StdRng;
 ///
+/// let backend = CpuLinAlg::new();
 /// let mut rng = StdRng::seed_from_u64(42);
-/// let layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+/// let layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
 /// let output: Vec<f64> = layer.forward(&vec![1.0, 0.0, -1.0, 0.5]);
 /// assert_eq!(output.len(), 3);
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "L::Matrix: Serialize, L::Vector: Serialize",
-    deserialize = "L::Matrix: for<'a> Deserialize<'a>, L::Vector: for<'a> Deserialize<'a>"
+    deserialize = "L::Matrix: for<'a> Deserialize<'a>, L::Vector: for<'a> Deserialize<'a>, L: Default"
 ))]
 pub struct Layer<L: LinAlg = CpuLinAlg> {
     /// Weight matrix of shape `[output_size × input_size]`.
@@ -67,6 +79,9 @@ pub struct Layer<L: LinAlg = CpuLinAlg> {
     pub bias: L::Vector,
     /// Activation function applied element-wise after the linear transform.
     pub activation: Activation,
+    /// Backend used for linear algebra operations.
+    #[serde(skip, default)]
+    pub(crate) backend: L,
 }
 
 impl<L: LinAlg> Layer<L> {
@@ -82,12 +97,14 @@ impl<L: LinAlg> Layer<L> {
         input_size: usize,
         output_size: usize,
         activation: Activation,
+        backend: &L,
         rng: &mut impl Rng,
     ) -> Self {
         Self {
-            weights: L::xavier_mat(output_size, input_size, rng),
-            bias: L::zeros_vec(output_size),
+            weights: backend.xavier_mat(output_size, input_size, rng),
+            bias: backend.zeros_vec(output_size),
             activation,
+            backend: backend.clone(),
         }
     }
 
@@ -97,9 +114,9 @@ impl<L: LinAlg> Layer<L> {
     ///
     /// Panics if `input.len() != input_size` (number of columns in weights).
     pub fn forward(&self, input: &L::Vector) -> L::Vector {
-        let linear = L::mat_vec_mul(&self.weights, input);
-        let biased = L::vec_add(&linear, &self.bias);
-        L::apply_activation(&biased, self.activation)
+        let linear = self.backend.mat_vec_mul(&self.weights, input);
+        let biased = self.backend.vec_add(&linear, &self.bias);
+        self.backend.apply_activation(&biased, self.activation)
     }
 
     /// Computes `activation(W^T * input)` (no bias).
@@ -112,9 +129,9 @@ impl<L: LinAlg> Layer<L> {
     ///
     /// Panics if `input.len() != output_size` (number of rows in weights).
     pub fn transpose_forward(&self, input: &L::Vector, activation: Activation) -> L::Vector {
-        let wt = L::mat_transpose(&self.weights);
-        let linear = L::mat_vec_mul(&wt, input);
-        L::apply_activation(&linear, activation)
+        let wt = self.backend.mat_transpose(&self.weights);
+        let linear = self.backend.mat_vec_mul(&wt, input);
+        self.backend.apply_activation(&linear, activation)
     }
 
     /// Backpropagation with gradient and weight clipping.
@@ -141,32 +158,33 @@ impl<L: LinAlg> Layer<L> {
         surprise_scale: f64,
     ) -> L::Vector {
         // 1. Activation derivative
-        let deriv = L::apply_derivative(output, self.activation);
+        let deriv = self.backend.apply_derivative(output, self.activation);
 
         // 2. Local gradient = delta * deriv (element-wise Hadamard product)
-        let mut grad = L::vec_hadamard(delta, &deriv);
+        let mut grad = self.backend.vec_hadamard(delta, &deriv);
 
         // 3. Clip gradient
-        L::clip_vec(&mut grad, GRAD_CLIP);
+        self.backend.clip_vec(&mut grad, GRAD_CLIP);
 
         // 4. Effective learning rate
         let effective_lr = lr * surprise_scale;
 
         // 5. Weight gradient: dW = outer(grad, input)
-        let dw = L::outer_product(&grad, input);
+        let dw = self.backend.outer_product(&grad, input);
 
         // 6. Update weights (scale_add includes WEIGHT_CLIP clamping)
-        L::mat_scale_add(&mut self.weights, &dw, -effective_lr);
+        self.backend
+            .mat_scale_add(&mut self.weights, &dw, -effective_lr);
 
         // 7. Update bias with clamping
-        let bias_update = L::vec_scale(&grad, effective_lr);
-        let new_bias = L::vec_sub(&self.bias, &bias_update);
+        let bias_update = self.backend.vec_scale(&grad, effective_lr);
+        let new_bias = self.backend.vec_sub(&self.bias, &bias_update);
         self.bias = new_bias;
-        L::clip_vec(&mut self.bias, WEIGHT_CLIP);
+        self.backend.clip_vec(&mut self.bias, WEIGHT_CLIP);
 
         // 8. Propagated delta: W^T * grad
-        let wt = L::mat_transpose(&self.weights);
-        L::mat_vec_mul(&wt, &grad)
+        let wt = self.backend.mat_transpose(&self.weights);
+        self.backend.mat_vec_mul(&wt, &grad)
     }
 }
 
@@ -180,12 +198,17 @@ mod tests {
         StdRng::seed_from_u64(42)
     }
 
+    fn make_backend() -> CpuLinAlg {
+        CpuLinAlg::new()
+    }
+
     // ── forward tests ──────────────────────────────────────────────
 
     #[test]
     fn test_forward_output_length_equals_output_size() {
         let mut rng = make_rng();
-        let layer: Layer = Layer::new(4, 3, Activation::Linear, &mut rng);
+        let backend = make_backend();
+        let layer: Layer = Layer::new(4, 3, Activation::Linear, &backend, &mut rng);
         let out = layer.forward(&vec![1.0, 0.0, -1.0, 0.5]);
         assert_eq!(out.len(), 3);
     }
@@ -193,7 +216,8 @@ mod tests {
     #[test]
     fn test_forward_linear_known_value() {
         let mut rng = make_rng();
-        let mut layer: Layer = Layer::new(2, 1, Activation::Linear, &mut rng);
+        let backend = make_backend();
+        let mut layer: Layer = Layer::new(2, 1, Activation::Linear, &backend, &mut rng);
         // Set known weights and bias
         layer.weights.set(0, 0, 2.0);
         layer.weights.set(0, 1, 3.0);
@@ -206,7 +230,8 @@ mod tests {
     #[test]
     fn test_forward_tanh_output_bounded() {
         let mut rng = make_rng();
-        let layer: Layer = Layer::new(4, 5, Activation::Tanh, &mut rng);
+        let backend = make_backend();
+        let layer: Layer = Layer::new(4, 5, Activation::Tanh, &backend, &mut rng);
         let out = layer.forward(&vec![10.0, -10.0, 5.0, -5.0]);
         for &v in &out {
             assert!(v > -1.0 && v < 1.0, "Tanh output {v} not in (-1,1)");
@@ -216,7 +241,8 @@ mod tests {
     #[test]
     fn test_forward_sigmoid_output_bounded() {
         let mut rng = make_rng();
-        let layer: Layer = Layer::new(4, 5, Activation::Sigmoid, &mut rng);
+        let backend = make_backend();
+        let layer: Layer = Layer::new(4, 5, Activation::Sigmoid, &backend, &mut rng);
         let out = layer.forward(&vec![10.0, -10.0, 5.0, -5.0]);
         for &v in &out {
             assert!(v > 0.0 && v < 1.0, "Sigmoid output {v} not in (0,1)");
@@ -226,7 +252,8 @@ mod tests {
     #[test]
     fn test_forward_relu_no_negative_outputs() {
         let mut rng = make_rng();
-        let layer: Layer = Layer::new(4, 5, Activation::Relu, &mut rng);
+        let backend = make_backend();
+        let layer: Layer = Layer::new(4, 5, Activation::Relu, &backend, &mut rng);
         let out = layer.forward(&vec![10.0, -10.0, 5.0, -5.0]);
         for &v in &out {
             assert!(v >= 0.0, "ReLU output {v} is negative");
@@ -236,7 +263,8 @@ mod tests {
     #[test]
     fn test_forward_all_outputs_finite() {
         let mut rng = make_rng();
-        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+        let backend = make_backend();
+        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
         let out = layer.forward(&vec![1e6, -1e6, 1e3, -1e3]);
         for &v in &out {
             assert!(v.is_finite(), "Output {v} is not finite");
@@ -247,7 +275,8 @@ mod tests {
     #[should_panic]
     fn test_forward_panics_wrong_input_length() {
         let mut rng = make_rng();
-        let layer: Layer = Layer::new(4, 3, Activation::Linear, &mut rng);
+        let backend = make_backend();
+        let layer: Layer = Layer::new(4, 3, Activation::Linear, &backend, &mut rng);
         let _ = layer.forward(&vec![1.0, 2.0]); // wrong length
     }
 
@@ -256,7 +285,8 @@ mod tests {
     #[test]
     fn test_transpose_forward_output_length_equals_input_size() {
         let mut rng = make_rng();
-        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+        let backend = make_backend();
+        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
         // transpose_forward takes output_size input, returns input_size
         let out = layer.transpose_forward(&vec![0.5, -0.5, 0.0], Activation::Tanh);
         assert_eq!(out.len(), 4);
@@ -265,7 +295,8 @@ mod tests {
     #[test]
     fn test_transpose_forward_all_finite() {
         let mut rng = make_rng();
-        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+        let backend = make_backend();
+        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
         let out = layer.transpose_forward(&vec![1e3, -1e3, 0.0], Activation::Tanh);
         for &v in &out {
             assert!(v.is_finite(), "transpose_forward output {v} is not finite");
@@ -275,7 +306,8 @@ mod tests {
     #[test]
     fn test_transpose_forward_different_activation_changes_output() {
         let mut rng = make_rng();
-        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+        let backend = make_backend();
+        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
         let input = vec![0.5, -0.5, 0.3];
         let out_tanh = layer.transpose_forward(&input, Activation::Tanh);
         let out_linear = layer.transpose_forward(&input, Activation::Linear);
@@ -294,7 +326,8 @@ mod tests {
     #[should_panic]
     fn test_transpose_forward_panics_wrong_input_length() {
         let mut rng = make_rng();
-        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+        let backend = make_backend();
+        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
         let _ = layer.transpose_forward(&vec![0.5, -0.5], Activation::Tanh); // wrong length
     }
 
@@ -303,7 +336,8 @@ mod tests {
     #[test]
     fn test_backward_changes_weights() {
         let mut rng = make_rng();
-        let mut layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+        let backend = make_backend();
+        let mut layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
         let input = vec![1.0, 0.5, -0.5, 0.0];
         let output = layer.forward(&input);
         let delta = vec![0.1, -0.2, 0.3];
@@ -319,7 +353,8 @@ mod tests {
     #[test]
     fn test_backward_changes_bias() {
         let mut rng = make_rng();
-        let mut layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+        let backend = make_backend();
+        let mut layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
         let input = vec![1.0, 0.5, -0.5, 0.0];
         let output = layer.forward(&input);
         let delta = vec![0.1, -0.2, 0.3];
@@ -336,7 +371,8 @@ mod tests {
     #[test]
     fn test_backward_returns_delta_of_correct_length() {
         let mut rng = make_rng();
-        let mut layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+        let backend = make_backend();
+        let mut layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
         let input = vec![1.0, 0.5, -0.5, 0.0];
         let output = layer.forward(&input);
         let delta = vec![0.1, -0.2, 0.3];
@@ -347,7 +383,8 @@ mod tests {
     #[test]
     fn test_backward_clips_weights_to_weight_clip() {
         let mut rng = make_rng();
-        let mut layer: Layer = Layer::new(4, 3, Activation::Linear, &mut rng);
+        let backend = make_backend();
+        let mut layer: Layer = Layer::new(4, 3, Activation::Linear, &backend, &mut rng);
         let input = vec![100.0, 100.0, 100.0, 100.0];
         let output = layer.forward(&input);
         let delta = vec![1e6, 1e6, 1e6];
@@ -372,7 +409,8 @@ mod tests {
     #[test]
     fn test_backward_returns_finite_delta() {
         let mut rng = make_rng();
-        let mut layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+        let backend = make_backend();
+        let mut layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
         let input = vec![1.0, 0.5, -0.5, 0.0];
         let output = layer.forward(&input);
         let delta = vec![0.1, -0.2, 0.3];
@@ -385,7 +423,8 @@ mod tests {
     #[test]
     fn test_backward_zero_lr_does_not_change_weights() {
         let mut rng = make_rng();
-        let mut layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+        let backend = make_backend();
+        let mut layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
         let input = vec![1.0, 0.5, -0.5, 0.0];
         let output = layer.forward(&input);
         let delta = vec![0.1, -0.2, 0.3];
@@ -410,7 +449,8 @@ mod tests {
     #[test]
     fn test_serde_roundtrip_preserves_weights_and_activation() {
         let mut rng = make_rng();
-        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &mut rng);
+        let backend = make_backend();
+        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
         let json = serde_json::to_string(&layer).unwrap();
         let restored: Layer = serde_json::from_str(&json).unwrap();
         assert_eq!(layer.bias, restored.bias);

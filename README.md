@@ -16,14 +16,14 @@ The library is **backend-agnostic**: all linear algebra operations are abstracte
 
 ```toml
 [dependencies]
-pc-rl-core = "1.2.3"
+pc-rl-core = "2.0"
 ```
 
 ## Quick Start
 
 ```rust
 use pc_rl_core::{
-    PcActorCriticCpu, PcActorCriticConfig, PcActorConfig, MlpCriticConfig,
+    CpuLinAlg, PcActorCritic, PcActorCriticConfig, PcActorConfig, MlpCriticConfig,
     Activation, LayerDef, SelectionMode,
 };
 
@@ -63,7 +63,8 @@ let config = PcActorCriticConfig {
     entropy_coeff: 0.0,
 };
 
-let mut agent = PcActorCriticCpu::new(config, 42)?;
+let backend = CpuLinAlg::new();
+let mut agent = PcActorCritic::new(backend, config, 42)?;
 
 // Training loop: act, collect trajectory steps, learn
 let (action, infer_result) = agent.act(&state, &valid_actions, SelectionMode::Training);
@@ -82,7 +83,7 @@ let (action, _) = agent.act(&state, &valid_actions, SelectionMode::Play);
 - **`MlpCritic<L: LinAlg>`** -- Standard MLP value function with MSE loss backpropagation and CCA crossover
 - **`PcActorCritic<L: LinAlg>`** -- Integrated agent combining actor and critic with surprise-based learning rate scheduling
 - **`Layer<L: LinAlg>`** -- Dense layer with forward, transpose (PC top-down), and backward passes
-- **`LinAlg` trait** -- Backend-agnostic linear algebra interface (32 methods). Default implementation: `CpuLinAlg`
+- **`LinAlg` trait** -- Backend-agnostic linear algebra interface (31 instance methods). Default implementation: `CpuLinAlg`
 - **`GolubKahanSvd`** -- O(n^3) SVD via bidiagonalization, used for CCA neuron alignment
 
 ### Key Mechanisms
@@ -110,7 +111,7 @@ type LayerCpu = Layer<CpuLinAlg>;
 PC-RL-Core/
 ├── src/
 │   ├── linalg/
-│   │   ├── mod.rs                  # LinAlg trait (32 methods, backend-agnostic)
+│   │   ├── mod.rs                  # LinAlg trait (31 methods, backend-agnostic)
 │   │   ├── cpu.rs                  # CpuLinAlg (Vec<f64> + Matrix)
 │   │   └── golub_kahan.rs          # Golub-Kahan SVD (O(n^3))
 │   ├── activation.rs               # Tanh, ReLU, Sigmoid, ELU, Softsign, Linear
@@ -153,7 +154,7 @@ No PyTorch, TensorFlow, or any ML framework. Pure Rust from scratch.
 
 ## Testing
 
-384 unit tests + 20 doctests:
+392 unit tests + 20 doctests:
 
 ```bash
 cargo nextest run

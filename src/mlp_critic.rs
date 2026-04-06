@@ -73,6 +73,7 @@ pub struct MlpCriticWeights {
 /// ```
 /// use pc_rl_core::activation::Activation;
 /// use pc_rl_core::layer::LayerDef;
+/// use pc_rl_core::linalg::cpu::CpuLinAlg;
 /// use pc_rl_core::mlp_critic::{MlpCritic, MlpCriticConfig};
 /// use rand::SeedableRng;
 /// use rand::rngs::StdRng;
@@ -84,7 +85,7 @@ pub struct MlpCriticWeights {
 ///     lr: 0.005,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
-/// let critic: MlpCritic = MlpCritic::new(config, &mut rng).unwrap();
+/// let critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config, &mut rng).unwrap();
 /// let value = critic.forward(&vec![0.0; 27]);
 /// assert!(value.is_finite());
 /// ```
@@ -94,6 +95,8 @@ pub struct MlpCritic<L: LinAlg = CpuLinAlg> {
     pub(crate) layers: Vec<Layer<L>>,
     /// Configuration used to build this critic.
     pub config: MlpCriticConfig,
+    /// Backend used for linear algebra operations.
+    pub(crate) backend: L,
 }
 
 impl<L: LinAlg> MlpCritic<L> {
@@ -109,7 +112,7 @@ impl<L: LinAlg> MlpCritic<L> {
     /// # Errors
     ///
     /// Returns `PcError::ConfigValidation` if `input_size` is zero.
-    pub fn new(config: MlpCriticConfig, rng: &mut impl Rng) -> Result<Self, PcError> {
+    pub fn new(backend: L, config: MlpCriticConfig, rng: &mut impl Rng) -> Result<Self, PcError> {
         if config.input_size == 0 {
             return Err(PcError::ConfigValidation(
                 "critic input_size must be > 0".into(),
@@ -120,14 +123,30 @@ impl<L: LinAlg> MlpCritic<L> {
         let mut prev_size = config.input_size;
 
         for def in &config.hidden_layers {
-            layers.push(Layer::<L>::new(prev_size, def.size, def.activation, rng));
+            layers.push(Layer::<L>::new(
+                prev_size,
+                def.size,
+                def.activation,
+                &backend,
+                rng,
+            ));
             prev_size = def.size;
         }
 
         // Output layer: 1 neuron
-        layers.push(Layer::<L>::new(prev_size, 1, config.output_activation, rng));
+        layers.push(Layer::<L>::new(
+            prev_size,
+            1,
+            config.output_activation,
+            &backend,
+            rng,
+        ));
 
-        Ok(Self { layers, config })
+        Ok(Self {
+            layers,
+            config,
+            backend,
+        })
     }
 
     /// Creates a child critic by crossing over two parent critics using CCA neuron alignment.
@@ -177,14 +196,15 @@ impl<L: LinAlg> MlpCritic<L> {
         if parent_a.config.input_size == child_config.input_size
             && parent_b.config.input_size == child_config.input_size
         {
-            let (layer, perm) = cca_align_and_blend_layer::<L>(
+            let (layer, perm) = cca_align_and_blend_layer(
+                &parent_a.backend,
                 &parent_a.layers[0],
                 &parent_b.layers[0],
                 caches_a.first(),
                 caches_b.first(),
                 None,
                 child_h0.size,
-                L::mat_cols(&parent_a.layers[0].weights),
+                parent_a.backend.mat_cols(&parent_a.layers[0].weights),
                 child_h0.activation,
                 alpha,
                 rng,
@@ -196,6 +216,7 @@ impl<L: LinAlg> MlpCritic<L> {
                 child_config.input_size,
                 child_h0.size,
                 child_h0.activation,
+                &parent_a.backend,
                 rng,
             ));
         }
@@ -206,7 +227,8 @@ impl<L: LinAlg> MlpCritic<L> {
             let prev_child_size = child_config.hidden_layers[h_idx - 1].size;
 
             if h_idx < num_a_hidden && h_idx < num_b_hidden {
-                let (layer, perm) = cca_align_and_blend_layer::<L>(
+                let (layer, perm) = cca_align_and_blend_layer(
+                    &parent_a.backend,
                     &parent_a.layers[h_idx],
                     &parent_b.layers[h_idx],
                     caches_a.get(h_idx),
@@ -225,6 +247,7 @@ impl<L: LinAlg> MlpCritic<L> {
                     prev_child_size,
                     child_def.size,
                     child_def.activation,
+                    &parent_a.backend,
                     rng,
                 ));
                 prev_perm = None;
@@ -236,34 +259,40 @@ impl<L: LinAlg> MlpCritic<L> {
         let a_out = parent_a.layers.last().unwrap();
         let b_out = parent_b.layers.last().unwrap();
 
-        if L::mat_cols(&a_out.weights) == last_child_hidden
-            && L::mat_cols(&b_out.weights) == last_child_hidden
+        if parent_a.backend.mat_cols(&a_out.weights) == last_child_hidden
+            && parent_a.backend.mat_cols(&b_out.weights) == last_child_hidden
         {
             let b_out_permuted = if let Some(ref pp) = prev_perm {
-                permute_cols::<L>(&b_out.weights, pp)
+                permute_cols(&parent_a.backend, &b_out.weights, pp)
             } else {
                 b_out.weights.clone()
             };
-            let mut weights = L::zeros_mat(1, last_child_hidden);
-            let mut biases = L::zeros_vec(1);
+            let mut weights = parent_a.backend.zeros_mat(1, last_child_hidden);
+            let mut biases = parent_a.backend.zeros_vec(1);
             for c in 0..last_child_hidden {
-                let va = L::mat_get(&a_out.weights, 0, c);
-                let vb = L::mat_get(&b_out_permuted, 0, c);
-                L::mat_set(&mut weights, 0, c, alpha * va + (1.0 - alpha) * vb);
+                let va = parent_a.backend.mat_get(&a_out.weights, 0, c);
+                let vb = parent_a.backend.mat_get(&b_out_permuted, 0, c);
+                parent_a
+                    .backend
+                    .mat_set(&mut weights, 0, c, alpha * va + (1.0 - alpha) * vb);
             }
-            let ba = L::vec_get(&a_out.bias, 0);
-            let bb = L::vec_get(&b_out.bias, 0);
-            L::vec_set(&mut biases, 0, alpha * ba + (1.0 - alpha) * bb);
+            let ba = parent_a.backend.vec_get(&a_out.bias, 0);
+            let bb = parent_a.backend.vec_get(&b_out.bias, 0);
+            parent_a
+                .backend
+                .vec_set(&mut biases, 0, alpha * ba + (1.0 - alpha) * bb);
             layers.push(Layer {
                 weights,
                 bias: biases,
                 activation: child_config.output_activation,
+                backend: parent_a.backend.clone(),
             });
         } else {
             layers.push(Layer::<L>::new(
                 last_child_hidden,
                 1,
                 child_config.output_activation,
+                &parent_a.backend,
                 rng,
             ));
         }
@@ -271,6 +300,7 @@ impl<L: LinAlg> MlpCritic<L> {
         Ok(Self {
             layers,
             config: child_config,
+            backend: parent_a.backend.clone(),
         })
     }
 
@@ -290,11 +320,11 @@ impl<L: LinAlg> MlpCritic<L> {
             self.config.input_size,
             input.len()
         );
-        let mut current = L::vec_from_slice(input);
+        let mut current = self.backend.vec_from_slice(input);
         for layer in &self.layers {
             current = layer.forward(&current);
         }
-        L::vec_get(&current, 0)
+        self.backend.vec_get(&current, 0)
     }
 
     /// Computes V(s) and returns both the value and hidden layer activations.
@@ -320,14 +350,14 @@ impl<L: LinAlg> MlpCritic<L> {
         );
         let num_hidden = self.config.hidden_layers.len();
         let mut hidden_states = Vec::with_capacity(num_hidden);
-        let mut current = L::vec_from_slice(input);
+        let mut current = self.backend.vec_from_slice(input);
         for (i, layer) in self.layers.iter().enumerate() {
             current = layer.forward(&current);
             if i < num_hidden {
                 hidden_states.push(current.clone());
             }
         }
-        (L::vec_get(&current, 0), hidden_states)
+        (self.backend.vec_get(&current, 0), hidden_states)
     }
 
     /// Performs one MSE-loss update and returns the loss.
@@ -347,19 +377,19 @@ impl<L: LinAlg> MlpCritic<L> {
         let mut inputs: Vec<L::Vector> = Vec::with_capacity(self.layers.len());
         let mut outputs: Vec<L::Vector> = Vec::with_capacity(self.layers.len());
 
-        let mut current = L::vec_from_slice(input);
+        let mut current = self.backend.vec_from_slice(input);
         for layer in &self.layers {
             inputs.push(current.clone());
             current = layer.forward(&current);
             outputs.push(current.clone());
         }
 
-        let predicted = L::vec_get(&current, 0);
+        let predicted = self.backend.vec_get(&current, 0);
         let error = target - predicted;
         let loss = error * error;
 
         // Output gradient: d(loss)/d(predicted) = -2*(target - predicted)
-        let mut delta = L::vec_from_slice(&[-2.0 * error]);
+        let mut delta = self.backend.vec_from_slice(&[-2.0 * error]);
 
         // Backprop through layers in reverse
         for i in (0..self.layers.len()).rev() {
@@ -384,24 +414,26 @@ impl<L: LinAlg> MlpCritic<L> {
             .layers
             .iter()
             .map(|layer| {
-                let rows = L::mat_rows(&layer.weights);
-                let cols = L::mat_cols(&layer.weights);
-                let mut cpu_weights = CpuLinAlg::zeros_mat(rows, cols);
+                let rows = self.backend.mat_rows(&layer.weights);
+                let cols = self.backend.mat_cols(&layer.weights);
+                let cpu = CpuLinAlg::new();
+                let mut cpu_weights = cpu.zeros_mat(rows, cols);
                 for r in 0..rows {
                     for c in 0..cols {
-                        CpuLinAlg::mat_set(
+                        cpu.mat_set(
                             &mut cpu_weights,
                             r,
                             c,
-                            L::mat_get(&layer.weights, r, c),
+                            self.backend.mat_get(&layer.weights, r, c),
                         );
                     }
                 }
-                let cpu_bias = L::vec_to_vec(&layer.bias);
+                let cpu_bias = self.backend.vec_to_vec(&layer.bias);
                 Layer {
                     weights: cpu_weights,
                     bias: cpu_bias,
                     activation: layer.activation,
+                    backend: CpuLinAlg::new(),
                 }
             })
             .collect();
@@ -424,6 +456,7 @@ impl<L: LinAlg> MlpCritic<L> {
     /// Returns `PcError::DimensionMismatch` if any weight matrix or bias
     /// vector has dimensions inconsistent with the config topology.
     pub fn from_weights(
+        backend: L,
         config: MlpCriticConfig,
         weights: MlpCriticWeights,
     ) -> Result<Self, PcError> {
@@ -477,30 +510,33 @@ impl<L: LinAlg> MlpCritic<L> {
             .layers
             .into_iter()
             .map(|cpu_layer| {
-                let rows = CpuLinAlg::mat_rows(&cpu_layer.weights);
-                let cols = CpuLinAlg::mat_cols(&cpu_layer.weights);
-                let mut generic_weights = L::zeros_mat(rows, cols);
+                let cpu = CpuLinAlg::new();
+                let rows = cpu.mat_rows(&cpu_layer.weights);
+                let cols = cpu.mat_cols(&cpu_layer.weights);
+                let mut generic_weights = backend.zeros_mat(rows, cols);
                 for r in 0..rows {
                     for c in 0..cols {
-                        L::mat_set(
+                        backend.mat_set(
                             &mut generic_weights,
                             r,
                             c,
-                            CpuLinAlg::mat_get(&cpu_layer.weights, r, c),
+                            cpu.mat_get(&cpu_layer.weights, r, c),
                         );
                     }
                 }
-                let generic_bias = L::vec_from_slice(&cpu_layer.bias);
+                let generic_bias = backend.vec_from_slice(&cpu_layer.bias);
                 Layer {
                     weights: generic_weights,
                     bias: generic_bias,
                     activation: cpu_layer.activation,
+                    backend: backend.clone(),
                 }
             })
             .collect();
         Ok(Self {
             layers: generic_layers,
             config,
+            backend,
         })
     }
 }
@@ -536,7 +572,8 @@ mod tests {
     #[test]
     fn test_forward_returns_finite_scalar() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![0.0; 27];
         let v = critic.forward(&input);
         assert!(v.is_finite(), "forward output {v} is not finite");
@@ -545,7 +582,8 @@ mod tests {
     #[test]
     fn test_forward_different_inputs_give_different_outputs() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let a = critic.forward(&vec![0.0; 27]);
         let mut input_b = vec![0.0; 27];
         input_b[0] = 1.0;
@@ -575,7 +613,7 @@ mod tests {
             output_activation: Activation::Linear,
             lr: 0.005,
         };
-        let critic: MlpCritic = MlpCritic::new(config, &mut rng).unwrap();
+        let critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let v = critic.forward(&vec![0.5; 27]);
         assert!(v.is_finite(), "Deep topology output {v} is not finite");
     }
@@ -583,7 +621,8 @@ mod tests {
     #[test]
     fn test_forward_extreme_input_still_finite() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input: Vec<f64> = (0..27)
             .map(|i| if i % 2 == 0 { 1e6 } else { -1e6 })
             .collect();
@@ -595,7 +634,8 @@ mod tests {
     #[should_panic]
     fn test_forward_panics_wrong_input_size() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let _ = critic.forward(&[0.0; 10]); // wrong size
     }
 
@@ -604,7 +644,8 @@ mod tests {
     #[test]
     fn test_update_loss_decreases_over_30_iterations() {
         let mut rng = make_rng();
-        let mut critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let mut critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![0.1; 27];
         let target = 0.5;
         let initial_loss = critic.update(&input, target);
@@ -621,7 +662,8 @@ mod tests {
     #[test]
     fn test_update_returns_finite_nonneg_loss() {
         let mut rng = make_rng();
-        let mut critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let mut critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let loss = critic.update(&vec![0.0; 27], 1.0);
         assert!(loss.is_finite(), "Loss {loss} is not finite");
         assert!(loss >= 0.0, "Loss {loss} is negative");
@@ -630,7 +672,8 @@ mod tests {
     #[test]
     fn test_update_changes_weights() {
         let mut rng = make_rng();
-        let mut critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let mut critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let w_before = critic.layers[0].weights.get(0, 0);
         let _ = critic.update(&vec![0.1; 27], 1.0);
         let w_after = critic.layers[0].weights.get(0, 0);
@@ -643,7 +686,8 @@ mod tests {
     #[test]
     fn test_update_clips_weights() {
         let mut rng = make_rng();
-        let mut critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let mut critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         // Extreme update to force clipping
         for _ in 0..100 {
             let _ = critic.update(&vec![10.0; 27], 1e6);
@@ -666,12 +710,14 @@ mod tests {
     #[test]
     fn test_serde_roundtrip_preserves_weights() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![0.3; 27];
         let original_output = critic.forward(&input);
 
         let weights = critic.to_weights();
-        let restored: MlpCritic = MlpCritic::from_weights(default_config(), weights).unwrap();
+        let restored: MlpCritic =
+            MlpCritic::from_weights(CpuLinAlg::new(), default_config(), weights).unwrap();
         let restored_output = restored.forward(&input);
 
         assert!(
@@ -685,11 +731,12 @@ mod tests {
     fn make_critic_cache(critic_input_size: usize, batch_size: usize) -> crate::matrix::Matrix {
         use crate::linalg::LinAlg;
         // Dummy cache: just random-ish activations
-        let mut mat = CpuLinAlg::zeros_mat(batch_size, critic_input_size);
+        let backend = CpuLinAlg::new();
+        let mut mat = backend.zeros_mat(batch_size, critic_input_size);
         for r in 0..batch_size {
             for c in 0..critic_input_size {
                 let val = ((r * critic_input_size + c) as f64 * 0.037).sin();
-                CpuLinAlg::mat_set(&mut mat, r, c, val);
+                backend.mat_set(&mut mat, r, c, val);
             }
         }
         mat
@@ -700,8 +747,10 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = default_config();
-        let critic_a: MlpCritic = MlpCritic::new(config.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(config.clone(), &mut rng_b).unwrap();
+        let critic_a: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let critic_b: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(36, 50)];
         let cache_b = vec![make_critic_cache(36, 50)];
@@ -731,8 +780,10 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = default_config();
-        let critic_a: MlpCritic = MlpCritic::new(config.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(config.clone(), &mut rng_b).unwrap();
+        let critic_a: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let critic_b: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(36, 50)];
         let cache_b = vec![make_critic_cache(36, 50)];
@@ -765,8 +816,10 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = default_config();
-        let critic_a: MlpCritic = MlpCritic::new(config.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(config.clone(), &mut rng_b).unwrap();
+        let critic_a: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let critic_b: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(36, 50)];
         let cache_b = vec![make_critic_cache(36, 50)];
@@ -804,8 +857,9 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config_36 = default_config(); // hidden [36]
-        let critic_a: MlpCritic = MlpCritic::new(config_36.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(config_36, &mut rng_b).unwrap();
+        let critic_a: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config_36.clone(), &mut rng_a).unwrap();
+        let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config_36, &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(36, 50)];
         let cache_b = vec![make_critic_cache(36, 50)];
@@ -834,7 +888,7 @@ mod tests {
         .unwrap();
 
         use crate::linalg::LinAlg;
-        assert_eq!(CpuLinAlg::mat_rows(&child.layers[0].weights), 48);
+        assert_eq!(CpuLinAlg::new().mat_rows(&child.layers[0].weights), 48);
         let v = child.forward(&vec![0.3; 27]);
         assert!(v.is_finite());
     }
@@ -852,8 +906,9 @@ mod tests {
             output_activation: Activation::Linear,
             lr: 0.005,
         };
-        let critic_a: MlpCritic = MlpCritic::new(config_48.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(config_48, &mut rng_b).unwrap();
+        let critic_a: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config_48.clone(), &mut rng_a).unwrap();
+        let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config_48, &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(48, 50)];
         let cache_b = vec![make_critic_cache(48, 50)];
@@ -873,7 +928,7 @@ mod tests {
         .unwrap();
 
         use crate::linalg::LinAlg;
-        assert_eq!(CpuLinAlg::mat_rows(&child.layers[0].weights), 36);
+        assert_eq!(CpuLinAlg::new().mat_rows(&child.layers[0].weights), 36);
         let v = child.forward(&vec![0.3; 27]);
         assert!(v.is_finite());
     }
@@ -885,7 +940,8 @@ mod tests {
     #[test]
     fn test_forward_with_hidden_returns_value_and_states() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![0.3; 27];
         let (value, hidden_states) = critic.forward_with_hidden(&input);
 
@@ -899,7 +955,8 @@ mod tests {
     #[test]
     fn test_forward_with_hidden_matches_forward() {
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(default_config(), &mut rng).unwrap();
+        let critic: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![0.3; 27];
         let value_plain = critic.forward(&input);
         let (value_hidden, _) = critic.forward_with_hidden(&input);
@@ -928,7 +985,7 @@ mod tests {
             lr: 0.005,
         };
         let mut rng = make_rng();
-        let critic: MlpCritic = MlpCritic::new(config, &mut rng).unwrap();
+        let critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config, &mut rng).unwrap();
         let input = vec![0.3; 27];
         let (value, hidden_states) = critic.forward_with_hidden(&input);
 
@@ -945,8 +1002,9 @@ mod tests {
         let mut rng_a = StdRng::seed_from_u64(42);
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = default_config();
-        let critic_a: MlpCritic = MlpCritic::new(config.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(config, &mut rng_b).unwrap();
+        let critic_a: MlpCritic =
+            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config, &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(36, 50)];
         let cache_b = vec![make_critic_cache(36, 50)];
@@ -979,7 +1037,8 @@ mod tests {
     /// Helper: build valid MlpCriticWeights from a config.
     fn valid_weights_for(config: &MlpCriticConfig) -> MlpCriticWeights {
         let mut rng = make_rng();
-        let critic = MlpCritic::<CpuLinAlg>::new(config.clone(), &mut rng).unwrap();
+        let critic =
+            MlpCritic::<CpuLinAlg>::new(CpuLinAlg::new(), config.clone(), &mut rng).unwrap();
         critic.to_weights()
     }
 
@@ -987,7 +1046,7 @@ mod tests {
     fn test_from_weights_valid_returns_ok() {
         let config = default_config();
         let weights = valid_weights_for(&config);
-        let result = MlpCritic::<CpuLinAlg>::from_weights(config, weights);
+        let result = MlpCritic::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_ok());
     }
 
@@ -998,7 +1057,7 @@ mod tests {
         // Layer 0 should be 36x27; corrupt rows to 20x27
         weights.layers[0].weights = crate::matrix::Matrix::zeros(20, 27);
         weights.layers[0].bias = vec![0.0; 20];
-        let result = MlpCritic::<CpuLinAlg>::from_weights(config, weights);
+        let result = MlpCritic::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -1012,7 +1071,7 @@ mod tests {
         let config = default_config(); // layer 0 should be 36x27
         let mut weights = valid_weights_for(&config);
         weights.layers[0].weights = crate::matrix::Matrix::zeros(36, 10); // wrong cols
-        let result = MlpCritic::<CpuLinAlg>::from_weights(config, weights);
+        let result = MlpCritic::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -1026,7 +1085,7 @@ mod tests {
         let config = default_config(); // layer 0 bias should be len 36
         let mut weights = valid_weights_for(&config);
         weights.layers[0].bias = vec![0.0; 5];
-        let result = MlpCritic::<CpuLinAlg>::from_weights(config, weights);
+        let result = MlpCritic::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -1041,7 +1100,7 @@ mod tests {
         let mut weights = valid_weights_for(&config);
         let last = weights.layers.len() - 1;
         weights.layers[last].weights = crate::matrix::Matrix::zeros(1, 10); // wrong cols
-        let result = MlpCritic::<CpuLinAlg>::from_weights(config, weights);
+        let result = MlpCritic::<CpuLinAlg>::from_weights(CpuLinAlg::new(), config, weights);
         assert!(result.is_err());
     }
 }

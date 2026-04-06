@@ -16,11 +16,22 @@ use crate::error::PcError;
 use rand::Rng;
 use std::fmt::Debug;
 
+/// Result type for SVD decomposition: `Ok((U, S, V))` or convergence error.
+pub type SvdResult<L> = Result<
+    (
+        <L as LinAlg>::Matrix,
+        <L as LinAlg>::Vector,
+        <L as LinAlg>::Matrix,
+    ),
+    PcError,
+>;
+
 /// Backend-agnostic linear algebra operations.
 ///
 /// Implementations provide concrete vector and matrix types along with
 /// all arithmetic, activation, and sampling operations needed by the
-/// PC-Actor-Critic framework.
+/// PC-Actor-Critic framework. All methods take `&self` to allow GPU
+/// backends to carry device state (e.g., CUDA context).
 ///
 /// # Associated Types
 ///
@@ -36,25 +47,24 @@ use std::fmt::Debug;
 /// handles (e.g., `wgpu::Device`, CUDA contexts) should wrap them in
 /// `Arc` to satisfy `Clone` without duplicating the underlying resource.
 ///
+/// # Serde Compatibility
+///
+/// Backends used with serde-derived structs (e.g., `Layer<L>`) must
+/// implement [`Default`] because the `backend` field uses
+/// `#[serde(skip, default)]`. `CpuLinAlg` implements `Default`.
+/// GPU backends must also implement `Default` (e.g., via a
+/// default device selection).
+///
 /// # Examples
 ///
 /// ```
 /// use pc_rl_core::linalg::cpu::CpuLinAlg;
 /// use pc_rl_core::linalg::LinAlg;
 ///
-/// let v = CpuLinAlg::zeros_vec(5);
-/// assert_eq!(CpuLinAlg::vec_len(&v), 5);
+/// let backend = CpuLinAlg::new();
+/// let v = backend.zeros_vec(5);
+/// assert_eq!(backend.vec_len(&v), 5);
 /// ```
-/// Result type for SVD decomposition: `Ok((U, S, V))` or convergence error.
-pub type SvdResult<L> = Result<
-    (
-        <L as LinAlg>::Matrix,
-        <L as LinAlg>::Vector,
-        <L as LinAlg>::Matrix,
-    ),
-    PcError,
->;
-
 pub trait LinAlg: Clone + Send + Sync + 'static {
     /// 1-D vector type.
     type Vector: Clone + Send + Sync + Debug;
@@ -64,30 +74,30 @@ pub trait LinAlg: Clone + Send + Sync + 'static {
     // ── Construction ─────────────────────────────────────────────
 
     /// Creates a zero-filled vector of the given size.
-    fn zeros_vec(size: usize) -> Self::Vector;
+    fn zeros_vec(&self, size: usize) -> Self::Vector;
 
     /// Creates a zero-filled matrix with the given dimensions.
-    fn zeros_mat(rows: usize, cols: usize) -> Self::Matrix;
+    fn zeros_mat(&self, rows: usize, cols: usize) -> Self::Matrix;
 
     /// Creates a matrix with Xavier-uniform initialization.
-    fn xavier_mat(rows: usize, cols: usize, rng: &mut impl Rng) -> Self::Matrix;
+    fn xavier_mat(&self, rows: usize, cols: usize, rng: &mut impl Rng) -> Self::Matrix;
 
     // ── Matrix ops ───────────────────────────────────────────────
 
     /// Matrix-vector multiplication: `m * v`.
-    fn mat_vec_mul(m: &Self::Matrix, v: &Self::Vector) -> Self::Vector;
+    fn mat_vec_mul(&self, m: &Self::Matrix, v: &Self::Vector) -> Self::Vector;
 
     /// Returns the transpose of the matrix.
-    fn mat_transpose(m: &Self::Matrix) -> Self::Matrix;
+    fn mat_transpose(&self, m: &Self::Matrix) -> Self::Matrix;
 
     /// Outer product of two vectors: `a * b^T`.
-    fn outer_product(a: &Self::Vector, b: &Self::Vector) -> Self::Matrix;
+    fn outer_product(&self, a: &Self::Vector, b: &Self::Vector) -> Self::Matrix;
 
     /// Matrix-matrix multiplication: `a * b`.
     ///
     /// Returns a matrix with dimensions `(rows_a, cols_b)`.
     /// Panics if `cols_a != rows_b`.
-    fn mat_mul(a: &Self::Matrix, b: &Self::Matrix) -> Self::Matrix;
+    fn mat_mul(&self, a: &Self::Matrix, b: &Self::Matrix) -> Self::Matrix;
 
     /// Singular Value Decomposition: `M = U × diag(S) × V^T`.
     ///
@@ -100,93 +110,127 @@ pub trait LinAlg: Clone + Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns `PcError::ConfigValidation` if the decomposition fails to converge.
-    fn svd(m: &Self::Matrix) -> SvdResult<Self>;
+    fn svd(&self, m: &Self::Matrix) -> SvdResult<Self>;
 
     /// Adds `scale * other` element-wise to `m` (in place).
-    fn mat_scale_add(m: &mut Self::Matrix, other: &Self::Matrix, scale: f64);
+    fn mat_scale_add(&self, m: &mut Self::Matrix, other: &Self::Matrix, scale: f64);
 
     /// Returns the number of rows.
-    fn mat_rows(m: &Self::Matrix) -> usize;
+    fn mat_rows(&self, m: &Self::Matrix) -> usize;
 
     /// Returns the number of columns.
-    fn mat_cols(m: &Self::Matrix) -> usize;
+    fn mat_cols(&self, m: &Self::Matrix) -> usize;
 
     /// Returns the element at `(row, col)`.
-    fn mat_get(m: &Self::Matrix, row: usize, col: usize) -> f64;
+    fn mat_get(&self, m: &Self::Matrix, row: usize, col: usize) -> f64;
 
     /// Sets the element at `(row, col)`.
-    fn mat_set(m: &mut Self::Matrix, row: usize, col: usize, val: f64);
+    fn mat_set(&self, m: &mut Self::Matrix, row: usize, col: usize, val: f64);
 
     // ── Vector ops ───────────────────────────────────────────────
 
     /// Element-wise addition: `a + b`.
-    fn vec_add(a: &Self::Vector, b: &Self::Vector) -> Self::Vector;
+    fn vec_add(&self, a: &Self::Vector, b: &Self::Vector) -> Self::Vector;
 
     /// Element-wise subtraction: `a - b`.
-    fn vec_sub(a: &Self::Vector, b: &Self::Vector) -> Self::Vector;
+    fn vec_sub(&self, a: &Self::Vector, b: &Self::Vector) -> Self::Vector;
 
     /// Scalar multiplication: `v * s`.
-    fn vec_scale(v: &Self::Vector, s: f64) -> Self::Vector;
+    fn vec_scale(&self, v: &Self::Vector, s: f64) -> Self::Vector;
 
     /// Element-wise (Hadamard) product: `a[i] * b[i]`.
-    fn vec_hadamard(a: &Self::Vector, b: &Self::Vector) -> Self::Vector;
+    fn vec_hadamard(&self, a: &Self::Vector, b: &Self::Vector) -> Self::Vector;
 
     /// Dot product: `sum(a[i] * b[i])`.
-    fn vec_dot(a: &Self::Vector, b: &Self::Vector) -> f64;
+    fn vec_dot(&self, a: &Self::Vector, b: &Self::Vector) -> f64;
 
     /// Returns the number of elements in the vector.
-    fn vec_len(v: &Self::Vector) -> usize;
+    fn vec_len(&self, v: &Self::Vector) -> usize;
 
     /// Returns the element at index `i`.
-    fn vec_get(v: &Self::Vector, i: usize) -> f64;
+    fn vec_get(&self, v: &Self::Vector, i: usize) -> f64;
 
     /// Sets the element at index `i`.
-    fn vec_set(v: &mut Self::Vector, i: usize, val: f64);
+    fn vec_set(&self, v: &mut Self::Vector, i: usize, val: f64);
 
     /// Creates a vector from a slice of `f64`.
-    fn vec_from_slice(s: &[f64]) -> Self::Vector;
+    fn vec_from_slice(&self, s: &[f64]) -> Self::Vector;
 
     /// Converts the vector to a `Vec<f64>` (copies data).
-    fn vec_to_vec(v: &Self::Vector) -> Vec<f64>;
-
-    /// Returns a slice view of the vector data (zero-copy for CPU).
-    ///
-    /// # CPU-only
-    ///
-    /// This method assumes the vector data lives in host memory. GPU backends
-    /// that store data in device memory cannot implement this without a copy.
-    /// Prefer [`vec_to_vec`](LinAlg::vec_to_vec) in generic code that must
-    /// work across backends. This method exists as an optimization escape
-    /// hatch when the caller knows the backend is CPU.
-    fn vec_as_slice(v: &Self::Vector) -> &[f64];
+    fn vec_to_vec(&self, v: &Self::Vector) -> Vec<f64>;
 
     // ── Clip ─────────────────────────────────────────────────────
 
     /// Clamps each element to `[-max_abs, max_abs]` in place.
-    fn clip_vec(v: &mut Self::Vector, max_abs: f64);
+    fn clip_vec(&self, v: &mut Self::Vector, max_abs: f64);
 
     /// Clamps each matrix element to `[-max_abs, max_abs]` in place.
-    fn clip_mat(m: &mut Self::Matrix, max_abs: f64);
+    fn clip_mat(&self, m: &mut Self::Matrix, max_abs: f64);
 
     // ── Activation ───────────────────────────────────────────────
 
     /// Applies an activation function element-wise.
-    fn apply_activation(v: &Self::Vector, act: Activation) -> Self::Vector;
+    fn apply_activation(&self, v: &Self::Vector, act: Activation) -> Self::Vector;
 
     /// Applies an activation derivative element-wise.
-    fn apply_derivative(v: &Self::Vector, act: Activation) -> Self::Vector;
+    fn apply_derivative(&self, v: &Self::Vector, act: Activation) -> Self::Vector;
 
     // ── Softmax / sampling ───────────────────────────────────────
 
     /// Numerically stable masked softmax.
-    fn softmax_masked(logits: &Self::Vector, mask: &[usize]) -> Self::Vector;
+    fn softmax_masked(&self, logits: &Self::Vector, mask: &[usize]) -> Self::Vector;
 
     /// Returns the index of the maximum value among masked indices.
-    fn argmax_masked(values: &Self::Vector, mask: &[usize]) -> usize;
+    fn argmax_masked(&self, values: &Self::Vector, mask: &[usize]) -> usize;
 
     /// Samples an action index from a probability distribution over masked indices.
-    fn sample_from_probs(probs: &Self::Vector, mask: &[usize], rng: &mut impl Rng) -> usize;
+    fn sample_from_probs(&self, probs: &Self::Vector, mask: &[usize], rng: &mut impl Rng) -> usize;
 
     /// Combined RMS error across multiple error vectors.
-    fn rms_error(error_vecs: &[&Self::Vector]) -> f64;
+    fn rms_error(&self, error_vecs: &[&Self::Vector]) -> f64;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CpuLinAlg;
+
+    /// Escenario 3: Operations use &self
+    #[test]
+    fn test_linalg_methods_take_self() {
+        let backend = CpuLinAlg::new();
+        let v = backend.zeros_vec(5);
+        assert_eq!(backend.vec_len(&v), 5);
+    }
+
+    /// Escenario 9: CpuLinAlg is ZST
+    #[test]
+    fn test_cpu_linalg_is_zst() {
+        assert_eq!(std::mem::size_of::<CpuLinAlg>(), 0);
+    }
+
+    /// Escenario 4: mat_vec_mul via instance
+    #[test]
+    fn test_mat_vec_mul_via_instance() {
+        let backend = CpuLinAlg::new();
+        // Identity 2x2 * [3,4] = [3,4]
+        let mut m = backend.zeros_mat(2, 2);
+        backend.mat_set(&mut m, 0, 0, 1.0);
+        backend.mat_set(&mut m, 1, 1, 1.0);
+        let v = backend.vec_from_slice(&[3.0, 4.0]);
+        let result = backend.mat_vec_mul(&m, &v);
+        assert_eq!(backend.vec_get(&result, 0), 3.0);
+        assert_eq!(backend.vec_get(&result, 1), 4.0);
+    }
+
+    /// Escenario 5: vec_as_slice removed from trait.
+    /// This is a compile-time negative check. The real verification is that
+    /// no generic code (code parameterized over L: LinAlg) can call
+    /// backend.vec_as_slice(). This test documents the removal; the compiler
+    /// enforces it.
+    #[test]
+    fn test_trait_has_31_methods() {
+        // After removing vec_as_slice, the trait has 31 methods.
+        // This is a documentation marker -- the real enforcement is the compiler.
+    }
 }
