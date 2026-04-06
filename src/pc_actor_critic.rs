@@ -671,14 +671,14 @@ fn cache_to_matrices<L: LinAlg>(backend: &L, cache: &ActivationCache<L>) -> Vec<
     for layer_idx in 0..num_layers {
         let samples = cache.layer(layer_idx);
         if samples.is_empty() {
-            matrices.push(L::zeros_mat(0, 0));
+            matrices.push(backend.zeros_mat(0, 0));
             continue;
         }
-        let n_neurons = L::vec_len(&samples[0]);
-        let mut mat = L::zeros_mat(batch_size, n_neurons);
+        let n_neurons = backend.vec_len(&samples[0]);
+        let mut mat = backend.zeros_mat(batch_size, n_neurons);
         for (r, sample) in samples.iter().enumerate() {
             for c in 0..n_neurons {
-                L::mat_set(&mut mat, r, c, L::vec_get(sample, c));
+                backend.mat_set(&mut mat, r, c, backend.vec_get(sample, c));
             }
         }
         matrices.push(mat);
@@ -734,7 +734,7 @@ mod tests {
     }
 
     fn make_agent() -> PcActorCritic {
-        let agent: PcActorCritic = PcActorCritic::new(default_config(), 42).unwrap();
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), default_config(), 42).unwrap();
         agent
     }
 
@@ -1613,6 +1613,6 @@ mod tests {
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
         let mat = CpuLinAlg::new().zeros_mat(10, 3);
-        let _perm = crate::matrix::cca_neuron_alignment::<CpuLinAlg>(&mat, &mat).unwrap();
+        let _perm = crate::matrix::cca_neuron_alignment::<CpuLinAlg>(&CpuLinAlg::new(), &mat, &mat).unwrap();
     }
 }

@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn test_cpu_linalg_default_equals_new() {
         let a = CpuLinAlg::new();
-        let b = CpuLinAlg::default();
+        let b: CpuLinAlg = Default::default();
         // Both are ZST -- they're identical
         assert_eq!(std::mem::size_of_val(&a), 0);
         assert_eq!(std::mem::size_of_val(&b), 0);

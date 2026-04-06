@@ -225,7 +225,7 @@ pub enum SelectionMode {
 ///     rezero_init: 0.001,
 /// };
 /// let mut rng = StdRng::seed_from_u64(42);
-/// let actor: PcActor = PcActor::new(config, &mut rng).unwrap();
+/// let actor: PcActor = PcActor::new(CpuLinAlg::new(), config, &mut rng).unwrap();
 /// let result = actor.infer(&[0.0; 9]);
 /// assert_eq!(result.y_conv.len(), 9);
 /// ```
@@ -1377,7 +1377,7 @@ mod tests {
     #[test]
     fn test_infer_converges_on_zero_board() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         // Should complete without panic; all finite
         for &v in &result.y_conv {
@@ -1413,7 +1413,7 @@ mod tests {
     #[test]
     fn test_infer_does_not_modify_weights() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let weights_before: Vec<Vec<f64>> = actor
             .layers
             .iter()
@@ -1428,7 +1428,7 @@ mod tests {
     #[test]
     fn test_infer_latent_size_single_hidden() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert_eq!(result.latent_concat.len(), 18);
     }
@@ -1436,7 +1436,7 @@ mod tests {
     #[test]
     fn test_infer_latent_size_two_hidden() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(two_hidden_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), two_hidden_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert_eq!(result.latent_concat.len(), 30);
     }
@@ -1444,7 +1444,7 @@ mod tests {
     #[test]
     fn test_infer_latent_size_matches_latent_size_method() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(two_hidden_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), two_hidden_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert_eq!(result.latent_concat.len(), actor.latent_size());
     }
@@ -1452,7 +1452,7 @@ mod tests {
     #[test]
     fn test_infer_y_conv_length_equals_output_size() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert_eq!(result.y_conv.len(), 9);
     }
@@ -1460,7 +1460,7 @@ mod tests {
     #[test]
     fn test_infer_hidden_states_count_matches_hidden_layers() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(two_hidden_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), two_hidden_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert_eq!(result.hidden_states.len(), 2);
     }
@@ -1468,7 +1468,7 @@ mod tests {
     #[test]
     fn test_infer_all_outputs_finite() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let result = actor.infer(&[1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5]);
         for &v in &result.y_conv {
             assert!(v.is_finite());
@@ -1482,7 +1482,7 @@ mod tests {
     #[test]
     fn test_infer_surprise_score_nonnegative() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert!(result.surprise_score >= 0.0);
     }
@@ -1490,7 +1490,7 @@ mod tests {
     #[test]
     fn test_infer_synchronous_and_inplace_both_converge() {
         let mut rng = make_rng();
-        let sync_actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let sync_actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let mut rng2 = make_rng();
         let inplace_config = PcActorConfig {
             synchronous: false,
@@ -1550,7 +1550,7 @@ mod tests {
     #[should_panic(expected = "input size")]
     fn test_infer_panics_wrong_input_length() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let _ = actor.infer(&[0.0; 5]);
     }
 
@@ -1559,7 +1559,7 @@ mod tests {
     #[test]
     fn test_select_action_training_always_in_valid() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let logits = vec![0.1, -0.2, 0.5, -0.1, 0.3, 0.0, -0.3, 0.2, 0.4];
         let valid = vec![0, 2, 4, 6, 8];
         for _ in 0..20 {
@@ -1573,7 +1573,7 @@ mod tests {
         let mut rng1 = StdRng::seed_from_u64(1);
         let mut rng2 = StdRng::seed_from_u64(99);
         let mut rng_init = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng_init).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng_init).unwrap();
         let logits = vec![0.1, -0.2, 0.5, -0.1, 0.3, 0.0, -0.3, 0.2, 0.4];
         let valid = vec![0, 2, 4, 6, 8];
         let a1 = actor.select_action(&logits, &valid, SelectionMode::Play, &mut rng1);
@@ -1605,7 +1605,7 @@ mod tests {
     #[should_panic]
     fn test_select_action_empty_valid_panics() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let logits = vec![0.1; 9];
         let _ = actor.select_action(&logits, &[], SelectionMode::Training, &mut rng);
     }
@@ -1615,7 +1615,7 @@ mod tests {
     #[test]
     fn test_update_weights_changes_first_layer() {
         let mut rng = make_rng();
-        let mut actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
         let infer_result = actor.infer(&input);
         let weights_before = actor.layers[0].weights.data.clone();
@@ -1627,7 +1627,7 @@ mod tests {
     #[test]
     fn test_update_weights_clips_all_layers() {
         let mut rng = make_rng();
-        let mut actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![1.0; 9];
         let infer_result = actor.infer(&input);
         let delta = vec![1e6; 9];
@@ -1645,7 +1645,7 @@ mod tests {
     #[test]
     fn test_update_weights_two_hidden_changes_both_layers() {
         let mut rng = make_rng();
-        let mut actor: PcActor = PcActor::new(two_hidden_config(), &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), two_hidden_config(), &mut rng).unwrap();
         let input = vec![0.5; 9];
         let infer_result = actor.infer(&input);
         let w0_before = actor.layers[0].weights.data.clone();
@@ -1666,7 +1666,7 @@ mod tests {
     #[should_panic(expected = "input size")]
     fn test_update_weights_panics_wrong_x_size() {
         let mut rng = make_rng();
-        let mut actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let input = vec![0.0; 9];
         let infer_result = actor.infer(&input);
         let delta = vec![0.1; 9];
@@ -1843,7 +1843,7 @@ mod tests {
     fn test_residual_homogeneous_no_projection() {
         // [27, 27]: same sizes → no projection needed
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), residual_two_hidden_config(), &mut rng).unwrap();
         assert_eq!(actor.skip_projections.len(), 1);
         assert!(actor.skip_projections[0].is_none());
     }
@@ -1919,14 +1919,14 @@ mod tests {
     #[test]
     fn test_non_residual_actor_empty_rezero_alpha() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         assert!(actor.rezero_alpha.is_empty());
     }
 
     #[test]
     fn test_residual_two_hidden_one_rezero_alpha() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), residual_two_hidden_config(), &mut rng).unwrap();
         assert_eq!(actor.rezero_alpha.len(), 1);
     }
 
@@ -1996,7 +1996,7 @@ mod tests {
     fn test_residual_false_identical_to_non_residual() {
         let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
         let mut rng1 = make_rng();
-        let actor1: PcActor = PcActor::new(two_hidden_config(), &mut rng1).unwrap();
+        let actor1: PcActor = PcActor::new(CpuLinAlg::new(), two_hidden_config(), &mut rng1).unwrap();
         let result1 = actor1.infer(&input);
 
         let mut rng2 = make_rng();
@@ -2035,7 +2035,7 @@ mod tests {
     #[test]
     fn test_residual_infer_all_outputs_finite() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), residual_two_hidden_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.5; 9]);
         for &v in &result.y_conv {
             assert!(v.is_finite());
@@ -2049,7 +2049,7 @@ mod tests {
     #[test]
     fn test_residual_latent_concat_size() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), residual_two_hidden_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.5; 9]);
         assert_eq!(result.latent_concat.len(), 54); // 27 + 27
     }
@@ -2071,7 +2071,7 @@ mod tests {
     #[test]
     fn test_residual_hidden_states_count() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), residual_two_hidden_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.5; 9]);
         assert_eq!(result.hidden_states.len(), 2);
     }
@@ -2079,7 +2079,7 @@ mod tests {
     #[test]
     fn test_residual_infer_does_not_modify_weights() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), residual_two_hidden_config(), &mut rng).unwrap();
         let weights_before: Vec<Vec<f64>> = actor
             .layers
             .iter()
@@ -2124,7 +2124,7 @@ mod tests {
     #[test]
     fn test_residual_tanh_components_populated() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), residual_two_hidden_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.5; 9]);
         assert_eq!(result.tanh_components.len(), 2);
         assert!(result.tanh_components[0].is_none()); // layer 0: no skip
@@ -2169,7 +2169,7 @@ mod tests {
         let delta = vec![0.1; 9];
 
         let mut rng1 = make_rng();
-        let mut actor1: PcActor = PcActor::new(two_hidden_config(), &mut rng1).unwrap();
+        let mut actor1: PcActor = PcActor::new(CpuLinAlg::new(), two_hidden_config(), &mut rng1).unwrap();
         let infer1 = actor1.infer(&input);
         actor1.update_weights(&delta, &infer1, &input, 1.0);
 
@@ -2190,7 +2190,7 @@ mod tests {
     #[test]
     fn test_residual_update_changes_all_layer_weights() {
         let mut rng = make_rng();
-        let mut actor: PcActor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), residual_two_hidden_config(), &mut rng).unwrap();
         let input = vec![0.5; 9];
         let infer_result = actor.infer(&input);
         let w0 = actor.layers[0].weights.data.clone();
@@ -2208,7 +2208,7 @@ mod tests {
     #[test]
     fn test_residual_update_changes_rezero_alpha() {
         let mut rng = make_rng();
-        let mut actor: PcActor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), residual_two_hidden_config(), &mut rng).unwrap();
         let input = vec![0.5; 9];
         let infer_result = actor.infer(&input);
         let alpha_before = actor.rezero_alpha.clone();
@@ -2222,7 +2222,7 @@ mod tests {
     #[test]
     fn test_residual_update_clips_weights() {
         let mut rng = make_rng();
-        let mut actor: PcActor = PcActor::new(residual_two_hidden_config(), &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), residual_two_hidden_config(), &mut rng).unwrap();
         let input = vec![1.0; 9];
         let infer_result = actor.infer(&input);
         actor.update_weights(&[1e6; 9], &infer_result, &input, 1.0);
@@ -2317,7 +2317,7 @@ mod tests {
     #[test]
     fn test_infer_prediction_errors_count_matches_hidden_layers() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert_eq!(result.prediction_errors.len(), 1);
     }
@@ -2325,7 +2325,7 @@ mod tests {
     #[test]
     fn test_infer_prediction_errors_two_hidden() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(two_hidden_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), two_hidden_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         assert_eq!(result.prediction_errors.len(), 2);
     }
@@ -2345,7 +2345,7 @@ mod tests {
     #[test]
     fn test_infer_prediction_errors_all_finite() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let result = actor.infer(&[1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5]);
         for errors in &result.prediction_errors {
             for &e in errors {
@@ -2357,7 +2357,7 @@ mod tests {
     #[test]
     fn test_infer_prediction_errors_size_matches_hidden_layer_size() {
         let mut rng = make_rng();
-        let actor: PcActor = PcActor::new(default_config(), &mut rng).unwrap();
+        let actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng).unwrap();
         let result = actor.infer(&[0.0; 9]);
         // default_config has one hidden layer of size 18
         assert_eq!(result.prediction_errors[0].len(), 18);
@@ -2375,7 +2375,7 @@ mod tests {
     #[test]
     fn test_local_learning_update_changes_weights() {
         let mut rng = make_rng();
-        let mut actor: PcActor = PcActor::new(local_learning_config(), &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), local_learning_config(), &mut rng).unwrap();
         let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
         let infer_result = actor.infer(&input);
         let weights_before = actor.layers[0].weights.data.clone();
@@ -2387,7 +2387,7 @@ mod tests {
     #[test]
     fn test_local_learning_clips_weights() {
         let mut rng = make_rng();
-        let mut actor: PcActor = PcActor::new(local_learning_config(), &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), local_learning_config(), &mut rng).unwrap();
         let input = vec![1.0; 9];
         let infer_result = actor.infer(&input);
         let delta = vec![1e6; 9];
@@ -2433,13 +2433,13 @@ mod tests {
 
         // Backprop actor
         let mut rng1 = make_rng();
-        let mut bp_actor: PcActor = PcActor::new(default_config(), &mut rng1).unwrap();
+        let mut bp_actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng1).unwrap();
         let bp_infer = bp_actor.infer(&input);
         bp_actor.update_weights(&delta, &bp_infer, &input, 1.0);
 
         // Local learning actor (same initial weights)
         let mut rng2 = make_rng();
-        let mut ll_actor: PcActor = PcActor::new(local_learning_config(), &mut rng2).unwrap();
+        let mut ll_actor: PcActor = PcActor::new(CpuLinAlg::new(), local_learning_config(), &mut rng2).unwrap();
         let ll_infer = ll_actor.infer(&input);
         ll_actor.update_weights(&delta, &ll_infer, &input, 1.0);
 
@@ -2466,13 +2466,13 @@ mod tests {
 
         // Pure backprop (local_learning=false, default)
         let mut rng1 = make_rng();
-        let mut bp_actor: PcActor = PcActor::new(default_config(), &mut rng1).unwrap();
+        let mut bp_actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng1).unwrap();
         let bp_infer = bp_actor.infer(&input);
         bp_actor.update_weights(&delta, &bp_infer, &input, 1.0);
 
         // lambda=1.0 should be identical to backprop
         let mut rng2 = make_rng();
-        let mut lam_actor: PcActor = PcActor::new(hybrid_config(1.0), &mut rng2).unwrap();
+        let mut lam_actor: PcActor = PcActor::new(CpuLinAlg::new(), hybrid_config(1.0), &mut rng2).unwrap();
         let lam_infer = lam_actor.infer(&input);
         lam_actor.update_weights(&delta, &lam_infer, &input, 1.0);
 
@@ -2489,13 +2489,13 @@ mod tests {
 
         // Pure local (local_learning=true)
         let mut rng1 = make_rng();
-        let mut ll_actor: PcActor = PcActor::new(local_learning_config(), &mut rng1).unwrap();
+        let mut ll_actor: PcActor = PcActor::new(CpuLinAlg::new(), local_learning_config(), &mut rng1).unwrap();
         let ll_infer = ll_actor.infer(&input);
         ll_actor.update_weights(&delta, &ll_infer, &input, 1.0);
 
         // lambda=0.0 should be identical to pure local
         let mut rng2 = make_rng();
-        let mut lam_actor: PcActor = PcActor::new(hybrid_config(0.0), &mut rng2).unwrap();
+        let mut lam_actor: PcActor = PcActor::new(CpuLinAlg::new(), hybrid_config(0.0), &mut rng2).unwrap();
         let lam_infer = lam_actor.infer(&input);
         lam_actor.update_weights(&delta, &lam_infer, &input, 1.0);
 
@@ -2512,19 +2512,19 @@ mod tests {
 
         // Pure backprop
         let mut rng1 = make_rng();
-        let mut bp_actor: PcActor = PcActor::new(default_config(), &mut rng1).unwrap();
+        let mut bp_actor: PcActor = PcActor::new(CpuLinAlg::new(), default_config(), &mut rng1).unwrap();
         let bp_infer = bp_actor.infer(&input);
         bp_actor.update_weights(&delta, &bp_infer, &input, 1.0);
 
         // Pure local
         let mut rng2 = make_rng();
-        let mut ll_actor: PcActor = PcActor::new(local_learning_config(), &mut rng2).unwrap();
+        let mut ll_actor: PcActor = PcActor::new(CpuLinAlg::new(), local_learning_config(), &mut rng2).unwrap();
         let ll_infer = ll_actor.infer(&input);
         ll_actor.update_weights(&delta, &ll_infer, &input, 1.0);
 
         // Hybrid lambda=0.5
         let mut rng3 = make_rng();
-        let mut hy_actor: PcActor = PcActor::new(hybrid_config(0.5), &mut rng3).unwrap();
+        let mut hy_actor: PcActor = PcActor::new(CpuLinAlg::new(), hybrid_config(0.5), &mut rng3).unwrap();
         let hy_infer = hy_actor.infer(&input);
         hy_actor.update_weights(&delta, &hy_infer, &input, 1.0);
 
@@ -2541,7 +2541,7 @@ mod tests {
     #[test]
     fn test_local_lambda_changes_weights() {
         let mut rng = make_rng();
-        let mut actor: PcActor = PcActor::new(hybrid_config(0.5), &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), hybrid_config(0.5), &mut rng).unwrap();
         let input = vec![1.0, -1.0, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5];
         let infer_result = actor.infer(&input);
         let weights_before = actor.layers[0].weights.data.clone();
@@ -2553,7 +2553,7 @@ mod tests {
     #[test]
     fn test_local_lambda_clips_weights() {
         let mut rng = make_rng();
-        let mut actor: PcActor = PcActor::new(hybrid_config(0.5), &mut rng).unwrap();
+        let mut actor: PcActor = PcActor::new(CpuLinAlg::new(), hybrid_config(0.5), &mut rng).unwrap();
         let input = vec![1.0; 9];
         let infer_result = actor.infer(&input);
         let delta = vec![1e6; 9];
@@ -2777,7 +2777,7 @@ mod tests {
             for &w in &layer.weights.data {
                 assert!(w.is_finite(), "NaN/Inf in layer {i} weights");
             }
-            for b in CpuLinAlg::vec_to_vec(&layer.bias) {
+            for b in CpuLinAlg::new().vec_to_vec(&layer.bias) {
                 assert!(b.is_finite(), "NaN/Inf in layer {i} biases");
             }
         }
@@ -3221,7 +3221,7 @@ mod tests {
 
         // Get CCA permutation for layer 0 to check if it's non-trivial
         let perm0 =
-            crate::matrix::cca_neuron_alignment::<CpuLinAlg>(&cache_mats_a[0], &cache_mats_b[0])
+            crate::matrix::cca_neuron_alignment(&CpuLinAlg::new(), &cache_mats_a[0], &cache_mats_b[0])
                 .unwrap();
         let is_nontrivial = perm0.iter().enumerate().any(|(i, &p)| i != p);
 
@@ -3341,7 +3341,7 @@ mod tests {
     /// an actor and extracting its weights.
     fn valid_weights_for(config: &PcActorConfig) -> crate::serializer::PcActorWeights {
         let mut rng = make_rng();
-        let actor = PcActor::<CpuLinAlg>::new(config.clone(), &mut rng).unwrap();
+        let actor = PcActor::<CpuLinAlg>::new(CpuLinAlg::new(), config.clone(), &mut rng).unwrap();
         actor.to_weights()
     }
 

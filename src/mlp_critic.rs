@@ -960,7 +960,7 @@ mod tests {
         let mut rng_b = StdRng::seed_from_u64(123);
         let config = default_config();
         let critic_a: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(config, &mut rng_b).unwrap();
+        let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config, &mut rng_b).unwrap();
 
         let cache_a = vec![make_critic_cache(36, 50)];
         let cache_b = vec![make_critic_cache(36, 50)];

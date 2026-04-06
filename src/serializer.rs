@@ -143,20 +143,11 @@ pub fn save_agent<L: LinAlg>(
 /// Returns `PcError::Io` if the file doesn't exist, `PcError::Serialization`
 /// for invalid JSON, or `PcError::DimensionMismatch` if the saved weights
 /// don't match the config topology.
-pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError> {
-    let json = std::fs::read_to_string(path)?;
-    let save_file: SaveFile = serde_json::from_str(&json)?;
-
-    let actor = PcActor::from_weights(save_file.config.actor.clone(), save_file.actor_weights)?;
-    let critic =
-        MlpCritic::from_weights(save_file.config.critic.clone(), save_file.critic_weights)?;
-
-    use rand::SeedableRng;
-    let rng = rand::rngs::StdRng::from_entropy();
-
-    let agent = PcActorCritic::from_parts(save_file.config, actor, critic, rng);
-
-    Ok((agent, save_file.metadata))
+pub fn load_agent(
+    path: &str,
+    backend: crate::linalg::cpu::CpuLinAlg,
+) -> Result<(PcActorCritic, AgentMetadata), PcError> {
+    load_agent_generic(path, backend)
 }
 
 /// Loads an agent from a JSON save file with a specific `LinAlg` backend.
@@ -177,19 +168,26 @@ pub fn load_agent(path: &str) -> Result<(PcActorCritic, AgentMetadata), PcError>
 /// don't match the config topology.
 pub fn load_agent_generic<L: LinAlg>(
     path: &str,
+    backend: L,
 ) -> Result<(PcActorCritic<L>, AgentMetadata), PcError> {
     let json = std::fs::read_to_string(path)?;
     let save_file: SaveFile = serde_json::from_str(&json)?;
 
-    let actor =
-        PcActor::<L>::from_weights(save_file.config.actor.clone(), save_file.actor_weights)?;
-    let critic =
-        MlpCritic::<L>::from_weights(save_file.config.critic.clone(), save_file.critic_weights)?;
+    let actor = PcActor::<L>::from_weights(
+        backend.clone(),
+        save_file.config.actor.clone(),
+        save_file.actor_weights,
+    )?;
+    let critic = MlpCritic::<L>::from_weights(
+        backend.clone(),
+        save_file.config.critic.clone(),
+        save_file.critic_weights,
+    )?;
 
     use rand::SeedableRng;
     let rng = rand::rngs::StdRng::from_entropy();
 
-    let agent = PcActorCritic::from_parts(save_file.config, actor, critic, rng);
+    let agent = PcActorCritic::from_parts(save_file.config, actor, critic, rng, backend);
 
     Ok((agent, save_file.metadata))
 }
@@ -295,7 +293,8 @@ mod tests {
     }
 
     fn make_agent() -> PcActorCritic {
-        let agent: PcActorCritic = PcActorCritic::new(default_config(), 42).unwrap();
+        use crate::linalg::cpu::CpuLinAlg;
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), default_config(), 42).unwrap();
         agent
     }
 
@@ -324,7 +323,7 @@ mod tests {
         let agent = make_agent();
         let path = temp_path("test_actor_roundtrip.json");
         save_agent(&agent, &path, 10, None).unwrap();
-        let (loaded, _) = load_agent(&path).unwrap();
+        let (loaded, _) = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
         for (orig, loaded_layer) in agent.actor.layers.iter().zip(loaded.actor.layers.iter()) {
             assert_vecs_approx_eq(&orig.weights.data, &loaded_layer.weights.data);
             assert_vecs_approx_eq(&orig.bias, &loaded_layer.bias);
@@ -337,7 +336,7 @@ mod tests {
         let agent = make_agent();
         let path = temp_path("test_critic_roundtrip.json");
         save_agent(&agent, &path, 10, None).unwrap();
-        let (loaded, _) = load_agent(&path).unwrap();
+        let (loaded, _) = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
         for (orig, loaded_layer) in agent.critic.layers.iter().zip(loaded.critic.layers.iter()) {
             assert_vecs_approx_eq(&orig.weights.data, &loaded_layer.weights.data);
             assert_vecs_approx_eq(&orig.bias, &loaded_layer.bias);
@@ -350,7 +349,7 @@ mod tests {
         let agent = make_agent();
         let path = temp_path("test_config_roundtrip.json");
         save_agent(&agent, &path, 10, None).unwrap();
-        let (loaded, _) = load_agent(&path).unwrap();
+        let (loaded, _) = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
         assert_eq!(loaded.config.gamma, agent.config.gamma);
         assert_eq!(
             loaded.config.actor.input_size,
@@ -369,7 +368,7 @@ mod tests {
         let agent = make_agent();
         let path = temp_path("test_metadata.json");
         save_agent(&agent, &path, 42, None).unwrap();
-        let (_, metadata) = load_agent(&path).unwrap();
+        let (_, metadata) = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
         assert!(!metadata.version.is_empty());
         assert_eq!(metadata.episode, 42);
         assert!(!metadata.created.is_empty());
@@ -394,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_load_nonexistent_returns_error() {
-        let result = load_agent("/nonexistent/path/agent.json");
+        let result = load_agent("/nonexistent/path/agent.json", crate::linalg::cpu::CpuLinAlg::new());
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(
@@ -407,7 +406,7 @@ mod tests {
     fn test_load_invalid_json_returns_error() {
         let path = temp_path("test_invalid.json");
         fs::write(&path, "not valid json {{{").unwrap();
-        let result = load_agent(&path);
+        let result = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new());
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(
@@ -434,7 +433,7 @@ mod tests {
         let tampered = serde_json::to_string_pretty(&save_file).unwrap();
         fs::write(&path, tampered).unwrap();
 
-        let result = load_agent(&path);
+        let result = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new());
         assert!(result.is_err());
         let err = result.err().unwrap();
         assert!(
@@ -450,8 +449,8 @@ mod tests {
         let path = temp_path("test_seed_entropy.json");
         save_agent(&agent, &path, 10, None).unwrap();
 
-        let (mut loaded1, _) = load_agent(&path).unwrap();
-        let (mut loaded2, _) = load_agent(&path).unwrap();
+        let (mut loaded1, _) = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
+        let (mut loaded2, _) = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
 
         // Both agents should produce different action sequences
         // because they use entropy-based RNG seeding
@@ -479,7 +478,7 @@ mod tests {
         let agent = make_agent();
         let path = temp_path("test_identical_infer.json");
         save_agent(&agent, &path, 10, None).unwrap();
-        let (loaded, _) = load_agent(&path).unwrap();
+        let (loaded, _) = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
 
         let input = vec![0.5, -0.5, 1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0];
         let orig_result = agent.infer(&input);
@@ -545,7 +544,7 @@ mod tests {
             },
             ..default_config()
         };
-        let mut agent: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(crate::linalg::cpu::CpuLinAlg::new(), config, 42).unwrap();
         // Train one step to modify rezero_alpha
         let input = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
@@ -570,7 +569,7 @@ mod tests {
 
         let path = temp_path("test_rezero_roundtrip.json");
         save_agent(&agent, &path, 10, None).unwrap();
-        let (loaded, _) = load_agent(&path).unwrap();
+        let (loaded, _) = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
         assert_eq!(
             loaded.actor.rezero_alpha, alpha_after_train,
             "Loaded rezero_alpha should match trained value, not rezero_init"
@@ -585,7 +584,7 @@ mod tests {
 
         let path = temp_path("test_nonresidual_compat.json");
         save_agent(&agent, &path, 10, None).unwrap();
-        let (loaded, _) = load_agent(&path).unwrap();
+        let (loaded, _) = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
         assert!(loaded.actor.rezero_alpha.is_empty());
         let _ = fs::remove_file(&path);
     }
@@ -596,9 +595,9 @@ mod tests {
         let path = temp_path("test_generic_load.json");
         save_agent(&agent, &path, 10, None).unwrap();
 
-        let (loaded_default, _) = load_agent(&path).unwrap();
+        let (loaded_default, _) = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
         let (loaded_generic, _) =
-            load_agent_generic::<crate::linalg::cpu::CpuLinAlg>(&path).unwrap();
+            load_agent_generic::<crate::linalg::cpu::CpuLinAlg>(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
 
         let input = vec![0.5, -0.5, 1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0];
         let r1 = loaded_default.infer(&input);
@@ -635,7 +634,7 @@ mod tests {
             },
             ..default_config()
         };
-        let mut agent: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(crate::linalg::cpu::CpuLinAlg::new(), config, 42).unwrap();
         // Train to modify projection weights
         let input = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
@@ -662,7 +661,7 @@ mod tests {
 
         let path = temp_path("test_skip_proj_roundtrip.json");
         save_agent(&agent, &path, 10, None).unwrap();
-        let (loaded, _) = load_agent(&path).unwrap();
+        let (loaded, _) = load_agent(&path, crate::linalg::cpu::CpuLinAlg::new()).unwrap();
 
         let loaded_proj = loaded.actor.skip_projections[0].as_ref().unwrap();
         assert_eq!(orig_data.len(), loaded_proj.data.len());
@@ -674,4 +673,5 @@ mod tests {
         }
         let _ = fs::remove_file(&path);
     }
+
 }

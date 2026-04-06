@@ -1246,7 +1246,7 @@ mod tests {
         }
         let act_b = act_a.clone();
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&backend, &act_a, &act_b).unwrap();
         assert_eq!(perm.len(), n_neurons);
         assert_eq!(perm, vec![0, 1, 2]);
     }
@@ -1269,7 +1269,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act, \&act).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&backend, &act, &act).unwrap();
         assert_eq!(perm.len(), 4);
     }
 
@@ -1306,7 +1306,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&backend, &act_a, &act_b).unwrap();
         assert_eq!(perm, vec![2, 0, 1]);
     }
 
@@ -1338,7 +1338,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&backend, &act_a, &act_b).unwrap();
         assert_eq!(perm, vec![1, 2, 0]);
     }
 
@@ -1370,7 +1370,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&backend, &act_a, &act_b).unwrap();
         assert_eq!(perm, vec![3, 1, 0, 2]);
     }
 
@@ -1402,7 +1402,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&backend, &act_a, &act_b).unwrap();
         assert_eq!(perm.len(), 3);
     }
 
@@ -1432,7 +1432,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&backend, &act_a, &act_b).unwrap();
         assert_eq!(perm.len(), 3);
     }
 
@@ -1463,7 +1463,7 @@ mod tests {
             backend.mat_set(&mut act_b, r, 2, backend.mat_get(&act_a, r, 2));
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&backend, &act_a, &act_b).unwrap();
         // Should produce a valid permutation of length 3, no panic
         assert_eq!(perm.len(), n_neurons);
         // All indices in range [0, n_neurons)
@@ -1580,7 +1580,7 @@ mod tests {
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(&backend, &act_a, &act_b).unwrap();
 
         // With Hungarian, the optimal assignment should recover the true permutation
         assert_eq!(
