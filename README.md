@@ -154,7 +154,7 @@ No PyTorch, TensorFlow, or any ML framework. Pure Rust from scratch.
 
 ## Testing
 
-391 unit tests + 20 doctests:
+392 unit tests + 20 doctests:
 
 ```bash
 cargo nextest run
