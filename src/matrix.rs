@@ -438,12 +438,13 @@ pub(crate) fn vec_scale(v: &[f64], s: f64) -> Vec<f64> {
 /// A permutation vector of length `min(n_a, n_b)` where `perm[i]` is the
 /// index of the neuron in A that B's neuron `i` maps to.
 pub fn cca_neuron_alignment<L: crate::linalg::LinAlg>(
+    backend: &L,
     act_a: &L::Matrix,
     act_b: &L::Matrix,
 ) -> Result<Vec<usize>, crate::error::PcError> {
-    let batch_size = L::mat_rows(act_a);
-    let n_a = L::mat_cols(act_a);
-    let n_b = L::mat_cols(act_b);
+    let batch_size = backend.mat_rows(act_a);
+    let n_a = backend.mat_cols(act_a);
+    let n_b = backend.mat_cols(act_b);
     let k = n_a.min(n_b);
 
     if k == 0 || batch_size < 2 {
@@ -451,37 +452,37 @@ pub fn cca_neuron_alignment<L: crate::linalg::LinAlg>(
     }
 
     // Phase 1: Standardize columns (mean=0, std=1)
-    let std_a = standardize_columns::<L>(act_a);
-    let std_b = standardize_columns::<L>(act_b);
+    let std_a = standardize_columns(backend, act_a);
+    let std_b = standardize_columns(backend, act_b);
 
     let scale = 1.0 / (batch_size as f64 - 1.0);
 
     // Phase 2: Compute covariance matrices
-    let std_a_t = L::mat_transpose(&std_a);
-    let std_b_t = L::mat_transpose(&std_b);
+    let std_a_t = backend.mat_transpose(&std_a);
+    let std_b_t = backend.mat_transpose(&std_b);
 
-    let mut c_a = L::mat_mul(&std_a_t, &std_a); // n_a × n_a
-    let mut c_b = L::mat_mul(&std_b_t, &std_b); // n_b × n_b
-    let mut c_ab = L::mat_mul(&std_a_t, &std_b); // n_a × n_b
+    let mut c_a = backend.mat_mul(&std_a_t, &std_a); // n_a × n_a
+    let mut c_b = backend.mat_mul(&std_b_t, &std_b); // n_b × n_b
+    let mut c_ab = backend.mat_mul(&std_a_t, &std_b); // n_a × n_b
 
     // Scale by 1/(batch_size - 1)
-    scale_matrix::<L>(&mut c_a, n_a, n_a, scale);
-    scale_matrix::<L>(&mut c_b, n_b, n_b, scale);
-    scale_matrix::<L>(&mut c_ab, n_a, n_b, scale);
+    scale_matrix(backend, &mut c_a, n_a, n_a, scale);
+    scale_matrix(backend, &mut c_b, n_b, n_b, scale);
+    scale_matrix(backend, &mut c_ab, n_a, n_b, scale);
 
     // Phase 3: Compute C_a^(-1/2) and C_b^(-1/2) via SVD
-    let c_a_inv_sqrt = mat_inv_sqrt::<L>(&c_a)?;
-    let c_b_inv_sqrt = mat_inv_sqrt::<L>(&c_b)?;
+    let c_a_inv_sqrt = mat_inv_sqrt(backend, &c_a)?;
+    let c_b_inv_sqrt = mat_inv_sqrt(backend, &c_b)?;
 
     // M = C_a^(-1/2) × C_ab × C_b^(-1/2)
-    let temp = L::mat_mul(&c_a_inv_sqrt, &c_ab);
-    let m = L::mat_mul(&temp, &c_b_inv_sqrt);
+    let temp = backend.mat_mul(&c_a_inv_sqrt, &c_ab);
+    let m = backend.mat_mul(&temp, &c_b_inv_sqrt);
 
     // SVD(M) → U, S, V
-    let (u, s, v) = L::svd(&m)?;
+    let (u, s, v) = backend.svd(&m)?;
 
     // Phase 4: Build cost matrix and solve optimal assignment via Hungarian
-    let n_canonical = L::mat_cols(&u).min(L::mat_cols(&v));
+    let n_canonical = backend.mat_cols(&u).min(backend.mat_cols(&v));
 
     // Cost matrix: cost[b][a] = -similarity(a, b)
     // similarity = sum_k S[k] * |U[a,k]| * |V[b,k]|
@@ -490,8 +491,8 @@ pub fn cca_neuron_alignment<L: crate::linalg::LinAlg>(
         for (a, cost_cell) in cost_row.iter_mut().enumerate() {
             let mut sim = 0.0;
             for kk in 0..n_canonical {
-                let sk = L::vec_get(&s, kk);
-                sim += sk * L::mat_get(&u, a, kk).abs() * L::mat_get(&v, b, kk).abs();
+                let sk = backend.vec_get(&s, kk);
+                sim += sk * backend.mat_get(&u, a, kk).abs() * backend.mat_get(&v, b, kk).abs();
             }
             *cost_cell = -sim; // Negate: Hungarian minimizes
         }
@@ -511,42 +512,48 @@ pub fn cca_neuron_alignment<L: crate::linalg::LinAlg>(
 }
 
 /// Scale all elements of a matrix by a scalar.
-fn scale_matrix<L: crate::linalg::LinAlg>(m: &mut L::Matrix, rows: usize, cols: usize, s: f64) {
+fn scale_matrix<L: crate::linalg::LinAlg>(
+    backend: &L,
+    m: &mut L::Matrix,
+    rows: usize,
+    cols: usize,
+    s: f64,
+) {
     for r in 0..rows {
         for c in 0..cols {
-            let val = L::mat_get(m, r, c);
-            L::mat_set(m, r, c, val * s);
+            let val = backend.mat_get(m, r, c);
+            backend.mat_set(m, r, c, val * s);
         }
     }
 }
 
 /// Standardize columns of a matrix to mean=0, std=1.
 /// Dead neurons (std < epsilon) get zeroed columns.
-fn standardize_columns<L: crate::linalg::LinAlg>(m: &L::Matrix) -> L::Matrix {
-    let rows = L::mat_rows(m);
-    let cols = L::mat_cols(m);
-    let mut result = L::zeros_mat(rows, cols);
+fn standardize_columns<L: crate::linalg::LinAlg>(backend: &L, m: &L::Matrix) -> L::Matrix {
+    let rows = backend.mat_rows(m);
+    let cols = backend.mat_cols(m);
+    let mut result = backend.zeros_mat(rows, cols);
     let eps = 1e-12;
 
     for c in 0..cols {
         // Compute mean
         let mut sum = 0.0;
         for r in 0..rows {
-            sum += L::mat_get(m, r, c);
+            sum += backend.mat_get(m, r, c);
         }
         let mean = sum / rows as f64;
 
         // Compute std
         let mut var_sum = 0.0;
         for r in 0..rows {
-            let diff = L::mat_get(m, r, c) - mean;
+            let diff = backend.mat_get(m, r, c) - mean;
             var_sum += diff * diff;
         }
         let std = (var_sum / (rows as f64 - 1.0)).sqrt();
 
         if std > eps {
             for r in 0..rows {
-                L::mat_set(&mut result, r, c, (L::mat_get(m, r, c) - mean) / std);
+                backend.mat_set(&mut result, r, c, (backend.mat_get(m, r, c) - mean) / std);
             }
         }
         // Dead neuron: column stays zero
@@ -557,36 +564,37 @@ fn standardize_columns<L: crate::linalg::LinAlg>(m: &L::Matrix) -> L::Matrix {
 /// Compute M^(-1/2) for a symmetric positive semi-definite matrix via SVD.
 /// Eigenvalues below epsilon are treated as zero.
 fn mat_inv_sqrt<L: crate::linalg::LinAlg>(
+    backend: &L,
     m: &L::Matrix,
 ) -> Result<L::Matrix, crate::error::PcError> {
-    let n = L::mat_rows(m);
-    let (u, s, _v) = L::svd(m)?;
+    let n = backend.mat_rows(m);
+    let (u, s, _v) = backend.svd(m)?;
     let eps = 1e-10;
 
     // Build diag(1/sqrt(s_i)) for non-zero singular values
-    let k = L::vec_len(&s);
-    let mut diag_inv_sqrt = L::zeros_mat(k, k);
+    let k = backend.vec_len(&s);
+    let mut diag_inv_sqrt = backend.zeros_mat(k, k);
     for i in 0..k {
-        let si = L::vec_get(&s, i);
+        let si = backend.vec_get(&s, i);
         if si > eps {
-            L::mat_set(&mut diag_inv_sqrt, i, i, 1.0 / si.sqrt());
+            backend.mat_set(&mut diag_inv_sqrt, i, i, 1.0 / si.sqrt());
         }
     }
 
     // M^(-1/2) = V × diag(1/sqrt(S)) × U^T
     // For symmetric M: U ≈ V, so M^(-1/2) = U × diag(1/sqrt(S)) × U^T
-    let temp = L::mat_mul(&u, &diag_inv_sqrt);
-    let ut = L::mat_transpose(&u);
-    let mut result = L::mat_mul(&temp, &ut);
+    let temp = backend.mat_mul(&u, &diag_inv_sqrt);
+    let ut = backend.mat_transpose(&u);
+    let mut result = backend.mat_mul(&temp, &ut);
 
     // Ensure result is n×n (SVD may truncate)
-    if L::mat_rows(&result) != n || L::mat_cols(&result) != n {
-        let mut padded = L::zeros_mat(n, n);
-        let r_rows = L::mat_rows(&result);
-        let r_cols = L::mat_cols(&result);
+    if backend.mat_rows(&result) != n || backend.mat_cols(&result) != n {
+        let mut padded = backend.zeros_mat(n, n);
+        let r_rows = backend.mat_rows(&result);
+        let r_cols = backend.mat_cols(&result);
         for r in 0..r_rows.min(n) {
             for c in 0..r_cols.min(n) {
-                L::mat_set(&mut padded, r, c, L::mat_get(&result, r, c));
+                backend.mat_set(&mut padded, r, c, backend.mat_get(&result, r, c));
             }
         }
         result = padded;
@@ -698,13 +706,14 @@ pub(crate) fn hungarian_assignment(cost: &[Vec<f64>]) -> Vec<usize> {
 /// Use `hungarian_assignment` instead for optimal matching.
 #[allow(dead_code)]
 fn greedy_match<L: crate::linalg::LinAlg>(
+    backend: &L,
     u: &L::Matrix,
     v: &L::Matrix,
     n_a: usize,
     n_b: usize,
 ) -> Vec<usize> {
     let k = n_a.min(n_b);
-    let n_canonical = L::mat_cols(u).min(L::mat_cols(v));
+    let n_canonical = backend.mat_cols(u).min(backend.mat_cols(v));
 
     let mut matched_a = vec![false; n_a];
     let mut matched_b = vec![false; n_b];
@@ -716,8 +725,8 @@ fn greedy_match<L: crate::linalg::LinAlg>(
         // Find neuron in A with largest |u_k| coefficient
         let mut best_a = 0;
         let mut best_a_val = 0.0_f64;
-        for (i, &is_matched) in matched_a.iter().enumerate().take(n_a.min(L::mat_rows(u))) {
-            let val = L::mat_get(u, i, col).abs();
+        for (i, &is_matched) in matched_a.iter().enumerate().take(n_a.min(backend.mat_rows(u))) {
+            let val = backend.mat_get(u, i, col).abs();
             if val > best_a_val && !is_matched {
                 best_a_val = val;
                 best_a = i;
@@ -727,8 +736,8 @@ fn greedy_match<L: crate::linalg::LinAlg>(
         // Find neuron in B with largest |v_k| coefficient
         let mut best_b = 0;
         let mut best_b_val = 0.0_f64;
-        for (i, &is_matched) in matched_b.iter().enumerate().take(n_b.min(L::mat_rows(v))) {
-            let val = L::mat_get(v, i, col).abs();
+        for (i, &is_matched) in matched_b.iter().enumerate().take(n_b.min(backend.mat_rows(v))) {
+            let val = backend.mat_get(v, i, col).abs();
             if val > best_b_val && !is_matched {
                 best_b_val = val;
                 best_b = i;
@@ -1221,22 +1230,23 @@ mod tests {
         // Same activations for A and B → identity permutation [0, 1, 2]
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
+        let backend = CpuLinAlg::new();
 
         let batch_size = 100;
         let n_neurons = 3;
         let mut rng = StdRng::seed_from_u64(42);
 
         // Generate random activations (batch_size × n_neurons)
-        let mut act_a = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let mut act_a = backend.zeros_mat(batch_size, n_neurons);
         for r in 0..batch_size {
             for c in 0..n_neurons {
                 let val: f64 = rng.gen_range(-1.0..1.0);
-                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+                backend.mat_set(&mut act_a, r, c, val);
             }
         }
         let act_b = act_a.clone();
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
         assert_eq!(perm.len(), n_neurons);
         assert_eq!(perm, vec![0, 1, 2]);
     }
@@ -1246,19 +1256,20 @@ mod tests {
         // A has 4 neurons, B has 4 neurons → perm length = 4
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
+        let backend = CpuLinAlg::new();
 
         let batch_size = 100;
         let mut rng = StdRng::seed_from_u64(42);
 
-        let mut act = CpuLinAlg::zeros_mat(batch_size, 4);
+        let mut act = backend.zeros_mat(batch_size, 4);
         for r in 0..batch_size {
             for c in 0..4 {
                 let val: f64 = rng.gen_range(-1.0..1.0);
-                CpuLinAlg::mat_set(&mut act, r, c, val);
+                backend.mat_set(&mut act, r, c, val);
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act, &act).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act, \&act).unwrap();
         assert_eq!(perm.len(), 4);
     }
 
@@ -1269,16 +1280,17 @@ mod tests {
         // B = permuted A with columns [2, 0, 1] → perm should map back
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
+        let backend = CpuLinAlg::new();
 
         let batch_size = 500;
         let n_neurons = 3;
         let mut rng = StdRng::seed_from_u64(42);
 
-        let mut act_a = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let mut act_a = backend.zeros_mat(batch_size, n_neurons);
         for r in 0..batch_size {
             for c in 0..n_neurons {
                 let val: f64 = rng.gen_range(-1.0..1.0);
-                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+                backend.mat_set(&mut act_a, r, c, val);
             }
         }
 
@@ -1286,15 +1298,15 @@ mod tests {
         // So B neuron 0 = A neuron 2, B neuron 1 = A neuron 0, B neuron 2 = A neuron 1
         // permutation[i] = which A neuron maps to B neuron i
         // Expected: [2, 0, 1]
-        let mut act_b = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let mut act_b = backend.zeros_mat(batch_size, n_neurons);
         let col_map = [2, 0, 1]; // B_col_j = A_col_{col_map[j]}
         for r in 0..batch_size {
             for (j, &src_col) in col_map.iter().enumerate() {
-                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, src_col));
+                backend.mat_set(&mut act_b, r, j, backend.mat_get(&act_a, r, src_col));
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
         assert_eq!(perm, vec![2, 0, 1]);
     }
 
@@ -1303,29 +1315,30 @@ mod tests {
         // Same permutation test but with batch_size=50
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
+        let backend = CpuLinAlg::new();
 
         let batch_size = 50;
         let n_neurons = 3;
         let mut rng = StdRng::seed_from_u64(99);
 
-        let mut act_a = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let mut act_a = backend.zeros_mat(batch_size, n_neurons);
         for r in 0..batch_size {
             for c in 0..n_neurons {
                 let val: f64 = rng.gen_range(-1.0..1.0);
-                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+                backend.mat_set(&mut act_a, r, c, val);
             }
         }
 
         // Permutation [1, 2, 0]
-        let mut act_b = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let mut act_b = backend.zeros_mat(batch_size, n_neurons);
         let col_map = [1, 2, 0];
         for r in 0..batch_size {
             for (j, &src_col) in col_map.iter().enumerate() {
-                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, src_col));
+                backend.mat_set(&mut act_b, r, j, backend.mat_get(&act_a, r, src_col));
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
         assert_eq!(perm, vec![1, 2, 0]);
     }
 
@@ -1334,29 +1347,30 @@ mod tests {
         // batch_size=500, verifying robustness
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
+        let backend = CpuLinAlg::new();
 
         let batch_size = 500;
         let n_neurons = 4;
         let mut rng = StdRng::seed_from_u64(7);
 
-        let mut act_a = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let mut act_a = backend.zeros_mat(batch_size, n_neurons);
         for r in 0..batch_size {
             for c in 0..n_neurons {
                 let val: f64 = rng.gen_range(-1.0..1.0);
-                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+                backend.mat_set(&mut act_a, r, c, val);
             }
         }
 
         // Permutation [3, 1, 0, 2]
-        let mut act_b = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let mut act_b = backend.zeros_mat(batch_size, n_neurons);
         let col_map = [3, 1, 0, 2];
         for r in 0..batch_size {
             for (j, &src_col) in col_map.iter().enumerate() {
-                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, src_col));
+                backend.mat_set(&mut act_b, r, j, backend.mat_get(&act_a, r, src_col));
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
         assert_eq!(perm, vec![3, 1, 0, 2]);
     }
 
@@ -1367,27 +1381,28 @@ mod tests {
         // A has 4 neurons, B has 3 neurons → permutation length = 3
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
+        let backend = CpuLinAlg::new();
 
         let batch_size = 200;
         let mut rng = StdRng::seed_from_u64(42);
 
-        let mut act_a = CpuLinAlg::zeros_mat(batch_size, 4);
+        let mut act_a = backend.zeros_mat(batch_size, 4);
         for r in 0..batch_size {
             for c in 0..4 {
                 let val: f64 = rng.gen_range(-1.0..1.0);
-                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+                backend.mat_set(&mut act_a, r, c, val);
             }
         }
 
         // B has 3 neurons: B_col_j = A_col_j (first 3 columns)
-        let mut act_b = CpuLinAlg::zeros_mat(batch_size, 3);
+        let mut act_b = backend.zeros_mat(batch_size, 3);
         for r in 0..batch_size {
             for c in 0..3 {
-                CpuLinAlg::mat_set(&mut act_b, r, c, CpuLinAlg::mat_get(&act_a, r, c));
+                backend.mat_set(&mut act_b, r, c, backend.mat_get(&act_a, r, c));
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
         assert_eq!(perm.len(), 3);
     }
 
@@ -1396,27 +1411,28 @@ mod tests {
         // A has 3 neurons, B has 5 neurons → permutation length = 3 (min)
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
+        let backend = CpuLinAlg::new();
 
         let batch_size = 200;
         let mut rng = StdRng::seed_from_u64(42);
 
-        let mut act_a = CpuLinAlg::zeros_mat(batch_size, 3);
+        let mut act_a = backend.zeros_mat(batch_size, 3);
         for r in 0..batch_size {
             for c in 0..3 {
                 let val: f64 = rng.gen_range(-1.0..1.0);
-                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+                backend.mat_set(&mut act_a, r, c, val);
             }
         }
 
-        let mut act_b = CpuLinAlg::zeros_mat(batch_size, 5);
+        let mut act_b = backend.zeros_mat(batch_size, 5);
         for r in 0..batch_size {
             for c in 0..5 {
                 let val: f64 = rng.gen_range(-1.0..1.0);
-                CpuLinAlg::mat_set(&mut act_b, r, c, val);
+                backend.mat_set(&mut act_b, r, c, val);
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
         assert_eq!(perm.len(), 3);
     }
 
@@ -1425,28 +1441,29 @@ mod tests {
         // One neuron in B has zero variance (dead) → still produces valid permutation
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
+        let backend = CpuLinAlg::new();
 
         let batch_size = 100;
         let n_neurons = 3;
         let mut rng = StdRng::seed_from_u64(42);
 
-        let mut act_a = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let mut act_a = backend.zeros_mat(batch_size, n_neurons);
         for r in 0..batch_size {
             for c in 0..n_neurons {
                 let val: f64 = rng.gen_range(-1.0..1.0);
-                CpuLinAlg::mat_set(&mut act_a, r, c, val);
+                backend.mat_set(&mut act_a, r, c, val);
             }
         }
 
         // B: neuron 1 is dead (constant 0), neurons 0 and 2 copy from A
-        let mut act_b = CpuLinAlg::zeros_mat(batch_size, n_neurons);
+        let mut act_b = backend.zeros_mat(batch_size, n_neurons);
         for r in 0..batch_size {
-            CpuLinAlg::mat_set(&mut act_b, r, 0, CpuLinAlg::mat_get(&act_a, r, 0));
-            CpuLinAlg::mat_set(&mut act_b, r, 1, 0.0); // dead neuron
-            CpuLinAlg::mat_set(&mut act_b, r, 2, CpuLinAlg::mat_get(&act_a, r, 2));
+            backend.mat_set(&mut act_b, r, 0, backend.mat_get(&act_a, r, 0));
+            backend.mat_set(&mut act_b, r, 1, 0.0); // dead neuron
+            backend.mat_set(&mut act_b, r, 2, backend.mat_get(&act_a, r, 2));
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
         // Should produce a valid permutation of length 3, no panic
         assert_eq!(perm.len(), n_neurons);
         // All indices in range [0, n_neurons)
@@ -1535,13 +1552,14 @@ mod tests {
         // directions. Use enough neurons that collisions are likely.
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
+        let backend = CpuLinAlg::new();
 
         let batch_size = 200;
         let n = 8;
         let mut rng = StdRng::seed_from_u64(42);
 
         // Generate A with distinct but correlated neuron activations
-        let mut act_a = CpuLinAlg::zeros_mat(batch_size, n);
+        let mut act_a = backend.zeros_mat(batch_size, n);
         for r in 0..batch_size {
             // Base signal
             let base: f64 = rng.gen_range(-1.0..1.0);
@@ -1549,20 +1567,20 @@ mod tests {
                 let noise: f64 = rng.gen_range(-0.3..0.3);
                 // Each neuron = base * weight_c + noise
                 let weight = (c as f64 + 1.0) / n as f64;
-                CpuLinAlg::mat_set(&mut act_a, r, c, base * weight + noise);
+                backend.mat_set(&mut act_a, r, c, base * weight + noise);
             }
         }
 
         // B is a known permutation of A: [5, 3, 7, 1, 6, 0, 4, 2]
         let true_perm = [5, 3, 7, 1, 6, 0, 4, 2];
-        let mut act_b = CpuLinAlg::zeros_mat(batch_size, n);
+        let mut act_b = backend.zeros_mat(batch_size, n);
         for r in 0..batch_size {
             for (j, &src_col) in true_perm.iter().enumerate() {
-                CpuLinAlg::mat_set(&mut act_b, r, j, CpuLinAlg::mat_get(&act_a, r, src_col));
+                backend.mat_set(&mut act_b, r, j, backend.mat_get(&act_a, r, src_col));
             }
         }
 
-        let perm = cca_neuron_alignment::<CpuLinAlg>(&act_a, &act_b).unwrap();
+        let perm = cca_neuron_alignment::<CpuLinAlg>(\&backend, \&act_a, \&act_b).unwrap();
 
         // With Hungarian, the optimal assignment should recover the true permutation
         assert_eq!(
