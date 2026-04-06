@@ -19,38 +19,54 @@ use rand::Rng;
 /// Uses `Vec<f64>` for vectors and [`Matrix`] for matrices.
 /// All trait methods delegate to existing implementations in
 /// [`crate::matrix`] and [`crate::activation`].
+///
+/// This is a zero-sized type (ZST), so storing it in structs adds no
+/// overhead. Implements [`Default`] for serde compatibility.
 #[derive(Debug, Clone)]
 pub struct CpuLinAlg;
+
+impl CpuLinAlg {
+    /// Creates a new CPU linear algebra backend.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for CpuLinAlg {
+    fn default() -> Self {
+        Self
+    }
+}
 
 impl LinAlg for CpuLinAlg {
     type Vector = Vec<f64>;
     type Matrix = Matrix;
 
-    fn zeros_vec(size: usize) -> Self::Vector {
+    fn zeros_vec(&self, size: usize) -> Self::Vector {
         vec![0.0; size]
     }
 
-    fn zeros_mat(rows: usize, cols: usize) -> Self::Matrix {
+    fn zeros_mat(&self, rows: usize, cols: usize) -> Self::Matrix {
         Matrix::zeros(rows, cols)
     }
 
-    fn xavier_mat(rows: usize, cols: usize, rng: &mut impl Rng) -> Self::Matrix {
+    fn xavier_mat(&self, rows: usize, cols: usize, rng: &mut impl Rng) -> Self::Matrix {
         Matrix::xavier(rows, cols, rng)
     }
 
-    fn mat_vec_mul(m: &Self::Matrix, v: &Self::Vector) -> Self::Vector {
+    fn mat_vec_mul(&self, m: &Self::Matrix, v: &Self::Vector) -> Self::Vector {
         m.mul_vec(v)
     }
 
-    fn mat_transpose(m: &Self::Matrix) -> Self::Matrix {
+    fn mat_transpose(&self, m: &Self::Matrix) -> Self::Matrix {
         m.transpose()
     }
 
-    fn outer_product(a: &Self::Vector, b: &Self::Vector) -> Self::Matrix {
+    fn outer_product(&self, a: &Self::Vector, b: &Self::Vector) -> Self::Matrix {
         Matrix::outer(a, b)
     }
 
-    fn mat_mul(a: &Self::Matrix, b: &Self::Matrix) -> Self::Matrix {
+    fn mat_mul(&self, a: &Self::Matrix, b: &Self::Matrix) -> Self::Matrix {
         assert_eq!(a.cols, b.rows, "mat_mul: inner dimensions mismatch");
         let mut result = Matrix::zeros(a.rows, b.cols);
         for i in 0..a.rows {
@@ -65,107 +81,108 @@ impl LinAlg for CpuLinAlg {
         result
     }
 
-    fn svd(m: &Self::Matrix) -> crate::linalg::SvdResult<Self> {
+    fn svd(&self, m: &Self::Matrix) -> crate::linalg::SvdResult<Self> {
         Ok(crate::linalg::golub_kahan::GolubKahanSvd::new().compute(m)?)
     }
 
-    fn mat_scale_add(m: &mut Self::Matrix, other: &Self::Matrix, scale: f64) {
+    fn mat_scale_add(&self, m: &mut Self::Matrix, other: &Self::Matrix, scale: f64) {
         m.scale_add(other, scale);
     }
 
-    fn mat_rows(m: &Self::Matrix) -> usize {
+    fn mat_rows(&self, m: &Self::Matrix) -> usize {
         m.rows
     }
 
-    fn mat_cols(m: &Self::Matrix) -> usize {
+    fn mat_cols(&self, m: &Self::Matrix) -> usize {
         m.cols
     }
 
-    fn mat_get(m: &Self::Matrix, row: usize, col: usize) -> f64 {
+    fn mat_get(&self, m: &Self::Matrix, row: usize, col: usize) -> f64 {
         m.get(row, col)
     }
 
-    fn mat_set(m: &mut Self::Matrix, row: usize, col: usize, val: f64) {
+    fn mat_set(&self, m: &mut Self::Matrix, row: usize, col: usize, val: f64) {
         m.set(row, col, val);
     }
 
-    fn vec_add(a: &Self::Vector, b: &Self::Vector) -> Self::Vector {
+    fn vec_add(&self, a: &Self::Vector, b: &Self::Vector) -> Self::Vector {
         crate::matrix::vec_add(a, b)
     }
 
-    fn vec_sub(a: &Self::Vector, b: &Self::Vector) -> Self::Vector {
+    fn vec_sub(&self, a: &Self::Vector, b: &Self::Vector) -> Self::Vector {
         crate::matrix::vec_sub(a, b)
     }
 
-    fn vec_scale(v: &Self::Vector, s: f64) -> Self::Vector {
+    fn vec_scale(&self, v: &Self::Vector, s: f64) -> Self::Vector {
         crate::matrix::vec_scale(v, s)
     }
 
-    fn vec_hadamard(a: &Self::Vector, b: &Self::Vector) -> Self::Vector {
+    fn vec_hadamard(&self, a: &Self::Vector, b: &Self::Vector) -> Self::Vector {
         assert_eq!(a.len(), b.len(), "vec_hadamard: length mismatch");
         a.iter().zip(b.iter()).map(|(x, y)| x * y).collect()
     }
 
-    fn vec_dot(a: &Self::Vector, b: &Self::Vector) -> f64 {
+    fn vec_dot(&self, a: &Self::Vector, b: &Self::Vector) -> f64 {
         assert_eq!(a.len(), b.len(), "vec_dot: length mismatch");
         a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
     }
 
-    fn vec_len(v: &Self::Vector) -> usize {
+    fn vec_len(&self, v: &Self::Vector) -> usize {
         v.len()
     }
 
-    fn vec_get(v: &Self::Vector, i: usize) -> f64 {
+    fn vec_get(&self, v: &Self::Vector, i: usize) -> f64 {
         v[i]
     }
 
-    fn vec_set(v: &mut Self::Vector, i: usize, val: f64) {
+    fn vec_set(&self, v: &mut Self::Vector, i: usize, val: f64) {
         v[i] = val;
     }
 
-    fn vec_from_slice(s: &[f64]) -> Self::Vector {
+    fn vec_from_slice(&self, s: &[f64]) -> Self::Vector {
         s.to_vec()
     }
 
-    fn vec_to_vec(v: &Self::Vector) -> Vec<f64> {
+    fn vec_to_vec(&self, v: &Self::Vector) -> Vec<f64> {
         v.clone()
     }
 
-    fn vec_as_slice(v: &Self::Vector) -> &[f64] {
-        v.as_slice()
-    }
-
-    fn clip_vec(v: &mut Self::Vector, max_abs: f64) {
+    fn clip_vec(&self, v: &mut Self::Vector, max_abs: f64) {
         crate::matrix::clip_vec(v, max_abs);
     }
 
-    fn clip_mat(m: &mut Self::Matrix, max_abs: f64) {
+    fn clip_mat(&self, m: &mut Self::Matrix, max_abs: f64) {
         for x in m.data.iter_mut() {
             *x = x.clamp(-max_abs, max_abs);
         }
     }
 
-    fn apply_activation(v: &Self::Vector, act: Activation) -> Self::Vector {
+    fn apply_activation(&self, v: &Self::Vector, act: Activation) -> Self::Vector {
         v.iter().map(|&x| act.apply(x)).collect()
     }
 
-    fn apply_derivative(v: &Self::Vector, act: Activation) -> Self::Vector {
+    fn apply_derivative(&self, v: &Self::Vector, act: Activation) -> Self::Vector {
         v.iter().map(|&fx| act.derivative(fx)).collect()
     }
 
-    fn softmax_masked(logits: &Self::Vector, mask: &[usize]) -> Self::Vector {
+    fn softmax_masked(&self, logits: &Self::Vector, mask: &[usize]) -> Self::Vector {
         crate::matrix::softmax_masked(logits, mask)
     }
 
-    fn argmax_masked(values: &Self::Vector, mask: &[usize]) -> usize {
+    fn argmax_masked(&self, values: &Self::Vector, mask: &[usize]) -> usize {
         crate::matrix::argmax_masked(values, mask)
     }
 
-    fn sample_from_probs(probs: &Self::Vector, mask: &[usize], rng: &mut impl Rng) -> usize {
+    fn sample_from_probs(
+        &self,
+        probs: &Self::Vector,
+        mask: &[usize],
+        rng: &mut impl Rng,
+    ) -> usize {
         crate::matrix::sample_from_probs(probs, mask, rng)
     }
 
-    fn rms_error(error_vecs: &[&Self::Vector]) -> f64 {
+    fn rms_error(&self, error_vecs: &[&Self::Vector]) -> f64 {
         let slices: Vec<&[f64]> = error_vecs.iter().map(|v| v.as_slice()).collect();
         crate::matrix::rms_error(&slices)
     }
