@@ -230,6 +230,8 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     rng: StdRng,
     /// Circular buffer of recent surprise scores for adaptive thresholds.
     surprise_buffer: VecDeque<f64>,
+    /// Backend used for linear algebra operations.
+    pub(crate) backend: L,
 }
 
 impl<L: LinAlg> PcActorCritic<L> {
@@ -243,7 +245,7 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// Returns `PcError::ConfigValidation` if gamma is out of `[0.0, 1.0]`,
     /// or if actor/critic config is invalid.
-    pub fn new(config: PcActorCriticConfig, seed: u64) -> Result<Self, PcError> {
+    pub fn new(backend: L, config: PcActorCriticConfig, seed: u64) -> Result<Self, PcError> {
         if !(0.0..=1.0).contains(&config.gamma) {
             return Err(PcError::ConfigValidation(format!(
                 "gamma must be in [0.0, 1.0], got {}",
@@ -259,14 +261,15 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         use rand::SeedableRng;
         let mut rng = StdRng::seed_from_u64(seed);
-        let actor = PcActor::<L>::new(config.actor.clone(), &mut rng)?;
-        let critic = MlpCritic::<L>::new(config.critic.clone(), &mut rng)?;
+        let actor = PcActor::<L>::new(backend.clone(), config.actor.clone(), &mut rng)?;
+        let critic = MlpCritic::<L>::new(backend.clone(), config.critic.clone(), &mut rng)?;
         Ok(Self {
             actor,
             critic,
             config,
             rng,
             surprise_buffer: VecDeque::new(),
+            backend,
         })
     }
 
@@ -319,10 +322,10 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
 
         // Convert caches to matrices [batch × neurons] for CCA
-        let actor_cache_mats_a = cache_to_matrices::<L>(actor_cache_a);
-        let actor_cache_mats_b = cache_to_matrices::<L>(actor_cache_b);
-        let critic_cache_mats_a = cache_to_matrices::<L>(critic_cache_a);
-        let critic_cache_mats_b = cache_to_matrices::<L>(critic_cache_b);
+        let actor_cache_mats_a = cache_to_matrices(&parent_a.backend, actor_cache_a);
+        let actor_cache_mats_b = cache_to_matrices(&parent_a.backend, actor_cache_b);
+        let critic_cache_mats_a = cache_to_matrices(&parent_a.backend, critic_cache_a);
+        let critic_cache_mats_b = cache_to_matrices(&parent_a.backend, critic_cache_b);
 
         use rand::SeedableRng;
         let mut rng = StdRng::seed_from_u64(seed);
@@ -355,6 +358,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             config: child_config,
             rng,
             surprise_buffer: VecDeque::new(),
+            backend: parent_a.backend.clone(),
         })
     }
 
@@ -371,6 +375,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         actor: PcActor<L>,
         critic: MlpCritic<L>,
         rng: StdRng,
+        backend: L,
     ) -> Self {
         Self {
             actor,
@@ -378,6 +383,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             config,
             rng,
             surprise_buffer: VecDeque::new(),
+            backend,
         }
     }
 
@@ -454,8 +460,8 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         for (t, step) in trajectory.iter().enumerate() {
             // Build critic input: concat(input, latent_concat)
-            let input_vec = L::vec_to_vec(&step.input);
-            let latent_vec = L::vec_to_vec(&step.latent_concat);
+            let input_vec = self.backend.vec_to_vec(&step.input);
+            let latent_vec = self.backend.vec_to_vec(&step.latent_concat);
             let mut critic_input = input_vec.clone();
             critic_input.extend_from_slice(&latent_vec);
 
@@ -468,14 +474,14 @@ impl<L: LinAlg> PcActorCritic<L> {
             total_loss += loss;
 
             // Policy gradient
-            let y_conv_vec = L::vec_to_vec(&step.y_conv);
+            let y_conv_vec = self.backend.vec_to_vec(&step.y_conv);
             let scaled: Vec<f64> = y_conv_vec
                 .iter()
                 .map(|&v| v / self.actor.config.temperature)
                 .collect();
-            let scaled_l = L::vec_from_slice(&scaled);
-            let pi_l = L::softmax_masked(&scaled_l, &step.valid_actions);
-            let pi = L::vec_to_vec(&pi_l);
+            let scaled_l = self.backend.vec_from_slice(&scaled);
+            let pi_l = self.backend.softmax_masked(&scaled_l, &step.valid_actions);
+            let pi = self.backend.vec_to_vec(&pi_l);
 
             let mut delta = vec![0.0; pi.len()];
             for &i in &step.valid_actions {
@@ -548,11 +554,11 @@ impl<L: LinAlg> PcActorCritic<L> {
         terminal: bool,
     ) -> f64 {
         // Build critic inputs
-        let latent_vec = L::vec_to_vec(&infer.latent_concat);
+        let latent_vec = self.backend.vec_to_vec(&infer.latent_concat);
         let mut critic_input = input.to_vec();
         critic_input.extend_from_slice(&latent_vec);
 
-        let next_latent_vec = L::vec_to_vec(&next_infer.latent_concat);
+        let next_latent_vec = self.backend.vec_to_vec(&next_infer.latent_concat);
         let mut next_critic_input = next_input.to_vec();
         next_critic_input.extend_from_slice(&next_latent_vec);
 
@@ -575,14 +581,14 @@ impl<L: LinAlg> PcActorCritic<L> {
         let loss = self.critic.update(&critic_input, target);
 
         // Policy gradient (same formula as learn, but scaled by td_error)
-        let y_conv_vec = L::vec_to_vec(&infer.y_conv);
+        let y_conv_vec = self.backend.vec_to_vec(&infer.y_conv);
         let scaled: Vec<f64> = y_conv_vec
             .iter()
             .map(|&v| v / self.actor.config.temperature)
             .collect();
-        let scaled_l = L::vec_from_slice(&scaled);
-        let pi_l = L::softmax_masked(&scaled_l, valid_actions);
-        let pi = L::vec_to_vec(&pi_l);
+        let scaled_l = self.backend.vec_from_slice(&scaled);
+        let pi_l = self.backend.softmax_masked(&scaled_l, valid_actions);
+        let pi = self.backend.vec_to_vec(&pi_l);
 
         let mut delta = vec![0.0; pi.len()];
         for &i in valid_actions {
@@ -657,7 +663,7 @@ impl<L: LinAlg> PcActorCritic<L> {
 
 /// Converts an `ActivationCache` into a vector of matrices `[batch × neurons]`,
 /// one per hidden layer, suitable for CCA alignment.
-fn cache_to_matrices<L: LinAlg>(cache: &ActivationCache<L>) -> Vec<L::Matrix> {
+fn cache_to_matrices<L: LinAlg>(backend: &L, cache: &ActivationCache<L>) -> Vec<L::Matrix> {
     let num_layers = cache.num_layers();
     let batch_size = cache.batch_size();
     let mut matrices = Vec::with_capacity(num_layers);
@@ -903,8 +909,8 @@ mod tests {
     fn test_learn_continuous_terminal_and_nonterminal_produce_different_updates() {
         // Create two identical agents
         let config = default_config();
-        let mut agent_term: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
-        let mut agent_nonterm: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
+        let mut agent_term: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_nonterm: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
         let input = vec![0.5; 9];
         let next_input = vec![-0.5; 9];
@@ -1015,7 +1021,7 @@ mod tests {
     fn test_adaptive_surprise_recalibrates_thresholds_after_many_episodes() {
         let mut config = default_config();
         config.adaptive_surprise = true;
-        let mut agent: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
         // Fill buffer with varied surprise scores to get nonzero std
         for i in 0..15 {
@@ -1055,7 +1061,7 @@ mod tests {
         // should keep the policy from collapsing to a single action
         let mut config = default_config();
         config.entropy_coeff = 0.1; // Strong entropy
-        let mut agent: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
         let input = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
@@ -1154,7 +1160,7 @@ mod tests {
             surprise_buffer_size: 100,
             entropy_coeff: 0.0, // no entropy to isolate gradient effect
         };
-        let mut agent: PcActorCritic = PcActorCritic::new(config, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
         let input = vec![0.0; 9];
         let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -1213,7 +1219,7 @@ mod tests {
     fn test_new_returns_error_zero_temperature() {
         let mut config = default_config();
         config.actor.temperature = 0.0;
-        let err = PcActorCritic::new(config, 42)
+        let err = PcActorCritic::new(CpuLinAlg::new(), config, 42)
             .map(|_: PcActorCritic| ())
             .unwrap_err();
         assert!(format!("{err}").contains("temperature"));
@@ -1224,7 +1230,7 @@ mod tests {
         let mut config = default_config();
         config.actor.input_size = 0;
         config.critic.input_size = 0;
-        assert!(PcActorCritic::new(config, 42)
+        assert!(PcActorCritic::new(CpuLinAlg::new(), config, 42)
             .map(|_: PcActorCritic| ())
             .is_err());
     }
@@ -1233,7 +1239,7 @@ mod tests {
     fn test_new_returns_error_zero_output_size() {
         let mut config = default_config();
         config.actor.output_size = 0;
-        assert!(PcActorCritic::new(config, 42)
+        assert!(PcActorCritic::new(CpuLinAlg::new(), config, 42)
             .map(|_: PcActorCritic| ())
             .is_err());
     }
@@ -1242,7 +1248,7 @@ mod tests {
     fn test_new_returns_error_negative_gamma() {
         let mut config = default_config();
         config.gamma = -0.1;
-        let err = PcActorCritic::new(config, 42)
+        let err = PcActorCritic::new(CpuLinAlg::new(), config, 42)
             .map(|_: PcActorCritic| ())
             .unwrap_err();
         assert!(format!("{err}").contains("gamma"));
@@ -1253,7 +1259,7 @@ mod tests {
         let mut config = default_config();
         config.adaptive_surprise = true;
         config.surprise_buffer_size = 0;
-        let result = PcActorCritic::new(config, 42).map(|_: PcActorCritic| ());
+        let result = PcActorCritic::new(CpuLinAlg::new(), config, 42).map(|_: PcActorCritic| ());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -1391,8 +1397,8 @@ mod tests {
     #[test]
     fn test_agent_crossover_produces_valid_agent() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1411,8 +1417,8 @@ mod tests {
     #[test]
     fn test_agent_crossover_actor_weights_differ() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1435,8 +1441,8 @@ mod tests {
     #[test]
     fn test_agent_crossover_critic_weights_differ() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1461,8 +1467,8 @@ mod tests {
     #[test]
     fn test_agent_crossover_child_can_infer() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1481,8 +1487,8 @@ mod tests {
     #[test]
     fn test_agent_crossover_child_can_learn() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1500,8 +1506,8 @@ mod tests {
     #[test]
     fn test_agent_crossover_mismatched_batch_size_error() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, _cc_b) = build_caches_for_agent(&mut agent_b, 30); // different batch
@@ -1527,8 +1533,8 @@ mod tests {
     #[test]
     fn test_agent_crossover_with_separate_critic_caches() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1544,8 +1550,8 @@ mod tests {
     #[test]
     fn test_agent_crossover_critic_uses_own_caches() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, cc_b) = build_caches_for_agent(&mut agent_b, 50);
@@ -1568,8 +1574,8 @@ mod tests {
     #[test]
     fn test_agent_crossover_mismatched_critic_batch_error() {
         let config = default_config();
-        let mut agent_a: PcActorCritic = PcActorCritic::new(config.clone(), 42).unwrap();
-        let mut agent_b: PcActorCritic = PcActorCritic::new(config.clone(), 123).unwrap();
+        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
 
         let (ac_a, cc_a) = build_caches_for_agent(&mut agent_a, 50);
         let (ac_b, _) = build_caches_for_agent(&mut agent_b, 50);
@@ -1606,7 +1612,7 @@ mod tests {
         // Verify cca_neuron_alignment is accessible via matrix module
         use crate::linalg::cpu::CpuLinAlg;
         use crate::linalg::LinAlg;
-        let mat = CpuLinAlg::zeros_mat(10, 3);
+        let mat = CpuLinAlg::new().zeros_mat(10, 3);
         let _perm = crate::matrix::cca_neuron_alignment::<CpuLinAlg>(&mat, &mat).unwrap();
     }
 }
