@@ -311,6 +311,45 @@ Initial state: both EWMAs initialized to 0, network starts in PLASTIC (learning
 from the beginning). As the network converges, the fast EWMA drops below the slow
 EWMA's sleep band and the network transitions to FROZEN for the first time.
 
+#### Initial warmup guard
+
+During initial training, surprise naturally decreases as the network learns. The
+fast EWMA (N=10) tracks this decrease quickly while the slow EWMA (N=50) retains
+the higher early values — creating a false signal that can trigger premature sleep
+within 20-30 steps. This is problematic because (a) the slow EWMA is not in steady
+state during warmup, making the fast vs slow comparison unfair, and (b) a PLASTIC
+phase shorter than `min_fisher_phase` produces unreliable Fisher data that gets
+discarded by the short-phase guard.
+
+To prevent premature sleep, the first FROZEN transition is suppressed until the
+network has accumulated enough steps for both the dual EWMA and the Fisher EMA
+to be in steady state:
+
+```
+min_initial_plastic = max(slow_window, min_fisher_phase)
+                    = max(slow_window, ceil(1 / (1 - fisher_ema_beta)))
+```
+
+With default parameters: `max(50, 100) = 100` steps (~15 TTT games).
+
+This guard is **derived from existing parameters** — no new configurable knob. It
+ensures:
+- The slow EWMA has completed warmup → fair fast vs slow comparison
+- The Fisher EMA has accumulated ~63% of steady-state value → reliable data for
+  the first EWC anchor
+
+The guard uses the per-network step counter `k`. Since `k` is monotonic (`u64`,
+never resets on episode boundaries), the guard is active only during the first
+`min_initial_plastic` steps of the network's lifetime, then becomes a permanent
+no-op. After GA crossover, `k` resets to 0 — the child automatically receives
+warmup protection.
+
+When the guard lifts at step `min_initial_plastic`:
+- If the network has already converged: fast is well below slow → immediate FROZEN
+  on the first evaluation, with reliable Fisher for EWC protection
+- If the network is still learning: fast tracks slow closely → stays PLASTIC
+  naturally until genuine convergence
+
 #### Why dual EWMA instead of single EWMA + adaptive thresholds
 
 A single EWMA with adaptive thresholds computed from a buffer has a **variance
@@ -368,6 +407,18 @@ pub sleep_fraction: f64,       // default 0.3 (fast < slow × 0.7 → FROZEN)
 
 Within the PLASTIC state, the existing linear interpolation (M1 range) still applies.
 Within the FROZEN state, `scale = scale_floor`.
+
+#### Scale discontinuity at FROZEN→PLASTIC transition
+
+When transitioning FROZEN→PLASTIC, the scale jumps from `scale_floor` (0.0) to
+whatever M1 computes from the current raw surprise — potentially 1.0-2.0. This is
+a discontinuous step, not a ramp. This is **intentional**: the dual EWMA required
+~10 steps of sustained elevated surprise to trigger the wake, confirming a genuine
+environment change. Aggressive learning at wake time is the correct response —
+delaying with a soft-start ramp would slow adaptation precisely when speed matters
+most. The first PLASTIC step's update magnitude is bounded by GRAD_CLIP (5.0) and
+WEIGHT_CLIP (5.0), and EWC protection (active from the first cycle onward, thanks
+to the warmup guard) resists large changes to important parameters.
 
 ### M3 — Layer-Wise Consolidation Decay
 
@@ -700,40 +751,62 @@ that weight, its Fisher, and its snapshot, not on other layers.
 The injection point in `update_weights()` per layer:
 
 ```rust
+// 0. Compute layer_decay (M3) and fold into surprise_scale
+let layer_decay = if adaptive_consolidation {
+    1.0 - adaptive_decay[i]                           // M3b
+} else {
+    consolidation_decay.powi((n_hidden - 1 - i) as i32) // M3a
+};
+let layer_surprise = surprise_scale * layer_decay;     // M3 folded in
+let effective_lr = self.config.lr_weights * layer_surprise;
+
 // 1. Compute EWC penalty from PRE-update weights (before backward modifies them)
 let ewc_w = ewc_lambda * F_w[i] * (W[i] - W_snapshot[i]);   // matrix
 let ewc_b = ewc_lambda * F_b[i] * (b[i] - b_snapshot[i]);   // vector
 
-// 2. Normal backward pass (Layer::backward is NOT modified)
+// 2. Normal backward pass — layer_decay reaches task gradient via layer_surprise
+//    Layer::backward is NOT modified: it receives lr and layer_surprise as before,
+//    computing effective_lr = lr * layer_surprise = lr * surprise_scale * layer_decay
 let propagated = self.layers[i].backward(
-    input, output, &delta, lr, surprise_scale
+    input, output, &delta, self.config.lr_weights, layer_surprise
 );
-// backward updates W and b internally via task gradient
-// backward returns propagated delta for the next layer (no EWC contamination)
+// backward updates W and b internally via task gradient (with layer_decay applied)
+// backward returns propagated delta for the next layer (independent of effective_lr)
 
-// 3. Post-correction: apply EWC penalty
-//    W[i] -= effective_lr * ewc_w
-//    b[i] -= effective_lr * ewc_b
+// 3. Post-correction: apply EWC penalty (same effective_lr as task gradient)
 self.backend.mat_scale_add(&mut self.layers[i].weights, &ewc_w, -effective_lr);
 let bias_penalty = self.backend.vec_scale(&ewc_b, effective_lr);
 self.layers[i].bias = self.backend.vec_sub(&self.layers[i].bias, &bias_penalty);
+
+// 4. rezero_alpha and skip projection updates also use layer_surprise:
+//    rezero_alpha[idx] -= effective_lr * grad_alpha;
+//    mat_scale_add(proj, &dw_proj, -effective_lr);
 ```
 
 Key design decisions:
 
-- **Layer::backward is NOT modified.** The EWC penalty is external to the Layer
-  abstraction. Layer remains a generic building block; EWC is an agent-level concern.
+- **Layer::backward is NOT modified.** The M3 layer_decay is folded into the
+  `surprise_scale` argument passed to backward: `layer_surprise = surprise_scale *
+  layer_decay`. Backward computes `effective_lr = lr * layer_surprise` internally,
+  which equals `lr * surprise_scale * layer_decay`. This ensures both the task
+  gradient and the EWC penalty use the same effective_lr. With `consolidation_decay
+  = 1.0` (legacy), `layer_decay = 1.0` and `layer_surprise = surprise_scale` —
+  identical to v2.0.0 behavior.
 - **Pre-update θ for penalty computation.** The penalty uses θ BEFORE backward
   modifies it (step 1 before step 2). This is mathematically exact per the EWC
   formula: `θ -= effective_lr × (task_grad + λ × F × (θ - θ*))`.
 - **Propagated gradient is clean.** The `W^T × grad` propagated to earlier layers
-  does NOT include EWC penalty. This is correct — EWC is a per-weight regularization
-  term on the loss, not a signal that should flow backward through the network.
+  does NOT include EWC penalty or effective_lr — it depends only on the clipped
+  gradient and the weight matrix. Layer_decay does not affect gradient propagation.
 - **EWC penalty is NOT gradient-clipped.** The penalty is a smooth quadratic term,
   not a noisy gradient. If the penalty is large, it SHOULD dominate — that is the
   protection mechanism. Maximum penalty magnitude: `λ × GRAD_CLIP² × WEIGHT_CLIP
   = 0.1 × 25.0 × 5.0 = 12.5`. At effective_lr ≈ 0.005: weight change = 0.0625
   per step, within normal operating ranges.
+- **All per-layer updates use layer_surprise.** The rezero_alpha update, skip
+  projection update, and any other per-layer weight modification within
+  `update_weights()` use the same `effective_lr = lr * layer_surprise`, ensuring
+  consistent layer_decay application across all trainable parameters of the layer.
 
 The penalty acts as an **elastic spring** pulling each weight back toward its
 consolidated value. The spring stiffness is proportional to the parameter's
@@ -745,7 +818,35 @@ importance (`F[i]`):
 - **Low F[i]** (unimportant for previous environment): the weight moves freely
   to accommodate the new task.
 - **λ_ewc** controls global stiffness. Higher values prioritize preserving old
-  knowledge; lower values prioritize adapting to the new environment.
+  knowledge; lower values prioritize adapting to the new environment. This parameter
+  is exposed in the library config (TOML/CLI) and can be included in the GA genome
+  as an evolvable parameter — agents with λ_ewc too high become petrified (cannot
+  learn → low fitness → selected against), while agents with λ_ewc too low suffer
+  catastrophic forgetting (lose prior knowledge → low fitness → selected against).
+  The GA naturally finds the optimal rigidity for the environment.
+
+##### F_total saturation bound
+
+F_total accumulates across environments via `F_total += F_ema` with fisher_decay
+applied at each cycle. The geometric series converges to:
+
+```
+F_total_max = F_ema_steady / (1 - fisher_decay) = F_ema / 0.1 = 10 × F_ema
+```
+
+Worst-case penalty magnitude (all parameters at maximum):
+- F_ema = GRAD_CLIP² = 25.0, F_total = 250, drift = WEIGHT_CLIP = 5.0
+- penalty = λ × F_total × drift = 0.1 × 250 × 5.0 = 125.0
+- weight change = effective_lr × 125 = 0.01 × 125 = 1.25 per step
+
+Typical values (27-neuron TTT network, 3 environment transitions):
+- F_ema ≈ 0.5, F_total ≈ 1.36, drift ≈ 0.1
+- penalty = 0.1 × 1.36 × 0.1 = 0.014 (~28% of typical task gradient)
+
+The worst case requires all gradients at clip AND weights drifted to WEIGHT_CLIP
+AND 10+ environment transitions — extremely unlikely for current network sizes.
+If a specific environment produces excessive EWC penalties, reduce `ewc_lambda`
+directly or let the GA evolve it to the optimal value.
 
 Note: EWC penalty is inside the `effective_lr` multiplication. In FROZEN state
 (`effective_lr ≈ scale_floor = 0.0`), both task gradient and EWC penalty are zero —
@@ -795,19 +896,30 @@ The full update formula combining all mechanisms:
 
 ```
 For layer i, parameter j:
+    // M3 — layer decay
     IF adaptive_consolidation:
         layer_decay = 1.0 - adaptive_decay[i]     // from M3b per-layer surprise EMA
     ELSE:
         layer_decay = consolidation_decay^(n_hidden - 1 - i)  // from M3a exponential
 
-    effective_lr   = lr * surprise_scale * layer_decay
+    // M3 folded into surprise_scale for Layer::backward
+    layer_surprise = surprise_scale * layer_decay
+    effective_lr   = lr * layer_surprise           // = lr * surprise_scale * layer_decay
+
+    // M4 — EWC penalty (pre-update θ)
     ewc_penalty    = λ_ewc * F[i,j] * (θ[i,j] - θ_snapshot[i,j])
-    total_grad     = task_grad[i,j] + ewc_penalty
-    θ[i,j]        -= effective_lr * total_grad
+
+    // Task gradient applied by Layer::backward (uses layer_surprise as surprise_scale)
+    // EWC penalty applied as post-correction (uses same effective_lr)
+    θ[i,j]        -= effective_lr * (task_grad[i,j] + ewc_penalty)
 ```
 
-When the hysteresis gate is FROZEN: `surprise_scale ≈ scale_floor (1e-6)`, so
-`effective_lr ≈ 0` regardless of EWC — the spring is irrelevant because nothing
+Both task gradient and EWC penalty are scaled by the same `effective_lr`, which
+includes `layer_decay`. This ensures M3 layer-wise consolidation applies uniformly
+to all weight updates for a given layer, not just the EWC penalty.
+
+When the hysteresis gate is FROZEN: `surprise_scale ≈ scale_floor (0.0)`, so
+`effective_lr = 0` regardless of EWC — the spring is irrelevant because nothing
 moves. EWC only matters during PLASTIC phases when the network is actively learning
 a new environment and needs to protect previously consolidated weights.
 
@@ -1077,6 +1189,24 @@ blending) operates exclusively on weight matrices and ActivationCaches. None of 
 continuous learning state participates in or affects the alignment or blending
 process. The crossover is a pure function of weights and activation history.
 
+### Serialization
+
+The existing serializer (`serializer.rs`) persists weights and config via JSON.
+Continuous learning adds mutable state (EWMAs, Fisher, snapshots, hysteresis state)
+that must be handled during save/load:
+
+- **Load without CL state** (e.g., a v2.0.0 model or weights-only export):
+  initialize all continuous learning state to clean PLASTIC defaults — identical
+  to the crossover reset contract above. The agent starts learning from scratch
+  with the loaded weights.
+- **Load with CL state** (full checkpoint): resume exactly where the agent left
+  off — FROZEN/PLASTIC state, EWMA values, Fisher diagonals, weight snapshots,
+  and step counters are all restored.
+
+The serialization format and field selection are defined during TDD implementation.
+The `#[serde(skip, default)]` pattern already used for the `backend` field provides
+the mechanism for backward-compatible deserialization of new state fields.
+
 ## Implementation Order
 
 Suggested phased approach, each phase independently testable:
@@ -1184,6 +1314,10 @@ IF actor transitions FROZEN → PLASTIC
    AND critic_frozen_steps >= actor_wakes_critic_threshold:
        Force critic to PLASTIC
 ```
+
+`critic_frozen_steps` increments on every call to `step()` while the critic is in
+FROZEN state, regardless of whether a learning update occurs on that step. It resets
+to 0 when the critic enters PLASTIC (by its own sleep condition or by this coupling).
 
 This is asymmetric — the actor can wake the critic, but NOT the reverse. The actor's
 PC surprise is a more reliable environment change detector (it measures internal
