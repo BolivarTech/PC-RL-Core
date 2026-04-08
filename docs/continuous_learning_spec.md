@@ -107,7 +107,7 @@ let action = agent.step(&state, reward, terminal);
 |------------|----------|-------------|
 | `state`    | `&[f64]` | Current environment observation |
 | `reward`   | `f64`    | Reward received for the **previous** action |
-| `terminal` | `bool`   | Whether the previous state was terminal (episode end) |
+| `terminal` | `bool`   | Whether this step ends the episode (terminal state reached, sets V(s')=0 in TD update) |
 
 #### Internal state machine
 
