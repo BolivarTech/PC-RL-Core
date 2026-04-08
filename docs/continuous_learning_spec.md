@@ -983,12 +983,19 @@ pub struct PcActorCriticConfig {
     pub scale_floor: f64,            // default 0.0
     pub scale_ceil: f64,             // default 2.0
 
-    // M2 — Dual-EWMA Hysteresis (per-network, same defaults)
-    pub hysteresis: bool,          // default false (legacy linear mapping)
-    pub fast_window: usize,        // default 10 (fast EWMA window)
-    pub slow_window: usize,        // default 50 (slow EWMA baseline window)
-    pub wake_fraction: f64,        // default 0.5 (fast > slow × 1.5 → PLASTIC)
-    pub sleep_fraction: f64,       // default 0.3 (fast < slow × 0.7 → FROZEN)
+    // M2 — Dual-EWMA Hysteresis (per-network, independently configurable)
+    // Actor:
+    pub actor_hysteresis: bool,          // default false (legacy linear mapping)
+    pub actor_fast_window: usize,        // default 10 (fast EWMA window)
+    pub actor_slow_window: usize,        // default 50 (slow EWMA baseline window)
+    pub actor_wake_fraction: f64,        // default 0.5 (fast > slow × 1.5 → PLASTIC)
+    pub actor_sleep_fraction: f64,       // default 0.3 (fast < slow × 0.7 → FROZEN)
+    // Critic:
+    pub critic_hysteresis: bool,          // default false
+    pub critic_fast_window: usize,        // default 10
+    pub critic_slow_window: usize,        // default 50
+    pub critic_wake_fraction: f64,        // default 0.5
+    pub critic_sleep_fraction: f64,       // default 0.3
 
     // M3 — Layer consolidation (per-network)
     // Actor:
@@ -1017,12 +1024,12 @@ Legacy equivalent (v2.0.0 behavior):
 [agent.actor]
 scale_floor = 0.1
 scale_ceil = 2.0
-hysteresis = false
+actor_hysteresis = false
 consolidation_decay = 1.0
 ewc_lambda = 0.0
 
 [agent.critic]
-consolidation_decay = 1.0
+critic_consolidation_decay = 1.0
 ```
 
 Continuous learning mode with fixed decay (M3a):
@@ -1031,11 +1038,11 @@ Continuous learning mode with fixed decay (M3a):
 [agent.actor]
 scale_floor = 0.0
 scale_ceil = 2.0
-hysteresis = true
-fast_window = 10
-slow_window = 50
-wake_fraction = 0.5
-sleep_fraction = 0.3
+actor_hysteresis = true
+actor_fast_window = 10
+actor_slow_window = 50
+actor_wake_fraction = 0.5
+actor_sleep_fraction = 0.3
 consolidation_decay = 0.5
 ewc_lambda = 0.1
 fisher_ema_beta = 0.99
@@ -1048,7 +1055,12 @@ hidden_layers = [
 ]
 
 [agent.critic]
-consolidation_decay = 0.5
+critic_hysteresis = true
+critic_fast_window = 10
+critic_slow_window = 50
+critic_wake_fraction = 0.5
+critic_sleep_fraction = 0.3
+critic_consolidation_decay = 0.5
 ```
 
 Continuous learning mode with adaptive decay (M3b, actor only):
@@ -1057,11 +1069,11 @@ Continuous learning mode with adaptive decay (M3b, actor only):
 [agent.actor]
 scale_floor = 0.0
 scale_ceil = 2.0
-hysteresis = true
-fast_window = 10
-slow_window = 50
-wake_fraction = 0.5
-sleep_fraction = 0.3
+actor_hysteresis = true
+actor_fast_window = 10
+actor_slow_window = 50
+actor_wake_fraction = 0.5
+actor_sleep_fraction = 0.3
 adaptive_consolidation = true
 consolidation_ema_beta = 0.99
 consolidation_sigmoid_k = 10.0
@@ -1078,7 +1090,12 @@ hidden_layers = [
 ]
 
 [agent.critic]
-consolidation_decay = 0.5    # critic always uses M3a
+critic_hysteresis = true
+critic_fast_window = 10
+critic_slow_window = 50
+critic_wake_fraction = 0.5
+critic_sleep_fraction = 0.3
+critic_consolidation_decay = 0.5    # critic always uses M3a
 ```
 
 All parameters accept CLI override (e.g., `--scale-floor 0.0`,
@@ -1109,21 +1126,28 @@ The `crossover()` method must initialize all continuous learning fields as follo
 
 // M2 — Dual-EWMA Hysteresis (per-network)
 actor_fast_ewma: 0.0,                     // no signal history
-actor_fast_ewma_k: 0,                     // warmup counter at zero
 actor_slow_ewma: 0.0,
-actor_slow_ewma_k: 0,
+actor_ewma_k: 0,                          // shared step counter (both EWMAs receive same signal)
 actor_plasticity_state: PlasticityState::Plastic,  // start learning
 critic_fast_ewma: 0.0,
-critic_fast_ewma_k: 0,
 critic_slow_ewma: 0.0,
-critic_slow_ewma_k: 0,
+critic_ewma_k: 0,
 critic_plasticity_state: PlasticityState::Plastic,
 
 // M4 — EWC (per-network)
+actor_f_total: vec![0.0; actor_num_params],        // no accumulated Fisher
 actor_fisher_ema: vec![0.0; actor_num_params],     // no importance data
 actor_weight_snapshot: None,                        // no anchor point
+actor_plastic_step_counter: 0,                      // no PLASTIC steps yet
+actor_last_phase_reliable: false,                   // no prior reliable phase
+critic_f_total: vec![0.0; critic_num_params],
 critic_fisher_ema: vec![0.0; critic_num_params],
 critic_weight_snapshot: None,
+critic_plastic_step_counter: 0,
+critic_last_phase_reliable: false,
+
+// Actor-critic coupling
+critic_frozen_steps: 0,                    // no FROZEN history
 
 // Buffers
 surprise_buffer: VecDeque::new(),          // already done in v2.0.0
@@ -1213,13 +1237,15 @@ Suggested phased approach, each phase independently testable:
 
 | Phase | Mechanism | Scope | Risk |
 |-------|-----------|-------|------|
+| 0 | Unified step() API | `step()`, `step_masked()`, `reset_step()`, internal state machine | Low — thin wrapper over existing `act()` + `learn_continuous()` |
 | 1 | M1 — Configurable scale range | `surprise_scale()` + config | Minimal — parameter change only |
-| 2 | M2 — Hysteresis gate | `surprise_scale()` + state field | Low — additive, behind flag |
-| 3 | M3 — Layer-wise decay | `update_weights()` | Low — multiplicative factor |
-| 4 | M4 — EWC regularization | `update_weights()` + snapshot storage | Medium — new storage + consolidation trigger |
+| 2 | M2 — Hysteresis gate | Dual-EWMA + state machine + warmup guard | Low — additive, behind flag |
+| 3 | M3 — Layer-wise decay | `update_weights()` + M3b per-layer EMA | Low — multiplicative factor |
+| 4 | M4 — EWC regularization | Fisher lifecycle + EWC post-correction + snapshot storage | Medium — new storage + consolidation trigger |
 
-Each phase should be validated independently with the Tic-Tac-Toe benchmark before
-proceeding to the next.
+Phase 0 provides the canonical API that subsequent phases build on — M1-M4 tests
+use `step()` / `step_masked()` for integration testing. Each phase should be
+validated independently with the Tic-Tac-Toe benchmark before proceeding to the next.
 
 ## Biological Analogy
 
@@ -1462,10 +1488,12 @@ This is subject to experimental validation — do not add preemptively.
 
 ```toml
 [agent.critic]
-consolidation_decay = 0.5    # default 1.0 (no decay, legacy)
-# Hysteresis parameters for the critic's own |TD error| state machine:
-# fast_window, slow_window, wake_fraction, sleep_fraction
-# default to the same values as the actor but are independently configurable.
+critic_hysteresis = true             # independent from actor
+critic_fast_window = 10
+critic_slow_window = 50
+critic_wake_fraction = 0.5
+critic_sleep_fraction = 0.3
+critic_consolidation_decay = 0.5     # default 1.0 (no decay, legacy)
 # ewc_lambda, fisher_ema_beta, fisher_decay are shared at agent level.
 ```
 
