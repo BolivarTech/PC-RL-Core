@@ -1217,19 +1217,32 @@ process. The crossover is a pure function of weights and activation history.
 
 The existing serializer (`serializer.rs`) persists weights and config via JSON.
 Continuous learning adds mutable state (EWMAs, Fisher, snapshots, hysteresis state)
-that must be handled during save/load:
+that must be handled during save/load.
 
-- **Load without CL state** (e.g., a v2.0.0 model or weights-only export):
-  initialize all continuous learning state to clean PLASTIC defaults — identical
-  to the crossover reset contract above. The agent starts learning from scratch
-  with the loaded weights.
-- **Load with CL state** (full checkpoint): resume exactly where the agent left
-  off — FROZEN/PLASTIC state, EWMA values, Fisher diagonals, weight snapshots,
-  and step counters are all restored.
+#### Automatic mode selection via field presence
 
-The serialization format and field selection are defined during TDD implementation.
-The `#[serde(skip, default)]` pattern already used for the `backend` field provides
-the mechanism for backward-compatible deserialization of new state fields.
+There is no explicit flag or mode selector. The behavior is determined automatically
+by serde during deserialization based on whether the CL fields are present in the
+JSON:
+
+- **Serialize a CL agent**: all continuous learning state (EWMAs, k counters,
+  FROZEN/PLASTIC state, F_total, F_ema, weight snapshots, plastic_step_counter,
+  last_phase_reliable, critic_frozen_steps) is written to JSON alongside weights
+  and config.
+
+- **Deserialize a CL JSON** (full checkpoint): serde finds the CL fields, restores
+  them, and the agent resumes exactly where it left off — same FROZEN/PLASTIC state,
+  same Fisher, same EWMAs.
+
+- **Deserialize a legacy JSON** (v2.0.0 model or weights-only): serde does NOT find
+  CL fields, uses `#[serde(default)]`, and all CL state is initialized to clean
+  PLASTIC defaults (identical to the crossover reset contract). The agent starts
+  continuous learning from scratch with the inherited weights, as if it were a newly
+  constructed agent.
+
+This uses the `#[serde(default)]` pattern already established for the `backend` field
+in v2.0.0. A single `load_agent()` method handles both cases transparently — no flags,
+no mode parameter. The JSON content dictates the behavior.
 
 ## Implementation Order
 
