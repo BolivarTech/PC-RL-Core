@@ -1,0 +1,95 @@
+MODE: code-review
+CONTEXT (File: C:/Users/JBOLIV~1/AppData/Local/Temp/magi-payload.md):
+
+# MAGI Deep Code Review — pc-rl-core continuos_learning branch
+
+## Scope
+
+Branch: `continuos_learning`
+Base commit: `6266252` (Base state before Ralph Loop)
+HEAD: `1d69b66`
+Total changes: **+5850 / -67** across 11 files
+
+## What was built
+
+Continuous Learning via Intrinsic Surprise Modulation (v2.1.0) — a 7-phase
+SBTDD implementation executed autonomously by Ralph Loop. Each phase ships
+with comprehensive tests (494 total, up from 392 baseline, +102 net).
+
+## Commits (chronological)
+
+```
+000eb73 feat: 001 - Unified step() API with TD(0) learning
+fc59c8e feat: 002 - Configurable scale range (scale_floor/scale_ceil)
+bd11708 feat: 003 - EwmaTracker & PlasticityState standalone types
+ba6cfe7 feat: 004 - Dual-EWMA hysteresis integration
+bcb5f32 feat: 005 - Layer-wise consolidation decay (M3a/M3b)
+173de8d feat: 006 - EWC regularization (M4) with Fisher lifecycle
+ff19f25 feat: 007 - GA crossover CL reset and CL state serialization
+```
+
+## Files changed (src only)
+
+- `src/lib.rs` — +5 (re-exports for new types)
+- `src/pc_actor.rs` — +81 (ActivationCache hooks for decay)
+- `src/mlp_critic.rs` — +56 (critic consolidation decay support)
+- `src/pc_actor_critic.rs` — **+4316** (all CL logic: step API, scale range,
+  EWMA, hysteresis, layer decay, EWC, crossover reset, serialization)
+- `src/serializer.rs` — +358 (ClState persistence with backward-compat defaults)
+
+## Authoritative references
+
+- **Spec (SDD+BDD):** `sbtdd/spec-behavior.md`
+- **Plan with TDD stubs:** `sbtdd/claude-plan-tdd.md`
+- **Section details:** `sbtdd/sections/section-01-*.md` through `section-07-*.md`
+- **Progress log:** `plans/progress.md` (what Ralph learned per iteration)
+- **Task backlog:** `plans/prd.json` (acceptance criteria per phase)
+
+## Review focus
+
+Perform a **deep technical review** of the new continuous-learning architecture.
+The agents should:
+
+1. **Read the spec first** (`sbtdd/spec-behavior.md`) to understand what was
+   supposed to be built, then compare against the actual code.
+2. **Read the full diff** on demand: `git diff 6266252..HEAD -- src/<file>`
+   or use `git show <commit> -- src/`
+3. **Read individual files** to verify critical sections
+4. **Check for these concerns** (each agent from their lens):
+
+   **Melchior (Scientist — technical rigor):**
+   - Mathematical correctness of EWMA warmup formula, sigmoid decay,
+     Fisher/EWC regularization, TD(0) learning
+   - Numeric stability (NaN propagation, gradient clipping interactions,
+     consolidation decay boundary conditions)
+   - Correctness of `Layer::backward` invariant preservation (spec mandates
+     zero modification to its signature/logic — injection via `surprise_scale`)
+   - Serialization round-trip fidelity for ClState
+   - Consistency between spec acceptance criteria and implemented tests
+
+   **Balthasar (Pragmatist — maintainability):**
+   - Is `pc_actor_critic.rs` at 4316+ lines too monolithic? Should it be split?
+   - API ergonomics of the new `step()`, `step_masked()`, `reset_step()` methods
+   - Test quality — are the 102 new tests meaningful or mostly boilerplate?
+   - Config surface area growth (new fields: scale_floor, scale_ceil, decay
+     params, Fisher params, hysteresis params) — is the UX still reasonable?
+   - Backward compatibility with v2.0.0 defaults
+   - Readability and discoverability of the new types
+
+   **Caspar (Critic — adversarial edge cases):**
+   - What happens if serialization encounters a legacy v2.0.0 JSON without
+     any CL fields? Does it degrade to `passes: false` or silently corrupt?
+   - EWC with `lambda=0` — is it actually a no-op or does it still allocate/compute?
+   - Hysteresis during GA crossover — does the child inherit parent's transient state?
+   - Fisher snapshots through layer size mismatches (crossover between
+     topologically different parents)
+   - Logits reversal interaction with softmax masked actions
+   - What breaks under concurrent `step()` + `reset_step()` calls?
+   - Any `unwrap()` / `panic!` in hot paths that should be `Result`?
+   - Clippy pedantic would catch anything?
+
+## Deliverable
+
+Each agent returns JSON with verdict, confidence, findings (critical/warning/info),
+and a concrete recommendation. Synthesis aggregates into a STRONG GO / GO / HOLD
+decision.
