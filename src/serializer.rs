@@ -291,6 +291,18 @@ mod tests {
             entropy_coeff: 0.01,
             scale_floor: 0.1,
             scale_ceil: 2.0,
+            actor_hysteresis: false,
+            actor_fast_window: 20,
+            actor_slow_window: 100,
+            actor_wake_fraction: 0.5,
+            actor_sleep_fraction: 0.3,
+            critic_hysteresis: false,
+            critic_fast_window: 20,
+            critic_slow_window: 100,
+            critic_wake_fraction: 0.5,
+            critic_sleep_fraction: 0.3,
+            actor_wakes_critic: false,
+            actor_wakes_critic_threshold: 1000,
         }
     }
 

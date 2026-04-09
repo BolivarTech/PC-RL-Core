@@ -62,6 +62,66 @@ fn default_scale_ceil() -> f64 {
     2.0
 }
 
+/// Default for actor hysteresis (disabled).
+fn default_actor_hysteresis() -> bool {
+    false
+}
+
+/// Default fast EWMA window for actor hysteresis.
+fn default_actor_fast_window() -> usize {
+    20
+}
+
+/// Default slow EWMA window for actor hysteresis.
+fn default_actor_slow_window() -> usize {
+    100
+}
+
+/// Default wake fraction for actor hysteresis.
+fn default_actor_wake_fraction() -> f64 {
+    0.5
+}
+
+/// Default sleep fraction for actor hysteresis.
+fn default_actor_sleep_fraction() -> f64 {
+    0.3
+}
+
+/// Default for critic hysteresis (disabled).
+fn default_critic_hysteresis() -> bool {
+    false
+}
+
+/// Default fast EWMA window for critic hysteresis.
+fn default_critic_fast_window() -> usize {
+    20
+}
+
+/// Default slow EWMA window for critic hysteresis.
+fn default_critic_slow_window() -> usize {
+    100
+}
+
+/// Default wake fraction for critic hysteresis.
+fn default_critic_wake_fraction() -> f64 {
+    0.5
+}
+
+/// Default sleep fraction for critic hysteresis.
+fn default_critic_sleep_fraction() -> f64 {
+    0.3
+}
+
+/// Default for actor-wakes-critic coupling (disabled).
+fn default_actor_wakes_critic() -> bool {
+    false
+}
+
+/// Default threshold for actor-wakes-critic coupling.
+fn default_actor_wakes_critic_threshold() -> u64 {
+    1000
+}
+
 /// Plasticity state of a network: whether it is actively learning or frozen.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum PlasticityState {
@@ -122,6 +182,65 @@ impl EwmaTracker {
     }
 }
 
+/// Dual-EWMA state machine for one network (actor or critic).
+///
+/// Drives automatic FROZEN/PLASTIC transitions based on the ratio
+/// between a fast EWMA (responsive) and a slow EWMA (baseline).
+///
+/// - FROZEN → PLASTIC: `fast > slow × (1 + wake_fraction)`
+/// - PLASTIC → FROZEN: `fast < slow × (1 - sleep_fraction)`,
+///   guarded by `fast.k >= min_initial_plastic`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HysteresisState {
+    /// Fast EWMA (responsive to recent signals).
+    pub fast: EwmaTracker,
+    /// Slow EWMA (baseline signal level).
+    pub slow: EwmaTracker,
+    /// Current plasticity state.
+    pub state: PlasticityState,
+    /// Fraction above slow EWMA that triggers wake (FROZEN → PLASTIC).
+    pub wake_fraction: f64,
+    /// Fraction below slow EWMA that triggers sleep (PLASTIC → FROZEN).
+    pub sleep_fraction: f64,
+    /// Minimum fast EWMA steps before sleep is allowed.
+    pub min_initial_plastic: u64,
+}
+
+impl HysteresisState {
+    /// Updates both EWMAs with the new signal and evaluates state transition.
+    ///
+    /// Returns `Some(new_state)` if a transition occurred, `None` otherwise.
+    ///
+    /// # Arguments
+    ///
+    /// * `signal` - The input signal (surprise for actor, |TD error| for critic).
+    pub fn update(&mut self, signal: f64) -> Option<PlasticityState> {
+        self.fast.update(signal);
+        self.slow.update(signal);
+
+        match self.state {
+            PlasticityState::Frozen => {
+                // Wake: fast > slow * (1 + wake_fraction)
+                if self.fast.value > self.slow.value * (1.0 + self.wake_fraction) {
+                    self.state = PlasticityState::Plastic;
+                    return Some(PlasticityState::Plastic);
+                }
+            }
+            PlasticityState::Plastic => {
+                // Sleep: fast < slow * (1 - sleep_fraction), guarded by warmup
+                if self.fast.k >= self.min_initial_plastic
+                    && self.fast.value < self.slow.value * (1.0 - self.sleep_fraction)
+                {
+                    self.state = PlasticityState::Frozen;
+                    return Some(PlasticityState::Frozen);
+                }
+            }
+        }
+
+        None
+    }
+}
+
 /// Configuration for the integrated PC Actor-Critic agent.
 ///
 /// # Examples
@@ -159,6 +278,18 @@ impl EwmaTracker {
 ///     entropy_coeff: 0.01,
 ///     scale_floor: 0.0,
 ///     scale_ceil: 2.0,
+///     actor_hysteresis: false,
+///     actor_fast_window: 20,
+///     actor_slow_window: 100,
+///     actor_wake_fraction: 0.5,
+///     actor_sleep_fraction: 0.3,
+///     critic_hysteresis: false,
+///     critic_fast_window: 20,
+///     critic_slow_window: 100,
+///     critic_wake_fraction: 0.5,
+///     critic_sleep_fraction: 0.3,
+///     actor_wakes_critic: false,
+///     actor_wakes_critic_threshold: 1000,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +329,45 @@ pub struct PcActorCriticConfig {
     /// Default: 2.0.
     #[serde(default = "default_scale_ceil")]
     pub scale_ceil: f64,
+    /// Enable actor dual-EWMA hysteresis state machine. Default: false.
+    #[serde(default = "default_actor_hysteresis")]
+    pub actor_hysteresis: bool,
+    /// Fast EWMA window for actor hysteresis. Default: 20.
+    #[serde(default = "default_actor_fast_window")]
+    pub actor_fast_window: usize,
+    /// Slow EWMA window for actor hysteresis. Default: 100.
+    #[serde(default = "default_actor_slow_window")]
+    pub actor_slow_window: usize,
+    /// Wake threshold fraction for actor (FROZEN → PLASTIC). Default: 0.5.
+    #[serde(default = "default_actor_wake_fraction")]
+    pub actor_wake_fraction: f64,
+    /// Sleep threshold fraction for actor (PLASTIC → FROZEN). Default: 0.3.
+    #[serde(default = "default_actor_sleep_fraction")]
+    pub actor_sleep_fraction: f64,
+    /// Enable critic dual-EWMA hysteresis state machine. Default: false.
+    #[serde(default = "default_critic_hysteresis")]
+    pub critic_hysteresis: bool,
+    /// Fast EWMA window for critic hysteresis. Default: 20.
+    #[serde(default = "default_critic_fast_window")]
+    pub critic_fast_window: usize,
+    /// Slow EWMA window for critic hysteresis. Default: 100.
+    #[serde(default = "default_critic_slow_window")]
+    pub critic_slow_window: usize,
+    /// Wake threshold fraction for critic (FROZEN → PLASTIC). Default: 0.5.
+    #[serde(default = "default_critic_wake_fraction")]
+    pub critic_wake_fraction: f64,
+    /// Sleep threshold fraction for critic (PLASTIC → FROZEN). Default: 0.3.
+    #[serde(default = "default_critic_sleep_fraction")]
+    pub critic_sleep_fraction: f64,
+    /// Enable actor→critic coupling: when actor wakes, force critic to wake
+    /// if it has been frozen for at least `actor_wakes_critic_threshold` steps.
+    /// Default: false.
+    #[serde(default = "default_actor_wakes_critic")]
+    pub actor_wakes_critic: bool,
+    /// Minimum critic frozen steps before actor→critic coupling triggers.
+    /// Default: 1000.
+    #[serde(default = "default_actor_wakes_critic_threshold")]
+    pub actor_wakes_critic_threshold: u64,
 }
 
 /// A single step in a trajectory collected during an episode.
@@ -325,6 +495,20 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// Previous valid actions mask (transient, not serialized).
     /// `None` = all actions valid (used by `step()`), `Some` = masked (used by `step_masked()`).
     valid_actions_prev: Option<Vec<usize>>,
+    /// Actor hysteresis state machine (None when disabled).
+    actor_hysteresis: Option<HysteresisState>,
+    /// Critic hysteresis state machine (None when disabled).
+    critic_hysteresis: Option<HysteresisState>,
+    /// Steps the actor has been in PLASTIC state during the current phase.
+    actor_plastic_step_counter: u64,
+    /// Steps the critic has been in PLASTIC state during the current phase.
+    critic_plastic_step_counter: u64,
+    /// Consecutive steps the critic has been FROZEN.
+    critic_frozen_steps: u64,
+    /// Circular buffer of recent |TD errors| for critic adaptive scale.
+    td_error_buffer: VecDeque<f64>,
+    /// Last TD error from learn_continuous (transient, for hysteresis).
+    last_td_error: f64,
 }
 
 impl<L: LinAlg> PcActorCritic<L> {
@@ -364,6 +548,65 @@ impl<L: LinAlg> PcActorCritic<L> {
             )));
         }
 
+        // Validate actor hysteresis fractions
+        if config.actor_hysteresis {
+            if config.actor_wake_fraction <= 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "actor_wake_fraction must be > 0.0 when actor_hysteresis enabled, got {}",
+                    config.actor_wake_fraction
+                )));
+            }
+            if config.actor_sleep_fraction <= 0.0 || config.actor_sleep_fraction >= 1.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "actor_sleep_fraction must be in (0.0, 1.0) when actor_hysteresis enabled, got {}",
+                    config.actor_sleep_fraction
+                )));
+            }
+        }
+
+        // Validate critic hysteresis fractions
+        if config.critic_hysteresis {
+            if config.critic_wake_fraction <= 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "critic_wake_fraction must be > 0.0 when critic_hysteresis enabled, got {}",
+                    config.critic_wake_fraction
+                )));
+            }
+            if config.critic_sleep_fraction <= 0.0 || config.critic_sleep_fraction >= 1.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "critic_sleep_fraction must be in (0.0, 1.0) when critic_hysteresis enabled, got {}",
+                    config.critic_sleep_fraction
+                )));
+            }
+        }
+
+        // Build hysteresis state machines when enabled
+        let actor_hysteresis = if config.actor_hysteresis {
+            Some(HysteresisState {
+                fast: EwmaTracker::new(config.actor_fast_window),
+                slow: EwmaTracker::new(config.actor_slow_window),
+                state: PlasticityState::Plastic,
+                wake_fraction: config.actor_wake_fraction,
+                sleep_fraction: config.actor_sleep_fraction,
+                min_initial_plastic: config.actor_slow_window as u64,
+            })
+        } else {
+            None
+        };
+
+        let critic_hysteresis = if config.critic_hysteresis {
+            Some(HysteresisState {
+                fast: EwmaTracker::new(config.critic_fast_window),
+                slow: EwmaTracker::new(config.critic_slow_window),
+                state: PlasticityState::Plastic,
+                wake_fraction: config.critic_wake_fraction,
+                sleep_fraction: config.critic_sleep_fraction,
+                min_initial_plastic: config.critic_slow_window as u64,
+            })
+        } else {
+            None
+        };
+
         use rand::SeedableRng;
         let mut rng = StdRng::seed_from_u64(seed);
         let actor = PcActor::<L>::new(backend.clone(), config.actor.clone(), &mut rng)?;
@@ -379,6 +622,13 @@ impl<L: LinAlg> PcActorCritic<L> {
             action_prev: None,
             infer_prev: None,
             valid_actions_prev: None,
+            actor_hysteresis,
+            critic_hysteresis,
+            actor_plastic_step_counter: 0,
+            critic_plastic_step_counter: 0,
+            critic_frozen_steps: 0,
+            td_error_buffer: VecDeque::new(),
+            last_td_error: 0.0,
         })
     }
 
@@ -472,6 +722,13 @@ impl<L: LinAlg> PcActorCritic<L> {
             action_prev: None,
             infer_prev: None,
             valid_actions_prev: None,
+            actor_hysteresis: None,
+            critic_hysteresis: None,
+            actor_plastic_step_counter: 0,
+            critic_plastic_step_counter: 0,
+            critic_frozen_steps: 0,
+            td_error_buffer: VecDeque::new(),
+            last_td_error: 0.0,
         })
     }
 
@@ -501,6 +758,13 @@ impl<L: LinAlg> PcActorCritic<L> {
             action_prev: None,
             infer_prev: None,
             valid_actions_prev: None,
+            actor_hysteresis: None,
+            critic_hysteresis: None,
+            actor_plastic_step_counter: 0,
+            critic_plastic_step_counter: 0,
+            critic_frozen_steps: 0,
+            td_error_buffer: VecDeque::new(),
+            last_td_error: 0.0,
         }
     }
 
@@ -724,12 +988,15 @@ impl<L: LinAlg> PcActorCritic<L> {
             delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
         }
 
-        let s_scale = self.surprise_scale(infer.surprise_score);
+        let s_scale = self.effective_actor_scale(infer.surprise_score);
         self.actor.update_weights(&delta, infer, input, s_scale);
 
         if self.config.adaptive_surprise {
             self.push_surprise(infer.surprise_score);
         }
+
+        self.last_td_error = td_error;
+        self.push_td_error(td_error.abs());
 
         loss
     }
@@ -862,6 +1129,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             self.action_prev.take(),
             self.infer_prev.take(),
         ) {
+            let surprise_score = prev_infer.surprise_score;
             let prev_state_vec = self.backend.vec_to_vec(&prev_state);
             let learn_mask = self
                 .valid_actions_prev
@@ -878,6 +1146,11 @@ impl<L: LinAlg> PcActorCritic<L> {
                 &current_infer,
                 terminal,
             );
+
+            // Update hysteresis state machines after learning
+            if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
+                self.process_hysteresis(surprise_score, self.last_td_error.abs());
+            }
         }
 
         // Select action
@@ -924,6 +1197,108 @@ impl<L: LinAlg> PcActorCritic<L> {
             self.surprise_buffer.pop_front();
         }
         self.surprise_buffer.push_back(surprise);
+    }
+
+    /// Pushes a |TD error| into the critic adaptive buffer (circular).
+    fn push_td_error(&mut self, td_error: f64) {
+        if self.td_error_buffer.len() >= self.config.surprise_buffer_size {
+            self.td_error_buffer.pop_front();
+        }
+        self.td_error_buffer.push_back(td_error);
+    }
+
+    /// Computes the learning rate scale factor for the critic based on |TD error|.
+    ///
+    /// Identical to [`surprise_scale()`](Self::surprise_scale) but reads from
+    /// the `td_error_buffer` for adaptive threshold computation.
+    pub fn critic_surprise_scale(&self, td_error: f64) -> f64 {
+        let (low, high) = if self.config.adaptive_surprise && self.td_error_buffer.len() >= 10 {
+            let mean = self.td_error_buffer.iter().sum::<f64>() / self.td_error_buffer.len() as f64;
+            let variance = self
+                .td_error_buffer
+                .iter()
+                .map(|&s| (s - mean) * (s - mean))
+                .sum::<f64>()
+                / self.td_error_buffer.len() as f64;
+            let std = variance.sqrt();
+            let lo = (mean - 0.5 * std).max(0.0);
+            let hi = mean + 1.5 * std;
+            (lo, hi)
+        } else {
+            (self.config.surprise_low, self.config.surprise_high)
+        };
+
+        if td_error <= low {
+            self.config.scale_floor
+        } else if td_error >= high {
+            self.config.scale_ceil
+        } else {
+            let t = (td_error - low) / (high - low);
+            self.config.scale_floor + t * (self.config.scale_ceil - self.config.scale_floor)
+        }
+    }
+
+    /// Computes the effective actor learning rate scale considering hysteresis.
+    ///
+    /// When actor hysteresis is enabled and the actor is FROZEN, returns
+    /// `scale_floor`. Otherwise delegates to [`surprise_scale()`](Self::surprise_scale).
+    pub(crate) fn effective_actor_scale(&self, surprise: f64) -> f64 {
+        match &self.actor_hysteresis {
+            Some(h) if h.state == PlasticityState::Frozen => self.config.scale_floor,
+            _ => self.surprise_scale(surprise),
+        }
+    }
+
+    /// Updates hysteresis state machines after learning.
+    ///
+    /// Handles EWMA updates, state transitions, counter management,
+    /// and actor→critic coupling.
+    pub(crate) fn process_hysteresis(&mut self, actor_signal: f64, critic_signal: f64) {
+        let mut actor_woke = false;
+
+        // Update actor hysteresis
+        if let Some(ref mut hyst) = self.actor_hysteresis {
+            // Increment counter for pre-transition state
+            if hyst.state == PlasticityState::Plastic {
+                self.actor_plastic_step_counter += 1;
+            }
+            if let Some(new_state) = hyst.update(actor_signal) {
+                if new_state == PlasticityState::Plastic {
+                    self.actor_plastic_step_counter = 0;
+                    actor_woke = true;
+                }
+            }
+        }
+
+        // Update critic hysteresis
+        if let Some(ref mut hyst) = self.critic_hysteresis {
+            // Increment counters for pre-transition state
+            if hyst.state == PlasticityState::Frozen {
+                self.critic_frozen_steps += 1;
+            }
+            if hyst.state == PlasticityState::Plastic {
+                self.critic_plastic_step_counter += 1;
+            }
+            if let Some(new_state) = hyst.update(critic_signal) {
+                if new_state == PlasticityState::Plastic {
+                    self.critic_plastic_step_counter = 0;
+                    self.critic_frozen_steps = 0;
+                }
+            }
+        }
+
+        // Actor wakes critic coupling
+        if actor_woke && self.config.actor_wakes_critic {
+            if let Some(ref mut critic_hyst) = self.critic_hysteresis {
+                if critic_hyst.state == PlasticityState::Frozen
+                    && self.critic_frozen_steps >= self.config.actor_wakes_critic_threshold
+                {
+                    critic_hyst.state = PlasticityState::Plastic;
+                    self.critic_plastic_step_counter = 0;
+                    self.critic_frozen_steps = 0;
+                }
+            }
+        }
     }
 }
 
@@ -998,6 +1373,18 @@ mod tests {
             entropy_coeff: 0.01,
             scale_floor: 0.1, // v2.0.0 compat: existing tests expect 0.1 floor
             scale_ceil: 2.0,
+            actor_hysteresis: false,
+            actor_fast_window: 20,
+            actor_slow_window: 100,
+            actor_wake_fraction: 0.5,
+            actor_sleep_fraction: 0.3,
+            critic_hysteresis: false,
+            critic_fast_window: 20,
+            critic_slow_window: 100,
+            critic_wake_fraction: 0.5,
+            critic_sleep_fraction: 0.3,
+            actor_wakes_critic: false,
+            actor_wakes_critic_threshold: 1000,
         }
     }
 
@@ -1440,6 +1827,18 @@ mod tests {
             entropy_coeff: 0.0, // no entropy to isolate gradient effect
             scale_floor: 0.1,
             scale_ceil: 2.0,
+            actor_hysteresis: false,
+            actor_fast_window: 20,
+            actor_slow_window: 100,
+            actor_wake_fraction: 0.5,
+            actor_sleep_fraction: 0.3,
+            critic_hysteresis: false,
+            critic_fast_window: 20,
+            critic_slow_window: 100,
+            critic_wake_fraction: 0.5,
+            critic_sleep_fraction: 0.3,
+            actor_wakes_critic: false,
+            actor_wakes_critic_threshold: 1000,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -2388,5 +2787,383 @@ mod tests {
         assert_eq!(loaded.k, tracker.k);
         assert!((loaded.value - tracker.value).abs() < f64::EPSILON);
         assert_eq!(loaded.window, tracker.window);
+    }
+
+    // ============ Phase 2b: HysteresisState Unit Tests ============
+
+    /// Helper: set up a HysteresisState's actor EWMAs for a wake transition.
+    fn setup_for_wake(hyst: &mut HysteresisState) {
+        hyst.state = PlasticityState::Frozen;
+        hyst.slow.value = 0.05;
+        hyst.slow.k = 200;
+        hyst.fast.value = 0.06;
+        hyst.fast.k = 200;
+    }
+
+    #[test]
+    fn hysteresis_wake_transition() {
+        let mut hyst = HysteresisState {
+            fast: EwmaTracker::new(5),
+            slow: EwmaTracker::new(20),
+            state: PlasticityState::Frozen,
+            wake_fraction: 0.5,
+            sleep_fraction: 0.3,
+            min_initial_plastic: 100,
+        };
+        // Manually set slow EWMA past warmup at 0.05
+        hyst.slow.value = 0.05;
+        hyst.slow.k = 50;
+        hyst.fast.value = 0.06;
+        hyst.fast.k = 10;
+        // Feed high signal: fast jumps well above wake threshold
+        // fast = 0.06 + (1.0 - 0.06)/5 = 0.248
+        // slow = 0.05 + (1.0 - 0.05)/20 = 0.0975
+        // Wake: 0.248 > 0.0975 * 1.5 = 0.14625 → yes
+        let result = hyst.update(1.0);
+        assert_eq!(result, Some(PlasticityState::Plastic));
+        assert_eq!(hyst.state, PlasticityState::Plastic);
+    }
+
+    #[test]
+    fn hysteresis_sleep_transition() {
+        let mut hyst = HysteresisState {
+            fast: EwmaTracker::new(5),
+            slow: EwmaTracker::new(20),
+            state: PlasticityState::Plastic,
+            wake_fraction: 0.5,
+            sleep_fraction: 0.3,
+            min_initial_plastic: 100,
+        };
+        // Past warmup and above min_initial_plastic
+        hyst.slow.value = 0.3;
+        hyst.slow.k = 200;
+        hyst.fast.value = 0.22;
+        hyst.fast.k = 200;
+        // Feed low signal:
+        // fast = 0.22 + (0.0 - 0.22)/5 = 0.176
+        // slow = 0.3 + (0.0 - 0.3)/20 = 0.285
+        // Sleep: 0.176 < 0.285 * 0.7 = 0.1995 → yes
+        // fast.k = 201 >= 100 → guard lifts
+        let result = hyst.update(0.0);
+        assert_eq!(result, Some(PlasticityState::Frozen));
+        assert_eq!(hyst.state, PlasticityState::Frozen);
+    }
+
+    #[test]
+    fn hysteresis_warmup_guard_suppresses_sleep() {
+        let mut hyst = HysteresisState {
+            fast: EwmaTracker::new(5),
+            slow: EwmaTracker::new(20),
+            state: PlasticityState::Plastic,
+            wake_fraction: 0.5,
+            sleep_fraction: 0.3,
+            min_initial_plastic: 100,
+        };
+        // fast.k < min_initial_plastic — sleep condition met but guard active
+        hyst.fast.k = 50;
+        hyst.fast.value = 0.1;
+        hyst.slow.k = 50;
+        hyst.slow.value = 0.5;
+        for _ in 0..10 {
+            let result = hyst.update(0.05);
+            assert_eq!(result, None);
+        }
+        // fast.k = 60, still < 100
+        assert_eq!(hyst.state, PlasticityState::Plastic);
+    }
+
+    #[test]
+    fn hysteresis_warmup_guard_lifts() {
+        let mut hyst = HysteresisState {
+            fast: EwmaTracker::new(5),
+            slow: EwmaTracker::new(20),
+            state: PlasticityState::Plastic,
+            wake_fraction: 0.5,
+            sleep_fraction: 0.3,
+            min_initial_plastic: 100,
+        };
+        hyst.fast.k = 99;
+        hyst.fast.value = 0.1;
+        hyst.slow.k = 99;
+        hyst.slow.value = 0.5;
+        // After update(0.0): fast.k=100 >= 100, guard lifts
+        // fast = 0.1 + (0.0 - 0.1)/5 = 0.08
+        // slow = 0.5 + (0.0 - 0.5)/20 = 0.475
+        // Sleep: 0.08 < 0.475 * 0.7 = 0.3325 → yes
+        let result = hyst.update(0.0);
+        assert_eq!(result, Some(PlasticityState::Frozen));
+        assert_eq!(hyst.state, PlasticityState::Frozen);
+    }
+
+    #[test]
+    fn hysteresis_no_false_wake_on_noise() {
+        let mut hyst = HysteresisState {
+            fast: EwmaTracker::new(5),
+            slow: EwmaTracker::new(20),
+            state: PlasticityState::Frozen,
+            wake_fraction: 0.5,
+            sleep_fraction: 0.3,
+            min_initial_plastic: 100,
+        };
+        // Feed constant signal — both converge to 0.1, no separation
+        for _ in 0..50 {
+            let result = hyst.update(0.1);
+            assert_eq!(result, None);
+        }
+        assert_eq!(hyst.state, PlasticityState::Frozen);
+    }
+
+    // ============ Phase 2b: Integration Tests ============
+
+    #[test]
+    fn actor_critic_independent_hysteresis() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.adaptive_surprise = true;
+        cfg.surprise_buffer_size = 100;
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Verify independent state machines exist
+        assert!(agent.actor_hysteresis.is_some());
+        assert!(agent.critic_hysteresis.is_some());
+
+        // Set actor to FROZEN, critic stays PLASTIC
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+
+        // Fill td_error_buffer for critic_surprise_scale
+        for _ in 0..20 {
+            agent.td_error_buffer.push_back(0.5);
+        }
+
+        // Actor FROZEN → effective scale is scale_floor
+        let actor_scale = agent.effective_actor_scale(0.5);
+        assert!((actor_scale - agent.config.scale_floor).abs() < f64::EPSILON);
+
+        // Critic PLASTIC → critic_surprise_scale computes from td_error_buffer
+        let critic_scale = agent.critic_surprise_scale(0.5);
+        assert!(critic_scale >= agent.config.scale_floor);
+        assert!(critic_scale <= agent.config.scale_ceil);
+    }
+
+    #[test]
+    fn actor_wakes_critic_coupling_default_threshold() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.actor_wakes_critic = true;
+        // Default threshold = 1000
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Set both to FROZEN
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_frozen_steps = 1000;
+
+        // Set up actor for wake transition
+        setup_for_wake(agent.actor_hysteresis.as_mut().unwrap());
+
+        agent.process_hysteresis(1.0, 0.0);
+
+        // Actor should be PLASTIC
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+        // Critic forced to PLASTIC via coupling
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+        // Counters reset
+        assert_eq!(agent.actor_plastic_step_counter, 0);
+        assert_eq!(agent.critic_frozen_steps, 0);
+    }
+
+    #[test]
+    fn actor_wakes_critic_custom_threshold() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.actor_wakes_critic = true;
+        cfg.actor_wakes_critic_threshold = 50;
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Both FROZEN, critic below custom threshold
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_frozen_steps = 40;
+
+        setup_for_wake(agent.actor_hysteresis.as_mut().unwrap());
+        agent.process_hysteresis(1.0, 0.0);
+
+        // Actor wakes, but critic stays FROZEN (41 < 50 threshold)
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Frozen
+        );
+
+        // Now set critic above threshold and trigger again
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_frozen_steps = 50;
+        setup_for_wake(agent.actor_hysteresis.as_mut().unwrap());
+        agent.process_hysteresis(1.0, 0.0);
+
+        // Now coupling fires (51 >= 50)
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+    }
+
+    #[test]
+    fn actor_wakes_critic_off_by_default() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        // actor_wakes_critic defaults to false
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_frozen_steps = 2000;
+
+        setup_for_wake(agent.actor_hysteresis.as_mut().unwrap());
+        agent.process_hysteresis(1.0, 0.0);
+
+        // Actor transitions to PLASTIC
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+        // Critic stays FROZEN (coupling disabled)
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Frozen
+        );
+    }
+
+    #[test]
+    fn critic_frozen_steps_resets_on_plastic() {
+        let mut cfg = default_config();
+        cfg.critic_hysteresis = true;
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Set critic to FROZEN with accumulated frozen steps
+        agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_frozen_steps = 500;
+
+        // Set up critic for wake transition
+        let critic_hyst = agent.critic_hysteresis.as_mut().unwrap();
+        critic_hyst.slow.value = 0.05;
+        critic_hyst.slow.k = 200;
+        critic_hyst.fast.value = 0.06;
+        critic_hyst.fast.k = 200;
+
+        // Feed high signal to critic to trigger wake
+        agent.process_hysteresis(0.0, 1.0);
+
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+        assert_eq!(agent.critic_frozen_steps, 0);
+    }
+
+    #[test]
+    fn hysteresis_disabled_by_default() {
+        let agent = make_agent();
+        assert!(agent.actor_hysteresis.is_none());
+        assert!(agent.critic_hysteresis.is_none());
+        // surprise_scale works normally (legacy behavior)
+        let scale = agent.surprise_scale(0.1);
+        assert!(scale > 0.0);
+    }
+
+    #[test]
+    fn wake_fraction_zero_rejected() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.actor_wake_fraction = 0.0;
+        let result = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => assert!(msg.contains("wake_fraction")),
+            e => panic!("expected ConfigValidation, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn sleep_fraction_one_rejected() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.actor_sleep_fraction = 1.0;
+        let result = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => assert!(msg.contains("sleep_fraction")),
+            e => panic!("expected ConfigValidation, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn sleep_fraction_zero_rejected() {
+        let mut cfg = default_config();
+        cfg.critic_hysteresis = true;
+        cfg.critic_sleep_fraction = 0.0;
+        let result = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => assert!(msg.contains("sleep_fraction")),
+            e => panic!("expected ConfigValidation, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn td_error_buffer_feeds_critic_scale() {
+        let mut cfg = default_config();
+        cfg.critic_hysteresis = true;
+        cfg.adaptive_surprise = true;
+        cfg.surprise_buffer_size = 100;
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Feed known |td_error| values into buffer
+        for i in 0..20 {
+            agent.td_error_buffer.push_back(0.1 * (i as f64));
+        }
+
+        // Compute expected adaptive thresholds from buffer
+        let mean: f64 = agent.td_error_buffer.iter().sum::<f64>() / 20.0;
+        let variance: f64 = agent
+            .td_error_buffer
+            .iter()
+            .map(|&v| (v - mean) * (v - mean))
+            .sum::<f64>()
+            / 20.0;
+        let std = variance.sqrt();
+        let lo = (mean - 0.5 * std).max(0.0);
+        let hi = mean + 1.5 * std;
+
+        // At low threshold → scale_floor
+        let scale_low = agent.critic_surprise_scale(lo);
+        assert!((scale_low - agent.config.scale_floor).abs() < 1e-10);
+
+        // At high threshold → scale_ceil
+        let scale_high = agent.critic_surprise_scale(hi);
+        assert!((scale_high - agent.config.scale_ceil).abs() < 1e-10);
+
+        // At midpoint → linear interpolation midpoint
+        let mid = (lo + hi) / 2.0;
+        let scale_mid = agent.critic_surprise_scale(mid);
+        let expected_mid = (agent.config.scale_floor + agent.config.scale_ceil) / 2.0;
+        assert!((scale_mid - expected_mid).abs() < 1e-10);
     }
 }
