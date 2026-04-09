@@ -524,6 +524,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_roundtrip_preserves_modified_rezero_alpha() {
         use crate::pc_actor::SelectionMode;
         let config = PcActorCriticConfig {
@@ -618,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_roundtrip_preserves_skip_projections_directly() {
         use crate::pc_actor::SelectionMode;
         let config = PcActorCriticConfig {

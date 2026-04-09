@@ -232,6 +232,15 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     surprise_buffer: VecDeque<f64>,
     /// Backend used for linear algebra operations.
     pub(crate) backend: L,
+    /// Previous observation (transient, not serialized).
+    state_prev: Option<L::Vector>,
+    /// Previous action taken (transient, not serialized).
+    action_prev: Option<usize>,
+    /// Previous inference result (transient, not serialized).
+    infer_prev: Option<InferResult<L>>,
+    /// Previous valid actions mask (transient, not serialized).
+    /// `None` = all actions valid (used by `step()`), `Some` = masked (used by `step_masked()`).
+    valid_actions_prev: Option<Vec<usize>>,
 }
 
 impl<L: LinAlg> PcActorCritic<L> {
@@ -270,6 +279,10 @@ impl<L: LinAlg> PcActorCritic<L> {
             rng,
             surprise_buffer: VecDeque::new(),
             backend,
+            state_prev: None,
+            action_prev: None,
+            infer_prev: None,
+            valid_actions_prev: None,
         })
     }
 
@@ -359,6 +372,10 @@ impl<L: LinAlg> PcActorCritic<L> {
             rng,
             surprise_buffer: VecDeque::new(),
             backend: parent_a.backend.clone(),
+            state_prev: None,
+            action_prev: None,
+            infer_prev: None,
+            valid_actions_prev: None,
         })
     }
 
@@ -384,6 +401,10 @@ impl<L: LinAlg> PcActorCritic<L> {
             rng,
             surprise_buffer: VecDeque::new(),
             backend,
+            state_prev: None,
+            action_prev: None,
+            infer_prev: None,
+            valid_actions_prev: None,
         }
     }
 
@@ -442,6 +463,7 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// # Returns
     ///
     /// Average critic loss over the trajectory.
+    #[deprecated(since = "2.1.0", note = "Use step() or step_masked() instead")]
     pub fn learn(&mut self, trajectory: &[TrajectoryStep<L>]) -> f64 {
         if trajectory.is_empty() {
             return 0.0;
@@ -652,6 +674,154 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
     }
 
+    /// Performs a single training step: learns from the previous transition (if any),
+    /// infers on the current state, selects an action, and stores internal state.
+    ///
+    /// Uses TD(0) single-step learning (same logic as `learn_continuous()`).
+    /// Always uses Training mode (stochastic softmax sampling). For deterministic
+    /// play mode, use `act(SelectionMode::Play)` directly.
+    ///
+    /// On the first call (or after reset/terminal), no learning occurs — the agent
+    /// only infers and stores state. On subsequent calls, learning uses the stored
+    /// previous state and the current state as the TD(0) bootstrap target.
+    ///
+    /// When `terminal` is true, V(s') = 0 for the TD error computation. The agent
+    /// infers on the terminal state but immediately clears stored state, so the
+    /// next call starts a fresh episode.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - Current observation vector.
+    /// * `reward` - Reward received from the environment after the previous action.
+    /// * `terminal` - Whether the current state is terminal.
+    ///
+    /// # Returns
+    ///
+    /// The selected action index.
+    pub fn step(&mut self, state: &[f64], reward: f64, terminal: bool) -> usize {
+        let all_actions: Vec<usize> = (0..self.config.actor.output_size).collect();
+        self.step_inner(state, &all_actions, reward, terminal, None)
+    }
+
+    /// Performs a single training step with action masking.
+    ///
+    /// Identical to [`step()`](Self::step) except uses masked softmax for action
+    /// selection, restricting the output to `valid_actions`. Stores the mask
+    /// for policy gradient computation on the next call.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - Current observation vector.
+    /// * `valid_actions` - Indices of legal actions for the current state.
+    /// * `reward` - Reward received from the environment after the previous action.
+    /// * `terminal` - Whether the current state is terminal.
+    ///
+    /// # Returns
+    ///
+    /// The selected action index (guaranteed to be in `valid_actions`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `valid_actions` is empty.
+    pub fn step_masked(
+        &mut self,
+        state: &[f64],
+        valid_actions: &[usize],
+        reward: f64,
+        terminal: bool,
+    ) -> usize {
+        assert!(!valid_actions.is_empty(), "valid_actions must not be empty");
+        self.step_inner(
+            state,
+            valid_actions,
+            reward,
+            terminal,
+            Some(valid_actions.to_vec()),
+        )
+    }
+
+    /// Shared implementation for `step()` and `step_masked()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - Current observation vector.
+    /// * `select_actions` - Actions to select from (all or masked).
+    /// * `reward` - Reward received.
+    /// * `terminal` - Whether state is terminal.
+    /// * `store_mask` - If `Some`, stored as `valid_actions_prev` for next learning step.
+    fn step_inner(
+        &mut self,
+        state: &[f64],
+        select_actions: &[usize],
+        reward: f64,
+        terminal: bool,
+        store_mask: Option<Vec<usize>>,
+    ) -> usize {
+        // Infer on current state (needed for both learning and action selection)
+        let current_infer = self.actor.infer(state);
+
+        // If previous state exists, learn from the transition
+        if let (Some(prev_state), Some(prev_action), Some(prev_infer)) = (
+            self.state_prev.take(),
+            self.action_prev.take(),
+            self.infer_prev.take(),
+        ) {
+            let prev_state_vec = self.backend.vec_to_vec(&prev_state);
+            let learn_mask = self
+                .valid_actions_prev
+                .take()
+                .unwrap_or_else(|| (0..self.config.actor.output_size).collect());
+
+            self.learn_continuous(
+                &prev_state_vec,
+                &prev_infer,
+                prev_action,
+                &learn_mask,
+                reward,
+                state,
+                &current_infer,
+                terminal,
+            );
+        }
+
+        // Select action
+        let action = self.actor.select_action(
+            &current_infer.y_conv,
+            select_actions,
+            SelectionMode::Training,
+            &mut self.rng,
+        );
+
+        // Store current state for next step
+        self.state_prev = Some(self.backend.vec_from_slice(state));
+        self.action_prev = Some(action);
+        self.infer_prev = Some(current_infer);
+        self.valid_actions_prev = store_mask;
+
+        // If terminal, clear all transient state
+        if terminal {
+            self.state_prev = None;
+            self.action_prev = None;
+            self.infer_prev = None;
+            self.valid_actions_prev = None;
+        }
+
+        action
+    }
+
+    /// Clears step-level internal state without affecting weights or learning state.
+    ///
+    /// After calling this method, the next `step()` or `step_masked()` call
+    /// behaves as the first call of a new episode (skips learning).
+    ///
+    /// Does NOT modify: weights, surprise buffer, or any continuous learning state.
+    pub fn reset_step(&mut self) {
+        self.state_prev = None;
+        self.action_prev = None;
+        self.infer_prev = None;
+        self.valid_actions_prev = None;
+    }
+
     /// Pushes a surprise score into the adaptive buffer (circular).
     fn push_surprise(&mut self, surprise: f64) {
         if self.surprise_buffer.len() >= self.config.surprise_buffer_size {
@@ -761,6 +931,7 @@ mod tests {
     // ── learn tests ───────────────────────────────────────────────
 
     #[test]
+    #[allow(deprecated)]
     fn test_learn_empty_returns_zero_without_modifying_weights() {
         let mut agent: PcActorCritic = make_agent();
         let w_before = agent.actor.layers[0].weights.data.clone();
@@ -772,6 +943,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_learn_updates_actor_weights() {
         let mut agent: PcActorCritic = make_agent();
         let trajectory = make_trajectory(&mut agent);
@@ -781,6 +953,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_learn_updates_critic_weights() {
         let mut agent: PcActorCritic = make_agent();
         let trajectory = make_trajectory(&mut agent);
@@ -790,6 +963,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_learn_returns_finite_nonneg_loss() {
         let mut agent: PcActorCritic = make_agent();
         let trajectory = make_trajectory(&mut agent);
@@ -799,6 +973,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_learn_single_step_trajectory() {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
@@ -822,6 +997,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_learn_multi_step_uses_stored_hidden_states() {
         // Build a 3-step trajectory to exercise multi-step learning
         let mut agent: PcActorCritic = make_agent();
@@ -1059,6 +1235,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_entropy_regularization_prevents_policy_collapse() {
         // With entropy regularization, repeated learning on same trajectory
         // should keep the policy from collapsing to a single action
@@ -1125,6 +1302,7 @@ mod tests {
     // ── learning diagnostic test ──────────────────────────────
 
     #[test]
+    #[allow(deprecated)]
     fn test_learn_improves_policy_for_rewarded_action() {
         // Linear output so logits are unbounded
         let config = PcActorCriticConfig {
@@ -1496,6 +1674,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_agent_crossover_child_can_learn() {
         let config = default_config();
         let mut agent_a: PcActorCritic =
@@ -1636,5 +1815,272 @@ mod tests {
         let mat = CpuLinAlg::new().zeros_mat(10, 3);
         let _perm = crate::matrix::cca_neuron_alignment::<CpuLinAlg>(&CpuLinAlg::new(), &mat, &mat)
             .unwrap();
+    }
+
+    // ── Phase 0: Unified step() API ──────────────────────────────
+
+    /// Helper: extract all layer weights (actor + critic) as flat Vec<f64>.
+    fn collect_all_weights(agent: &PcActorCritic) -> Vec<f64> {
+        let mut weights = Vec::new();
+        for layer in &agent.actor.layers {
+            weights.extend_from_slice(&layer.weights.data);
+            weights.extend_from_slice(&layer.bias);
+        }
+        for layer in &agent.critic.layers {
+            weights.extend_from_slice(&layer.weights.data);
+            weights.extend_from_slice(&layer.bias);
+        }
+        weights
+    }
+
+    #[test]
+    fn step_step_matches_learn_continuous_td0() {
+        // Agent A: uses step() + step()
+        let config = default_config();
+        let mut agent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -1.0, 0.0, 1.0, -0.5, 0.0, -1.0, 0.5];
+        let reward = 1.0;
+
+        let _a1 = agent_a.step(&s1, 0.0, false);
+        let _a2 = agent_a.step(&s2, reward, false);
+
+        // Agent B: uses act() + act() + learn_continuous()
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        let all_actions: Vec<usize> = (0..9).collect();
+
+        let (action1, infer1) = agent_b.act(&s1, &all_actions, SelectionMode::Training);
+        let (_, infer2) = agent_b.act(&s2, &all_actions, SelectionMode::Training);
+
+        let _ = agent_b.learn_continuous(
+            &s1,
+            &infer1,
+            action1,
+            &all_actions,
+            reward,
+            &s2,
+            &infer2,
+            false,
+        );
+
+        let w_a = collect_all_weights(&agent_a);
+        let w_b = collect_all_weights(&agent_b);
+        assert_eq!(w_a.len(), w_b.len());
+        for (i, (a, b)) in w_a.iter().zip(w_b.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "Weight mismatch at index {i}: step={a} vs learn_continuous={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn step_terminal_uses_zero_bootstrap() {
+        let config = default_config();
+        let mut agent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -1.0, 0.0, 1.0, -0.5, 0.0, -1.0, 0.5];
+
+        let _a1 = agent_a.step(&s1, 0.0, false);
+        let _a2 = agent_a.step(&s2, 1.0, true); // terminal
+
+        // Agent B: manual learn_continuous with terminal=true
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        let all_actions: Vec<usize> = (0..9).collect();
+
+        let (action1, infer1) = agent_b.act(&s1, &all_actions, SelectionMode::Training);
+        let (_, infer2) = agent_b.act(&s2, &all_actions, SelectionMode::Training);
+
+        let _ =
+            agent_b.learn_continuous(&s1, &infer1, action1, &all_actions, 1.0, &s2, &infer2, true);
+
+        let w_a = collect_all_weights(&agent_a);
+        let w_b = collect_all_weights(&agent_b);
+        for (i, (a, b)) in w_a.iter().zip(w_b.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "Weight mismatch at index {i}: step={a} vs learn_continuous={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn step_masked_stores_valid_actions_for_learning() {
+        let config = default_config();
+        let mut agent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -1.0, 0.0, 1.0, -0.5, 0.0, -1.0, 0.5];
+        let mask = vec![0, 2, 5];
+
+        let _a1 = agent_a.step_masked(&s1, &mask, 0.0, false);
+        let all_actions: Vec<usize> = (0..9).collect();
+        let _a2 = agent_a.step(&s2, 1.0, false);
+
+        // Agent B: manual path
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        let (action1, infer1) = agent_b.act(&s1, &mask, SelectionMode::Training);
+        let (_, infer2) = agent_b.act(&s2, &all_actions, SelectionMode::Training);
+
+        let _ = agent_b.learn_continuous(&s1, &infer1, action1, &mask, 1.0, &s2, &infer2, false);
+
+        let w_a = collect_all_weights(&agent_a);
+        let w_b = collect_all_weights(&agent_b);
+        for (i, (a, b)) in w_a.iter().zip(w_b.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "Weight mismatch at index {i}: step_masked={a} vs learn_continuous={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn step_first_call_skips_learning() {
+        let mut agent: PcActorCritic = make_agent();
+        let w_before = collect_all_weights(&agent);
+        let state = vec![0.5; 9];
+        let action = agent.step(&state, 0.0, false);
+        assert!(action < 9, "Action {action} out of bounds");
+        let w_after = collect_all_weights(&agent);
+        assert_eq!(
+            w_before, w_after,
+            "Weights should not change on first step()"
+        );
+    }
+
+    #[test]
+    fn step_second_call_modifies_weights() {
+        let mut agent: PcActorCritic = make_agent();
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -1.0, 0.0, 1.0, -0.5, 0.0, -1.0, 0.5];
+        let _ = agent.step(&s1, 0.0, false);
+        let w_before = collect_all_weights(&agent);
+        let _ = agent.step(&s2, 1.0, false);
+        let w_after = collect_all_weights(&agent);
+        assert_ne!(
+            w_before, w_after,
+            "Weights should change after second step()"
+        );
+    }
+
+    #[test]
+    fn step_terminal_clears_state() {
+        let mut agent: PcActorCritic = make_agent();
+        let s1 = vec![1.0; 9];
+        let s2 = vec![-1.0; 9];
+        let s3 = vec![0.5; 9];
+
+        let _ = agent.step(&s1, 0.0, false);
+        let _ = agent.step(&s2, 1.0, true); // terminal clears state
+        let w_after_terminal = collect_all_weights(&agent);
+
+        let _ = agent.step(&s3, 0.0, false); // should skip learning (first after terminal)
+        let w_after_first = collect_all_weights(&agent);
+        assert_eq!(
+            w_after_terminal, w_after_first,
+            "First step after terminal should skip learning"
+        );
+    }
+
+    #[test]
+    fn step_masked_action_in_valid_set() {
+        let valid = vec![0, 2, 5];
+        for seed in 0..100u64 {
+            let mut agent: PcActorCritic =
+                PcActorCritic::new(CpuLinAlg::new(), default_config(), seed).unwrap();
+            let state = vec![0.5; 9];
+            let action = agent.step_masked(&state, &valid, 0.0, false);
+            assert!(
+                valid.contains(&action),
+                "seed={seed}: action {action} not in valid set {valid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_step_clears_only_step_state() {
+        let mut agent: PcActorCritic = make_agent();
+        let s1 = vec![1.0; 9];
+        let s2 = vec![-1.0; 9];
+
+        let _ = agent.step(&s1, 0.0, false); // stores state
+        let w_before = collect_all_weights(&agent);
+
+        agent.reset_step();
+
+        let w_after = collect_all_weights(&agent);
+        assert_eq!(w_before, w_after, "reset_step() must not change weights");
+
+        // Next step should skip learning (first call after reset)
+        let _ = agent.step(&s2, 0.5, false);
+        let w_after_step = collect_all_weights(&agent);
+        assert_eq!(
+            w_after, w_after_step,
+            "First step after reset should skip learning"
+        );
+    }
+
+    #[test]
+    fn reset_step_does_not_affect_surprise_buffer() {
+        let mut config = default_config();
+        config.adaptive_surprise = true;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        let s1 = vec![1.0; 9];
+        let s2 = vec![-1.0; 9];
+
+        // Two step() calls push surprise to buffer (second call triggers learning)
+        let _ = agent.step(&s1, 0.0, false);
+        let _ = agent.step(&s2, 1.0, false);
+        let buf_len_before = agent.surprise_buffer.len();
+
+        agent.reset_step();
+
+        assert_eq!(
+            agent.surprise_buffer.len(),
+            buf_len_before,
+            "reset_step() must not affect surprise buffer"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn learn_deprecated_still_functional() {
+        let mut agent: PcActorCritic = make_agent();
+        let trajectory = make_trajectory(&mut agent);
+        let loss = agent.learn(&trajectory);
+        assert!(loss.is_finite(), "learn() should still return finite loss");
+    }
+
+    #[test]
+    fn act_not_deprecated() {
+        // This test compiles without #[allow(deprecated)].
+        // If act() were deprecated, clippy -D warnings would catch it.
+        let mut agent: PcActorCritic = make_agent();
+        let input = vec![0.5; 9];
+        let valid = vec![0, 1, 2];
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        assert!(action < 9);
+        assert!(infer.surprise_score.is_finite());
+    }
+
+    #[test]
+    fn step_masked_empty_valid_actions_handled() {
+        let mut agent: PcActorCritic = make_agent();
+        let state = vec![0.5; 9];
+        // Empty valid actions should panic
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            agent.step_masked(&state, &[], 0.0, false)
+        }));
+        assert!(
+            result.is_err(),
+            "step_masked with empty valid_actions should panic"
+        );
     }
 }
