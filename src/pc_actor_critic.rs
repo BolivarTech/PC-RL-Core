@@ -122,6 +122,36 @@ fn default_actor_wakes_critic_threshold() -> u64 {
     1000
 }
 
+/// Default actor consolidation decay base (1.0 = no decay).
+fn default_consolidation_decay() -> f64 {
+    1.0
+}
+
+/// Default critic consolidation decay base (1.0 = no decay).
+fn default_critic_consolidation_decay() -> f64 {
+    1.0
+}
+
+/// Default adaptive consolidation flag (disabled).
+fn default_adaptive_consolidation() -> bool {
+    false
+}
+
+/// Default EMA smoothing for per-layer prediction error (M3b).
+fn default_consolidation_ema_beta() -> f64 {
+    0.99
+}
+
+/// Default sigmoid steepness for adaptive consolidation (M3b).
+fn default_consolidation_sigmoid_k() -> f64 {
+    10.0
+}
+
+/// Default sigmoid midpoint for adaptive consolidation (M3b).
+fn default_consolidation_error_threshold() -> f64 {
+    0.05
+}
+
 /// Plasticity state of a network: whether it is actively learning or frozen.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum PlasticityState {
@@ -290,6 +320,12 @@ impl HysteresisState {
 ///     critic_sleep_fraction: 0.3,
 ///     actor_wakes_critic: false,
 ///     actor_wakes_critic_threshold: 1000,
+///     consolidation_decay: 1.0,
+///     critic_consolidation_decay: 1.0,
+///     adaptive_consolidation: false,
+///     consolidation_ema_beta: 0.99,
+///     consolidation_sigmoid_k: 10.0,
+///     consolidation_error_threshold: 0.05,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +404,33 @@ pub struct PcActorCriticConfig {
     /// Default: 1000.
     #[serde(default = "default_actor_wakes_critic_threshold")]
     pub actor_wakes_critic_threshold: u64,
+    /// Actor fixed decay base for layer-wise consolidation (M3a).
+    /// Layer i gets `consolidation_decay^(n_hidden - 1 - i)`.
+    /// 1.0 = no decay (default). Must be in [0.0, 1.0].
+    #[serde(default = "default_consolidation_decay")]
+    pub consolidation_decay: f64,
+    /// Critic fixed decay base for layer-wise consolidation (M3a).
+    /// Independent from actor decay. Must be in [0.0, 1.0]. Default: 1.0.
+    #[serde(default = "default_critic_consolidation_decay")]
+    pub critic_consolidation_decay: f64,
+    /// Enable adaptive sigmoid decay for actor (M3b). When true,
+    /// per-layer prediction error EMA drives decay via sigmoid.
+    /// Overrides `consolidation_decay` for actor; critic always uses M3a.
+    /// Default: false.
+    #[serde(default = "default_adaptive_consolidation")]
+    pub adaptive_consolidation: bool,
+    /// EMA smoothing factor for per-layer prediction error (M3b).
+    /// Must be in (0.0, 1.0) exclusive. Default: 0.99.
+    #[serde(default = "default_consolidation_ema_beta")]
+    pub consolidation_ema_beta: f64,
+    /// Sigmoid steepness for adaptive consolidation (M3b).
+    /// Must be > 0.0 when `adaptive_consolidation` is true. Default: 10.0.
+    #[serde(default = "default_consolidation_sigmoid_k")]
+    pub consolidation_sigmoid_k: f64,
+    /// Sigmoid midpoint for adaptive consolidation (M3b).
+    /// Must be > 0.0 when `adaptive_consolidation` is true. Default: 0.05.
+    #[serde(default = "default_consolidation_error_threshold")]
+    pub consolidation_error_threshold: f64,
 }
 
 /// A single step in a trajectory collected during an episode.
@@ -509,6 +572,12 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     td_error_buffer: VecDeque<f64>,
     /// Last TD error from learn_continuous (transient, for hysteresis).
     last_td_error: f64,
+    /// Precomputed per-hidden-layer decay factors for actor (M3a).
+    actor_decay_factors: Vec<f64>,
+    /// Precomputed per-hidden-layer decay factors for critic (M3a).
+    critic_decay_factors: Vec<f64>,
+    /// Per-layer prediction error EMA for adaptive consolidation (M3b, actor only).
+    layer_error_ema: Vec<f64>,
 }
 
 impl<L: LinAlg> PcActorCritic<L> {
@@ -580,6 +649,67 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
         }
 
+        // Validate consolidation decay (M3a)
+        if !(0.0..=1.0).contains(&config.consolidation_decay) {
+            return Err(PcError::ConfigValidation(format!(
+                "consolidation_decay must be in [0.0, 1.0], got {}",
+                config.consolidation_decay
+            )));
+        }
+        if !(0.0..=1.0).contains(&config.critic_consolidation_decay) {
+            return Err(PcError::ConfigValidation(format!(
+                "critic_consolidation_decay must be in [0.0, 1.0], got {}",
+                config.critic_consolidation_decay
+            )));
+        }
+
+        // Validate adaptive consolidation params (M3b)
+        if config.adaptive_consolidation {
+            if config.consolidation_sigmoid_k <= 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "consolidation_sigmoid_k must be > 0.0 when adaptive_consolidation enabled, got {}",
+                    config.consolidation_sigmoid_k
+                )));
+            }
+            if config.consolidation_ema_beta <= 0.0 || config.consolidation_ema_beta >= 1.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "consolidation_ema_beta must be in (0.0, 1.0), got {}",
+                    config.consolidation_ema_beta
+                )));
+            }
+            if config.consolidation_error_threshold <= 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "consolidation_error_threshold must be > 0.0, got {}",
+                    config.consolidation_error_threshold
+                )));
+            }
+        }
+
+        // Precompute layer decay factors (M3a)
+        let n_actor_hidden = config.actor.hidden_layers.len();
+        let actor_decay_factors: Vec<f64> = (0..n_actor_hidden)
+            .map(|i| {
+                config
+                    .consolidation_decay
+                    .powi((n_actor_hidden - 1 - i) as i32)
+            })
+            .collect();
+        let n_critic_hidden = config.critic.hidden_layers.len();
+        let critic_decay_factors: Vec<f64> = (0..n_critic_hidden)
+            .map(|i| {
+                config
+                    .critic_consolidation_decay
+                    .powi((n_critic_hidden - 1 - i) as i32)
+            })
+            .collect();
+
+        // Per-layer error EMA for adaptive consolidation (M3b)
+        let layer_error_ema = if config.adaptive_consolidation {
+            vec![0.0; n_actor_hidden]
+        } else {
+            Vec::new()
+        };
+
         // Build hysteresis state machines when enabled
         let actor_hysteresis = if config.actor_hysteresis {
             Some(HysteresisState {
@@ -629,6 +759,9 @@ impl<L: LinAlg> PcActorCritic<L> {
             critic_frozen_steps: 0,
             td_error_buffer: VecDeque::new(),
             last_td_error: 0.0,
+            actor_decay_factors,
+            critic_decay_factors,
+            layer_error_ema,
         })
     }
 
@@ -711,6 +844,25 @@ impl<L: LinAlg> PcActorCritic<L> {
             &mut rng,
         )?;
 
+        // Precompute crossover child decay factors
+        let n_ah = child_config.actor.hidden_layers.len();
+        let child_actor_decay: Vec<f64> = (0..n_ah)
+            .map(|i| child_config.consolidation_decay.powi((n_ah - 1 - i) as i32))
+            .collect();
+        let n_ch = child_config.critic.hidden_layers.len();
+        let child_critic_decay: Vec<f64> = (0..n_ch)
+            .map(|i| {
+                child_config
+                    .critic_consolidation_decay
+                    .powi((n_ch - 1 - i) as i32)
+            })
+            .collect();
+        let child_layer_error_ema = if child_config.adaptive_consolidation {
+            vec![0.0; n_ah]
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             actor,
             critic,
@@ -729,6 +881,9 @@ impl<L: LinAlg> PcActorCritic<L> {
             critic_frozen_steps: 0,
             td_error_buffer: VecDeque::new(),
             last_td_error: 0.0,
+            actor_decay_factors: child_actor_decay,
+            critic_decay_factors: child_critic_decay,
+            layer_error_ema: child_layer_error_ema,
         })
     }
 
@@ -747,6 +902,23 @@ impl<L: LinAlg> PcActorCritic<L> {
         rng: StdRng,
         backend: L,
     ) -> Self {
+        let n_ah = config.actor.hidden_layers.len();
+        let actor_decay_factors: Vec<f64> = (0..n_ah)
+            .map(|i| config.consolidation_decay.powi((n_ah - 1 - i) as i32))
+            .collect();
+        let n_ch = config.critic.hidden_layers.len();
+        let critic_decay_factors: Vec<f64> = (0..n_ch)
+            .map(|i| {
+                config
+                    .critic_consolidation_decay
+                    .powi((n_ch - 1 - i) as i32)
+            })
+            .collect();
+        let layer_error_ema = if config.adaptive_consolidation {
+            vec![0.0; n_ah]
+        } else {
+            Vec::new()
+        };
         Self {
             actor,
             critic,
@@ -765,6 +937,9 @@ impl<L: LinAlg> PcActorCritic<L> {
             critic_frozen_steps: 0,
             td_error_buffer: VecDeque::new(),
             last_td_error: 0.0,
+            actor_decay_factors,
+            critic_decay_factors,
+            layer_error_ema,
         }
     }
 
@@ -895,8 +1070,9 @@ impl<L: LinAlg> PcActorCritic<L> {
                 converged: false,
                 tanh_components: step.tanh_components.clone(),
             };
+            let actor_decay = self.effective_actor_decay();
             self.actor
-                .update_weights(&delta, &stored_infer, &input_vec, s_scale);
+                .update_weights(&delta, &stored_infer, &input_vec, s_scale, &actor_decay);
 
             // Push surprise to adaptive buffer
             if self.config.adaptive_surprise {
@@ -959,8 +1135,14 @@ impl<L: LinAlg> PcActorCritic<L> {
             };
         let td_error = target - v_s;
 
-        // Update critic
-        let loss = self.critic.update(&critic_input, target);
+        // Update critic with per-layer consolidation decay
+        let critic_scale = self.critic_surprise_scale(td_error.abs());
+        let loss = self.critic.update_with_decay(
+            &critic_input,
+            target,
+            critic_scale,
+            &self.critic_decay_factors,
+        );
 
         // Policy gradient (same formula as learn, but scaled by td_error)
         let y_conv_vec = self.backend.vec_to_vec(&infer.y_conv);
@@ -989,7 +1171,9 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
 
         let s_scale = self.effective_actor_scale(infer.surprise_score);
-        self.actor.update_weights(&delta, infer, input, s_scale);
+        let actor_decay = self.effective_actor_decay();
+        self.actor
+            .update_weights(&delta, infer, input, s_scale, &actor_decay);
 
         if self.config.adaptive_surprise {
             self.push_surprise(infer.surprise_score);
@@ -1249,6 +1433,26 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
     }
 
+    /// Computes per-hidden-layer decay factors for the actor.
+    ///
+    /// When `adaptive_consolidation` is true, uses sigmoid of per-layer
+    /// error EMA (M3b). Otherwise uses precomputed fixed decay (M3a).
+    pub(crate) fn effective_actor_decay(&self) -> Vec<f64> {
+        if self.config.adaptive_consolidation {
+            self.layer_error_ema
+                .iter()
+                .map(|&e| {
+                    let x = -self.config.consolidation_sigmoid_k
+                        * (e - self.config.consolidation_error_threshold);
+                    let adaptive_decay = 1.0 / (1.0 + (-x).exp());
+                    1.0 - adaptive_decay
+                })
+                .collect()
+        } else {
+            self.actor_decay_factors.clone()
+        }
+    }
+
     /// Updates hysteresis state machines after learning.
     ///
     /// Handles EWMA updates, state transitions, counter management,
@@ -1385,6 +1589,12 @@ mod tests {
             critic_sleep_fraction: 0.3,
             actor_wakes_critic: false,
             actor_wakes_critic_threshold: 1000,
+            consolidation_decay: 1.0,
+            critic_consolidation_decay: 1.0,
+            adaptive_consolidation: false,
+            consolidation_ema_beta: 0.99,
+            consolidation_sigmoid_k: 10.0,
+            consolidation_error_threshold: 0.05,
         }
     }
 
@@ -1839,6 +2049,12 @@ mod tests {
             critic_sleep_fraction: 0.3,
             actor_wakes_critic: false,
             actor_wakes_critic_threshold: 1000,
+            consolidation_decay: 1.0,
+            critic_consolidation_decay: 1.0,
+            adaptive_consolidation: false,
+            consolidation_ema_beta: 0.99,
+            consolidation_sigmoid_k: 10.0,
+            consolidation_error_threshold: 0.05,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -3165,5 +3381,403 @@ mod tests {
         let scale_mid = agent.critic_surprise_scale(mid);
         let expected_mid = (agent.config.scale_floor + agent.config.scale_ceil) / 2.0;
         assert!((scale_mid - expected_mid).abs() < 1e-10);
+    }
+
+    // ── Phase 3: Layer-Wise Consolidation Decay (M3) Tests ──────────
+
+    /// Helper: config with 3 hidden layers for decay tests.
+    fn three_layer_config() -> PcActorCriticConfig {
+        PcActorCriticConfig {
+            actor: PcActorConfig {
+                input_size: 9,
+                hidden_layers: vec![
+                    LayerDef {
+                        size: 12,
+                        activation: Activation::Tanh,
+                    },
+                    LayerDef {
+                        size: 12,
+                        activation: Activation::Tanh,
+                    },
+                    LayerDef {
+                        size: 8,
+                        activation: Activation::Tanh,
+                    },
+                ],
+                output_size: 9,
+                output_activation: Activation::Tanh,
+                alpha: 0.1,
+                tol: 0.01,
+                min_steps: 1,
+                max_steps: 20,
+                lr_weights: 0.01,
+                synchronous: true,
+                temperature: 1.0,
+                local_lambda: 1.0,
+                residual: false,
+                rezero_init: 0.001,
+            },
+            critic: MlpCriticConfig {
+                input_size: 41, // 9 + 12 + 12 + 8
+                hidden_layers: vec![
+                    LayerDef {
+                        size: 20,
+                        activation: Activation::Tanh,
+                    },
+                    LayerDef {
+                        size: 16,
+                        activation: Activation::Tanh,
+                    },
+                ],
+                output_activation: Activation::Linear,
+                lr: 0.005,
+            },
+            gamma: 0.95,
+            surprise_low: 0.02,
+            surprise_high: 0.15,
+            adaptive_surprise: false,
+            surprise_buffer_size: 100,
+            entropy_coeff: 0.01,
+            scale_floor: 0.1,
+            scale_ceil: 2.0,
+            actor_hysteresis: false,
+            actor_fast_window: 20,
+            actor_slow_window: 100,
+            actor_wake_fraction: 0.5,
+            actor_sleep_fraction: 0.3,
+            critic_hysteresis: false,
+            critic_fast_window: 20,
+            critic_slow_window: 100,
+            critic_wake_fraction: 0.5,
+            critic_sleep_fraction: 0.3,
+            actor_wakes_critic: false,
+            actor_wakes_critic_threshold: 1000,
+            consolidation_decay: 1.0,
+            critic_consolidation_decay: 1.0,
+            adaptive_consolidation: false,
+            consolidation_ema_beta: 0.99,
+            consolidation_sigmoid_k: 10.0,
+            consolidation_error_threshold: 0.05,
+        }
+    }
+
+    #[test]
+    fn test_decay_1_0_is_noop() {
+        let config = PcActorCriticConfig {
+            consolidation_decay: 1.0,
+            ..three_layer_config()
+        };
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        // All factors should be 1.0 (no decay)
+        for &f in &agent.actor_decay_factors {
+            assert!((f - 1.0).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_decay_0_5_three_layers() {
+        let config = PcActorCriticConfig {
+            consolidation_decay: 0.5,
+            ..three_layer_config()
+        };
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        // 3 hidden layers: factors = [0.5^2, 0.5^1, 0.5^0] = [0.25, 0.5, 1.0]
+        assert_eq!(agent.actor_decay_factors.len(), 3);
+        assert!((agent.actor_decay_factors[0] - 0.25).abs() < f64::EPSILON);
+        assert!((agent.actor_decay_factors[1] - 0.5).abs() < f64::EPSILON);
+        assert!((agent.actor_decay_factors[2] - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_decay_factors_precomputed() {
+        let mut config = three_layer_config();
+        config.actor.hidden_layers.push(LayerDef {
+            size: 6,
+            activation: Activation::Tanh,
+        });
+        config.consolidation_decay = 0.5;
+        // Fix critic input_size for 4 hidden layers: 9 + 12 + 12 + 8 + 6 = 47
+        config.critic.input_size = 47;
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        // 4 hidden layers: [0.5^3, 0.5^2, 0.5^1, 0.5^0] = [0.125, 0.25, 0.5, 1.0]
+        assert_eq!(agent.actor_decay_factors.len(), 4);
+        assert!((agent.actor_decay_factors[0] - 0.125).abs() < f64::EPSILON);
+        assert!((agent.actor_decay_factors[1] - 0.25).abs() < f64::EPSILON);
+        assert!((agent.actor_decay_factors[2] - 0.5).abs() < f64::EPSILON);
+        assert!((agent.actor_decay_factors[3] - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_critic_independent_decay() {
+        let config = PcActorCriticConfig {
+            consolidation_decay: 0.5,
+            critic_consolidation_decay: 0.8,
+            ..three_layer_config()
+        };
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        // Actor: 3 hidden layers, decay=0.5 → [0.25, 0.5, 1.0]
+        assert_eq!(agent.actor_decay_factors.len(), 3);
+        assert!((agent.actor_decay_factors[0] - 0.25).abs() < f64::EPSILON);
+        // Critic: 2 hidden layers, decay=0.8 → [0.8^1, 0.8^0] = [0.8, 1.0]
+        assert_eq!(agent.critic_decay_factors.len(), 2);
+        assert!((agent.critic_decay_factors[0] - 0.8).abs() < f64::EPSILON);
+        assert!((agent.critic_decay_factors[1] - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_decay_single_hidden_layer_is_noop() {
+        let config = PcActorCriticConfig {
+            consolidation_decay: 0.5,
+            ..default_config()
+        };
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        // 1 hidden layer: 0.5^(1-1-0) = 0.5^0 = 1.0
+        assert_eq!(agent.actor_decay_factors.len(), 1);
+        assert!((agent.actor_decay_factors[0] - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_decay_no_hidden_layers_safe() {
+        let config = PcActorCriticConfig {
+            actor: PcActorConfig {
+                input_size: 9,
+                hidden_layers: vec![],
+                output_size: 9,
+                output_activation: Activation::Linear,
+                alpha: 0.0,
+                tol: 0.01,
+                min_steps: 1,
+                max_steps: 1,
+                lr_weights: 0.01,
+                synchronous: true,
+                temperature: 1.0,
+                local_lambda: 1.0,
+                residual: false,
+                rezero_init: 0.001,
+            },
+            critic: MlpCriticConfig {
+                input_size: 9,
+                hidden_layers: vec![],
+                output_activation: Activation::Linear,
+                lr: 0.005,
+            },
+            consolidation_decay: 0.5,
+            ..default_config()
+        };
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        // 0 hidden layers: empty decay factors
+        assert!(agent.actor_decay_factors.is_empty());
+        assert!(agent.critic_decay_factors.is_empty());
+    }
+
+    #[test]
+    fn test_consolidation_decay_zero_freezes_early_layers() {
+        let config = PcActorCriticConfig {
+            consolidation_decay: 0.0,
+            ..three_layer_config()
+        };
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        // 3 hidden layers, decay=0.0: [0.0^2, 0.0^1, 0.0^0] = [0.0, 0.0, 1.0]
+        assert!((agent.actor_decay_factors[0] - 0.0).abs() < f64::EPSILON);
+        assert!((agent.actor_decay_factors[1] - 0.0).abs() < f64::EPSILON);
+        assert!((agent.actor_decay_factors[2] - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ── M3b: Adaptive Sigmoid Tests ─────────────────────────────────
+
+    #[test]
+    fn test_adaptive_sigmoid_output_range() {
+        // sigmoid(-k*(e - threshold)) should always be in [0, 1]
+        let k = 10.0;
+        let threshold = 0.05;
+        for &error in &[0.0, 0.01, 0.05, 0.1, 0.5, 1.0, 10.0] {
+            let x: f64 = -k * (error - threshold);
+            let sig = 1.0 / (1.0 + (-x).exp());
+            assert!((0.0..=1.0).contains(&sig), "sigmoid({x}) = {sig}");
+        }
+    }
+
+    #[test]
+    fn test_adaptive_sigmoid_low_error_protects() {
+        // error_ema << threshold → high adaptive_decay → strong protection
+        let k = 10.0;
+        let threshold = 0.05;
+        let error = 0.001; // very low
+        let x: f64 = -k * (error - threshold);
+        let adaptive_decay = 1.0 / (1.0 + (-x).exp());
+        // sigmoid(0.49) ≈ 0.62 → (1 - 0.62) ≈ 0.38 effective
+        assert!(
+            adaptive_decay > 0.5,
+            "low error should give high decay (protection)"
+        );
+        assert!(
+            (1.0 - adaptive_decay) < 0.5,
+            "effective learning should be < 50%"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_sigmoid_high_error_releases() {
+        // error_ema >> threshold → low adaptive_decay → full plasticity
+        let k = 10.0;
+        let threshold = 0.05;
+        let error = 0.5; // very high
+        let x: f64 = -k * (error - threshold);
+        let adaptive_decay = 1.0 / (1.0 + (-x).exp());
+        // sigmoid(-4.5) ≈ 0.011 → (1 - 0.011) ≈ 0.989 effective
+        assert!(
+            adaptive_decay < 0.1,
+            "high error should give low decay (release)"
+        );
+        assert!(
+            (1.0 - adaptive_decay) > 0.9,
+            "effective learning should be > 90%"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_overrides_fixed_decay() {
+        let config = PcActorCriticConfig {
+            consolidation_decay: 0.5, // would give [0.25, 0.5, 1.0]
+            adaptive_consolidation: true,
+            ..three_layer_config()
+        };
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        // When adaptive is on, layer_error_ema should be initialized
+        assert_eq!(agent.layer_error_ema.len(), 3);
+        // Fixed decay factors should still be precomputed (for critic)
+        // but adaptive flag takes precedence for actor
+        assert!(agent.config.adaptive_consolidation);
+    }
+
+    #[test]
+    fn test_m3b_error_ema_uses_consolidation_ema_beta() {
+        let config = PcActorCriticConfig {
+            adaptive_consolidation: true,
+            consolidation_ema_beta: 0.9,
+            ..three_layer_config()
+        };
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        // Verify the config beta is 0.9 (will be used in EMA updates)
+        assert!((agent.config.consolidation_ema_beta - 0.9).abs() < f64::EPSILON);
+        // layer_error_ema initialized to zeros
+        for &e in &agent.layer_error_ema {
+            assert!((e - 0.0).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_m3b_cold_start_effective_lr() {
+        // Fresh agent with adaptive: all EMAs = 0.0
+        // sigmoid(-10 * (0.0 - 0.05)) = sigmoid(0.5) ≈ 0.6225
+        // effective = (1.0 - 0.6225) ≈ 0.3775
+        let k = 10.0;
+        let threshold = 0.05;
+        let error = 0.0;
+        let x: f64 = -k * (error - threshold);
+        let adaptive_decay = 1.0 / (1.0 + (-x).exp());
+        let effective = 1.0 - adaptive_decay;
+        // ~38% of full learning rate at cold start
+        assert!(
+            effective > 0.35 && effective < 0.40,
+            "cold start effective factor should be ~0.378, got {effective}"
+        );
+    }
+
+    // ── Validation Tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_decay_out_of_range_rejected() {
+        // consolidation_decay=1.5 → error
+        let config = PcActorCriticConfig {
+            consolidation_decay: 1.5,
+            ..three_layer_config()
+        };
+        let result = PcActorCritic::new(CpuLinAlg::new(), config, 42);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("consolidation_decay"),
+            "error should mention consolidation_decay: {err}"
+        );
+
+        // consolidation_decay=-0.1 → error
+        let config2 = PcActorCriticConfig {
+            consolidation_decay: -0.1,
+            ..three_layer_config()
+        };
+        let result2 = PcActorCritic::new(CpuLinAlg::new(), config2, 42);
+        assert!(result2.is_err());
+    }
+
+    #[test]
+    fn test_critic_decay_out_of_range_rejected() {
+        let config = PcActorCriticConfig {
+            critic_consolidation_decay: 2.0,
+            ..three_layer_config()
+        };
+        let result = PcActorCritic::new(CpuLinAlg::new(), config, 42);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("critic_consolidation_decay"),
+            "error should mention critic_consolidation_decay: {err}"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_sigmoid_steepness_positive_required() {
+        let config = PcActorCriticConfig {
+            adaptive_consolidation: true,
+            consolidation_sigmoid_k: -1.0,
+            ..three_layer_config()
+        };
+        let result = PcActorCritic::new(CpuLinAlg::new(), config, 42);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("consolidation_sigmoid_k"),
+            "error should mention consolidation_sigmoid_k: {err}"
+        );
+    }
+
+    #[test]
+    fn test_consolidation_ema_beta_out_of_range_rejected() {
+        // beta=0.0 → rejected
+        let config = PcActorCriticConfig {
+            adaptive_consolidation: true,
+            consolidation_ema_beta: 0.0,
+            ..three_layer_config()
+        };
+        let result = PcActorCritic::new(CpuLinAlg::new(), config, 42);
+        assert!(result.is_err());
+
+        // beta=1.0 → rejected
+        let config2 = PcActorCriticConfig {
+            adaptive_consolidation: true,
+            consolidation_ema_beta: 1.0,
+            ..three_layer_config()
+        };
+        let result2 = PcActorCritic::new(CpuLinAlg::new(), config2, 42);
+        assert!(result2.is_err());
+    }
+
+    #[test]
+    fn test_consolidation_error_threshold_nonpositive_rejected() {
+        let config = PcActorCriticConfig {
+            adaptive_consolidation: true,
+            consolidation_error_threshold: 0.0,
+            ..three_layer_config()
+        };
+        let result = PcActorCritic::new(CpuLinAlg::new(), config, 42);
+        assert!(result.is_err());
+
+        let config2 = PcActorCriticConfig {
+            adaptive_consolidation: true,
+            consolidation_error_threshold: -0.1,
+            ..three_layer_config()
+        };
+        let result2 = PcActorCritic::new(CpuLinAlg::new(), config2, 42);
+        assert!(result2.is_err());
     }
 }

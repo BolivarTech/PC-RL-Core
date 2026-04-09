@@ -405,6 +405,62 @@ impl<L: LinAlg> MlpCritic<L> {
         loss
     }
 
+    /// Performs a full training step with per-layer consolidation decay.
+    ///
+    /// Like [`MlpCritic::update`], but applies `surprise_scale * decay_factors[i]` to
+    /// each hidden layer's backward pass. The output layer always receives
+    /// the raw `surprise_scale`. Empty `decay_factors` means no per-layer
+    /// decay (all layers get `surprise_scale`).
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Raw input vector (state features).
+    /// * `target` - Target value for the critic.
+    /// * `surprise_scale` - Global learning rate scale from surprise.
+    /// * `decay_factors` - Per-hidden-layer consolidation decay factors.
+    pub fn update_with_decay(
+        &mut self,
+        input: &[f64],
+        target: f64,
+        surprise_scale: f64,
+        decay_factors: &[f64],
+    ) -> f64 {
+        let mut inputs: Vec<L::Vector> = Vec::with_capacity(self.layers.len());
+        let mut outputs: Vec<L::Vector> = Vec::with_capacity(self.layers.len());
+
+        let mut current = self.backend.vec_from_slice(input);
+        for layer in &self.layers {
+            inputs.push(current.clone());
+            current = layer.forward(&current);
+            outputs.push(current.clone());
+        }
+
+        let predicted = self.backend.vec_get(&current, 0);
+        let error = target - predicted;
+        let loss = error * error;
+
+        let mut delta = self.backend.vec_from_slice(&[-2.0 * error]);
+        let n_layers = self.layers.len();
+        let n_hidden = if n_layers > 0 { n_layers - 1 } else { 0 };
+
+        for i in (0..n_layers).rev() {
+            let layer_scale = if i < n_hidden && !decay_factors.is_empty() {
+                surprise_scale * decay_factors[i]
+            } else {
+                surprise_scale
+            };
+            delta = self.layers[i].backward(
+                &inputs[i],
+                &outputs[i],
+                &delta,
+                self.config.lr,
+                layer_scale,
+            );
+        }
+
+        loss
+    }
+
     /// Extracts a serializable snapshot of current weights.
     ///
     /// Converts generic layers to CPU layers element-by-element for

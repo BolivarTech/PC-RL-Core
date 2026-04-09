@@ -303,6 +303,12 @@ mod tests {
             critic_sleep_fraction: 0.3,
             actor_wakes_critic: false,
             actor_wakes_critic_threshold: 1000,
+            consolidation_decay: 1.0,
+            critic_consolidation_decay: 1.0,
+            adaptive_consolidation: false,
+            consolidation_ema_beta: 0.99,
+            consolidation_sigmoid_k: 10.0,
+            consolidation_error_threshold: 0.05,
         }
     }
 
