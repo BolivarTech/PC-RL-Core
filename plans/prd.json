@@ -183,7 +183,7 @@
     {
       "id": "007",
       "title": "GA Crossover Reset & Serialization",
-      "status": "pending",
+      "status": "completed",
       "priority": "high",
       "description": "Crossover resets all CL state to clean PLASTIC. Serialization via ClState with serde defaults for v2.0.0 backward compat. Round-trip fidelity. Legacy JSON loads as clean PLASTIC.",
       "section_ref": "sbtdd/sections/section-07-ga-serialization.md",

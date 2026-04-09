@@ -160,3 +160,23 @@ Task: Continuous Learning via Intrinsic Surprise Modulation (pc-rl-core v2.1.0)
 - Short PLASTIC phases (< min_fisher_phase) discard F_ema, don't apply fisher_decay on next wake
 - F_total preserved through rapid oscillations (5 cycles verified)
 - Logits reversal produces different Fisher EMA but same weight updates (no snapshot = no correction)
+
+## Task 007: GA Crossover Reset & Serialization — COMPLETED (iteration 7)
+
+**Changes:**
+- Added serializable CL structs: `FisherStateSerialized`, `EwmaTrackerSerialized`, `HysteresisStateSerialized`, `ClState`
+- Extended `SaveFile` with `#[serde(default)] cl_state: Option<ClState>` for backward compat
+- Added `PcActorCritic::to_cl_state()` — extracts all CL state into CPU-side serializable types
+- Added `PcActorCritic::restore_cl_state()` — restores CL state from deserialized `ClState`
+- Updated `save_agent()` to include `cl_state` in SaveFile
+- Updated `load_agent_generic()` to call `restore_cl_state()` when `cl_state` is present
+- Crossover already resets CL state to clean defaults (verified with new tests)
+- 10 new tests (3 crossover reset + 6 serialization + 1 default config), 494 total passing
+
+**Patterns:**
+- `to_cl_state()` returns `None` when no CL features are active (zero overhead for v2.0.0 behavior)
+- `restore_cl_state()` is called post-`from_parts()` — doesn't change `from_parts` API
+- Legacy JSON (no `cl_state` field) loads as `None` → agent gets clean PLASTIC defaults via `from_parts`
+- Fisher state serialization mirrors `to_weights()` pattern: L::Matrix → Matrix via element-wise copy
+- Transient step state (state_prev, action_prev, infer_prev, valid_actions_prev) is NOT serialized
+- All serializable structs use `#[serde(default)]` on optional fields for forward compat
