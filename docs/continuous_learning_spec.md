@@ -111,7 +111,11 @@ let action = agent.step(&state, reward, terminal);
 
 #### Internal state machine
 
-The agent stores `(state_prev, action_prev, infer_prev)` from the previous step.
+The agent stores `(state_prev, action_prev, infer_prev, valid_actions_prev)` from
+the previous step. `valid_actions_prev` is `None` for `step()` (all actions valid)
+and `Some(valid_actions)` for `step_masked()` — used in the learning step to
+restrict the policy gradient to valid actions only.
+
 On each call to `step()`:
 
 ```
@@ -135,9 +139,10 @@ ignored. The consumer passes `0.0` and `false` as convention.
 agent.reset_step();
 ```
 
-Clears the internal `(state_prev, action_prev, infer_prev)` state, returning the
-agent to the same condition as before its first `step()` call. The next `step()`
-behaves as the first call of a fresh episode — `reward` and `terminal` are ignored.
+Clears the internal `(state_prev, action_prev, infer_prev, valid_actions_prev)`
+state, returning the agent to the same condition as before its first `step()` call.
+The next `step()` behaves as the first call of a fresh episode — `reward` and
+`terminal` are ignored.
 
 This does **not** affect weights, surprise buffer, hysteresis state, or EWC anchors.
 It only resets the temporal link between consecutive steps.
@@ -286,7 +291,9 @@ State: FROZEN  →  fast_ewma > slow_ewma × (1 + wake_fraction)  →  PLASTIC
 State: PLASTIC →  fast_ewma < slow_ewma × (1 - sleep_fraction) →  FROZEN
 ```
 
-Where `wake_fraction > 0` and `sleep_fraction > 0` (both configurable).
+Where `wake_fraction > 0` and `sleep_fraction ∈ (0, 1)` exclusive (both
+configurable). `sleep_fraction >= 1.0` would make sleep impossible (`slow × 0 = 0`,
+fast EWMA of non-negative signals never goes below 0).
 
 This design is **self-calibrating**: thresholds are relative to the current baseline
 (slow_ewma), not absolute values. They automatically adapt to different signal
@@ -615,6 +622,7 @@ Where:
 pub ewc_lambda: f64,          // default 0.0 (disabled, legacy behavior)
 pub fisher_ema_beta: f64,     // default 0.99 (EMA smoothing for Fisher estimation)
 pub fisher_decay: f64,        // default 0.9 (decay of old Fisher between PLASTIC phases)
+pub logits_reversal: bool,    // default false (negate logits for Fisher estimation)
 ```
 
 #### EWC Computation Details
@@ -716,6 +724,95 @@ penalize deviations from these values during subsequent PLASTIC phases.
 The snapshot is always taken at PLASTIC → FROZEN, regardless of whether the phase
 was long or short. Even if Fisher was not updated (short phase), the weights may
 have changed slightly and the snapshot should reflect the current state.
+
+##### Logits reversal (optional)
+
+When the actor's policy becomes near-deterministic (one action dominates with
+probability ~1.0), the REINFORCE policy gradient delta approaches zero because
+`pi ≈ one_hot` for the dominant action, making all components of `(pi - one_hot)`
+small. This causes the Fisher EMA to decay toward zero even though the parameters
+are critically important for maintaining the confident policy. This is "Fisher
+collapse": EWC loses its protective effect precisely when protection matters most.
+
+Logits reversal (EWC-DR, 2026) addresses this by computing a **separate Fisher
+delta** using negated logits, which inverts the softmax distribution. This produces
+non-trivial gradients through parameters that the network relies on for confident
+predictions. The actual `backward()` call for weight updates uses the real logits
+— learning is completely unaffected.
+
+**Fisher delta computation**: When `logits_reversal = true`, the Fisher gradient
+uses a dedicated delta recomputed from the reversed softmax distribution:
+
+```
+pi_reversed = softmax_masked(-y_conv / temperature, valid_actions)
+delta_fisher[i] = pi_reversed[i] - (1 if i == action else 0)
+```
+
+Where `temperature` is the actor's existing temperature parameter (the same one
+used in `select_action()` for the forward softmax: `softmax_masked(y_conv / T,
+valid_actions)`). This is NOT a new config field — it reuses the actor's
+temperature to ensure the reversed distribution has the same entropy scale as the
+forward distribution.
+
+`softmax_masked` is used (not bare `softmax`) to ensure probability mass is only
+assigned to valid actions, consistent with the rest of the architecture. Without
+masking, invalid actions would receive non-zero probability in the reversed
+distribution, adding noise to the Fisher estimate.
+
+This `delta_fisher` replaces the task delta ONLY in the Fisher gradient pipeline.
+It is NOT scaled by advantage — Fisher estimates must reflect parameter importance
+for the policy structure, not the magnitude of the value function signal.
+
+When `logits_reversal = true`, each PLASTIC step performs two computations:
+
+1. **Fisher gradient**: compute `delta_fisher` from
+   `softmax_masked(-y_conv / T, valid_actions)` as above → extract the clipped
+   local gradient through the output layer backward pipeline (activation derivative
+   → hadamard with `delta_fisher` → clip at GRAD_CLIP) → square → update F_ema.
+   Hidden layers receive the propagated Fisher delta through normal backpropagation.
+   **This is a read-only computation** — no weight or bias updates occur at any
+   layer during the Fisher gradient pass. Implementation should use a dedicated
+   gradient-extraction method or call `backward()` with `effective_lr = 0.0` to
+   suppress weight mutations. For linear output activation, the activation
+   derivative is 1.0 (identity), so the hadamard is a pass-through.
+2. **Task gradient**: real logits → `backward()` as normal (with advantage scaling,
+   weight updates applied)
+
+When `logits_reversal = false` (default), the task gradient (post-clip, pre-scaling,
+without advantage) is reused for Fisher estimation — a single gradient computation
+suffices for both.
+
+**Why this works**: If the original logits are `[100, -50, -50]` with
+`pi ≈ [1.0, 0, 0]`, the task delta is `≈ [0, 0, 0]` (near-zero Fisher). With
+negation, `pi_reversed ≈ [0, 0.5, 0.5]` and `delta_fisher ≈ [-1.0, 0.5, 0.5]`
+— producing large gradients that capture which parameters are responsible for the
+confident policy.
+
+**Approximation note**: The reversed gradients measure how sensitive each parameter
+is to producing the *inverted* policy. This is a proxy for importance under the
+actual policy — parameters that strongly determine the confident action would need
+to change significantly to reverse it. This is a heuristic approximation of the
+true Fisher Information, not an exact computation.
+
+```rust
+pub logits_reversal: bool,    // default false
+```
+
+```toml
+[agent.actor]
+logits_reversal = false       # default: standard Fisher estimation
+```
+
+**Default off**: During PLASTIC phases (when Fisher accumulates), the network is
+actively learning and not yet converged to high confidence, so the policy gradient
+delta is typically non-trivial. Fisher collapse is primarily a concern for larger
+networks or longer PLASTIC phases where the policy may converge to near-deterministic
+within a single phase. Logits reversal is provided as an experimental switch for
+these future scenarios.
+
+**Applies to actor only**: The critic uses MSE loss gradients for Fisher estimation,
+which do not exhibit the same policy-gradient saturation behavior. Logits reversal
+is not applicable to the critic.
 
 ##### Fisher decay between environments
 
@@ -1011,6 +1108,7 @@ pub struct PcActorCriticConfig {
     pub ewc_lambda: f64,             // default 0.0 (disabled)
     pub fisher_ema_beta: f64,        // default 0.99 (EMA smoothing for Fisher)
     pub fisher_decay: f64,           // default 0.9 (decay of old Fisher between phases)
+    pub logits_reversal: bool,       // default false (negate logits for Fisher estimation, actor only)
 
     // Actor-critic coupling (optional safety mechanism)
     pub actor_wakes_critic: bool,              // default false (fully independent)
