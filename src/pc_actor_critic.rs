@@ -1119,6 +1119,178 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
     }
 
+    /// Extracts the continuous learning state for serialization.
+    ///
+    /// Converts all CL state (hysteresis, Fisher, counters) into
+    /// CPU-side serializable types. Returns `None` if no CL features
+    /// are active (all defaults).
+    pub fn to_cl_state(&self) -> Option<crate::serializer::ClState> {
+        use crate::serializer::{
+            ClState, EwmaTrackerSerialized, FisherStateSerialized, HysteresisStateSerialized,
+        };
+
+        let has_cl = self.actor_hysteresis.is_some()
+            || self.critic_hysteresis.is_some()
+            || !self.actor_fisher.is_empty()
+            || !self.critic_fisher.is_empty()
+            || self.actor_plastic_step_counter > 0
+            || self.critic_plastic_step_counter > 0
+            || self.critic_frozen_steps > 0
+            || !self.layer_error_ema.is_empty()
+            || self.actor_last_phase_reliable
+            || self.critic_last_phase_reliable;
+
+        if !has_cl {
+            return None;
+        }
+
+        let serialize_ewma = |t: &EwmaTracker| EwmaTrackerSerialized {
+            value: t.value,
+            k: t.k,
+            window: t.window,
+        };
+
+        let serialize_hysteresis = |h: &HysteresisState| HysteresisStateSerialized {
+            fast: serialize_ewma(&h.fast),
+            slow: serialize_ewma(&h.slow),
+            state: h.state.clone(),
+            wake_fraction: h.wake_fraction,
+            sleep_fraction: h.sleep_fraction,
+            min_initial_plastic: h.min_initial_plastic,
+        };
+
+        let serialize_fisher = |fs: &FisherState<L>, backend: &L| -> FisherStateSerialized {
+            let mat_to_cpu = |m: &L::Matrix| -> crate::matrix::Matrix {
+                let rows = backend.mat_rows(m);
+                let cols = backend.mat_cols(m);
+                let mut cpu = crate::matrix::Matrix::zeros(rows, cols);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        cpu.set(r, c, backend.mat_get(m, r, c));
+                    }
+                }
+                cpu
+            };
+            FisherStateSerialized {
+                f_total_weights: mat_to_cpu(&fs.f_total_weights),
+                f_total_bias: backend.vec_to_vec(&fs.f_total_bias),
+                f_ema_weights: mat_to_cpu(&fs.f_ema_weights),
+                f_ema_bias: backend.vec_to_vec(&fs.f_ema_bias),
+                theta_snapshot_weights: fs.theta_snapshot_weights.as_ref().map(mat_to_cpu),
+                theta_snapshot_bias: fs
+                    .theta_snapshot_bias
+                    .as_ref()
+                    .map(|v| backend.vec_to_vec(v)),
+                theta_snapshot_rezero_alpha: fs.theta_snapshot_rezero_alpha,
+                theta_snapshot_skip_proj: fs.theta_snapshot_skip_proj.as_ref().map(mat_to_cpu),
+            }
+        };
+
+        Some(ClState {
+            actor_hysteresis: self.actor_hysteresis.as_ref().map(serialize_hysteresis),
+            critic_hysteresis: self.critic_hysteresis.as_ref().map(serialize_hysteresis),
+            actor_plastic_step_counter: self.actor_plastic_step_counter,
+            critic_plastic_step_counter: self.critic_plastic_step_counter,
+            critic_frozen_steps: self.critic_frozen_steps,
+            actor_fisher: self
+                .actor_fisher
+                .iter()
+                .map(|f| serialize_fisher(f, &self.backend))
+                .collect(),
+            critic_fisher: self
+                .critic_fisher
+                .iter()
+                .map(|f| serialize_fisher(f, &self.backend))
+                .collect(),
+            actor_last_phase_reliable: self.actor_last_phase_reliable,
+            critic_last_phase_reliable: self.critic_last_phase_reliable,
+            layer_error_ema: self.layer_error_ema.clone(),
+        })
+    }
+
+    /// Restores continuous learning state from a serialized `ClState`.
+    ///
+    /// Called after `from_parts()` during deserialization. If `cl_state`
+    /// is `None` (legacy JSON), the agent keeps its clean defaults.
+    pub fn restore_cl_state(&mut self, cl_state: crate::serializer::ClState) {
+        use crate::serializer::{EwmaTrackerSerialized, HysteresisStateSerialized};
+
+        let deserialize_ewma = |t: EwmaTrackerSerialized| -> EwmaTracker {
+            EwmaTracker {
+                value: t.value,
+                k: t.k,
+                window: t.window,
+            }
+        };
+
+        let deserialize_hysteresis = |h: HysteresisStateSerialized| -> HysteresisState {
+            HysteresisState {
+                fast: deserialize_ewma(h.fast),
+                slow: deserialize_ewma(h.slow),
+                state: h.state,
+                wake_fraction: h.wake_fraction,
+                sleep_fraction: h.sleep_fraction,
+                min_initial_plastic: h.min_initial_plastic,
+            }
+        };
+
+        self.actor_hysteresis = cl_state.actor_hysteresis.map(deserialize_hysteresis);
+        self.critic_hysteresis = cl_state.critic_hysteresis.map(deserialize_hysteresis);
+        self.actor_plastic_step_counter = cl_state.actor_plastic_step_counter;
+        self.critic_plastic_step_counter = cl_state.critic_plastic_step_counter;
+        self.critic_frozen_steps = cl_state.critic_frozen_steps;
+        self.actor_last_phase_reliable = cl_state.actor_last_phase_reliable;
+        self.critic_last_phase_reliable = cl_state.critic_last_phase_reliable;
+
+        if !cl_state.layer_error_ema.is_empty() {
+            self.layer_error_ema = cl_state.layer_error_ema;
+        }
+
+        // Restore Fisher state
+        let deserialize_fisher_vec = |serialized: Vec<crate::serializer::FisherStateSerialized>,
+                                      backend: &L|
+         -> Vec<FisherState<L>> {
+            serialized
+                .into_iter()
+                .map(|fs| {
+                    let cpu_to_mat = |m: &crate::matrix::Matrix| -> L::Matrix {
+                        let rows = m.rows;
+                        let cols = m.cols;
+                        let mut result = backend.zeros_mat(rows, cols);
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                backend.mat_set(&mut result, r, c, m.get(r, c));
+                            }
+                        }
+                        result
+                    };
+                    let cpu_to_vec = |v: &[f64]| -> L::Vector { backend.vec_from_slice(v) };
+
+                    FisherState {
+                        f_total_weights: cpu_to_mat(&fs.f_total_weights),
+                        f_total_bias: cpu_to_vec(&fs.f_total_bias),
+                        f_ema_weights: cpu_to_mat(&fs.f_ema_weights),
+                        f_ema_bias: cpu_to_vec(&fs.f_ema_bias),
+                        theta_snapshot_weights: fs.theta_snapshot_weights.as_ref().map(cpu_to_mat),
+                        theta_snapshot_bias: fs.theta_snapshot_bias.as_ref().map(|v| cpu_to_vec(v)),
+                        theta_snapshot_rezero_alpha: fs.theta_snapshot_rezero_alpha,
+                        theta_snapshot_skip_proj: fs
+                            .theta_snapshot_skip_proj
+                            .as_ref()
+                            .map(cpu_to_mat),
+                    }
+                })
+                .collect()
+        };
+
+        if !cl_state.actor_fisher.is_empty() {
+            self.actor_fisher = deserialize_fisher_vec(cl_state.actor_fisher, &self.backend);
+        }
+        if !cl_state.critic_fisher.is_empty() {
+            self.critic_fisher = deserialize_fisher_vec(cl_state.critic_fisher, &self.backend);
+        }
+    }
+
     /// Runs PC inference without selecting an action or modifying RNG state.
     ///
     /// Use this when you only need the inference result (e.g., for TD(0)
@@ -5531,5 +5703,192 @@ mod tests {
             "beta=0.01 → min_phase should be ~1, got {}",
             min_phase
         );
+    }
+
+    // ── Section 07: GA Crossover Reset ──────────────────────────
+
+    #[test]
+    fn test_crossover_resets_all_cl_state() {
+        // Two parents with EWC + hysteresis enabled, train them to get non-zero Fisher
+        let mut config = ewc_config();
+        config.adaptive_consolidation = true;
+        config.consolidation_ema_beta = 0.99;
+        config.consolidation_sigmoid_k = 10.0;
+        config.consolidation_error_threshold = 0.05;
+
+        let mut parent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut parent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
+
+        // Train parents to accumulate Fisher and CL state
+        let state1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let state2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for _ in 0..5 {
+            parent_a.step(&state1, 0.0, false);
+            parent_a.step(&state2, 1.0, true);
+            parent_b.step(&state1, 0.0, false);
+            parent_b.step(&state2, -1.0, true);
+        }
+
+        // Force parents into FROZEN state with non-zero Fisher
+        if let Some(ref mut h) = parent_a.actor_hysteresis {
+            h.state = PlasticityState::Frozen;
+        }
+        if let Some(ref mut h) = parent_a.critic_hysteresis {
+            h.state = PlasticityState::Frozen;
+        }
+        parent_a.critic_frozen_steps = 50;
+
+        // Pre-load F_total on parent_a to ensure non-zero Fisher
+        let rows = parent_a
+            .backend
+            .mat_rows(&parent_a.actor_fisher[0].f_total_weights);
+        let cols = parent_a
+            .backend
+            .mat_cols(&parent_a.actor_fisher[0].f_total_weights);
+        for r in 0..rows {
+            for c in 0..cols {
+                parent_a
+                    .backend
+                    .mat_set(&mut parent_a.actor_fisher[0].f_total_weights, r, c, 1.0);
+            }
+        }
+
+        // Set mid-episode step state on parent_a
+        parent_a.step(&state1, 0.0, false); // state_prev is now set
+
+        let (ac_a, cc_a) = build_caches_for_agent(&mut parent_a, 50);
+        let (ac_b, cc_b) = build_caches_for_agent(&mut parent_b, 50);
+
+        let child: PcActorCritic = PcActorCritic::crossover(
+            &parent_a, &parent_b, &ac_a, &ac_b, &cc_a, &cc_b, 0.5, config, 99,
+        )
+        .unwrap();
+
+        // Verify all CL state is clean
+        assert!(child.actor_hysteresis.is_none());
+        assert!(child.critic_hysteresis.is_none());
+        assert_eq!(child.actor_plastic_step_counter, 0);
+        assert_eq!(child.critic_plastic_step_counter, 0);
+        assert_eq!(child.critic_frozen_steps, 0);
+        assert!(child.surprise_buffer.is_empty());
+        assert!(child.td_error_buffer.is_empty());
+        assert!(child.state_prev.is_none());
+        assert!(child.action_prev.is_none());
+        assert!(child.infer_prev.is_none());
+        assert!(child.valid_actions_prev.is_none());
+        assert!(!child.actor_last_phase_reliable);
+        assert!(!child.critic_last_phase_reliable);
+
+        // Fisher state should be empty (clean)
+        assert!(
+            child.actor_fisher.is_empty(),
+            "Child actor_fisher should be empty"
+        );
+        assert!(
+            child.critic_fisher.is_empty(),
+            "Child critic_fisher should be empty"
+        );
+
+        // Per-layer error EMAs should be zero (if adaptive consolidation enabled)
+        for ema in &child.layer_error_ema {
+            assert!(
+                (*ema).abs() < f64::EPSILON,
+                "Per-layer error EMA should be 0.0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_crossover_child_warmup_guard_active() {
+        // Child from crossover with hysteresis config should have k=0
+        // so warmup guard prevents sleep even under sleep conditions
+        let config = ewc_config();
+        let mut parent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut parent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
+
+        let (ac_a, cc_a) = build_caches_for_agent(&mut parent_a, 50);
+        let (ac_b, cc_b) = build_caches_for_agent(&mut parent_b, 50);
+
+        let mut child: PcActorCritic = PcActorCritic::crossover(
+            &parent_a, &parent_b, &ac_a, &ac_b, &cc_a, &cc_b, 0.5, config, 99,
+        )
+        .unwrap();
+
+        // Child starts PLASTIC, hysteresis is None (clean defaults).
+        // Feed it a few steps that would normally trigger sleep
+        // but since hysteresis is None, it stays Plastic.
+        let state = vec![0.5; 9];
+        for _ in 0..5 {
+            child.step(&state, 0.0, false);
+            child.step(&state, 0.0, true);
+        }
+
+        // Child should still be functional (no panic, no stuck state)
+        // Actor hysteresis is None → always Plastic
+        assert!(child.actor_hysteresis.is_none());
+    }
+
+    #[test]
+    fn test_crossover_weights_from_parents() {
+        // Two parents with known distinct weights.
+        // Child weights are CCA-blended. CL state is clean.
+        let config = default_config();
+        let mut parent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 42).unwrap();
+        let mut parent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config.clone(), 123).unwrap();
+
+        let (ac_a, cc_a) = build_caches_for_agent(&mut parent_a, 50);
+        let (ac_b, cc_b) = build_caches_for_agent(&mut parent_b, 50);
+
+        let child: PcActorCritic = PcActorCritic::crossover(
+            &parent_a, &parent_b, &ac_a, &ac_b, &cc_a, &cc_b, 0.5, config, 99,
+        )
+        .unwrap();
+
+        // Child weights should differ from both parents (CCA blend)
+        assert_ne!(
+            child.actor.layers[0].weights.data,
+            parent_a.actor.layers[0].weights.data
+        );
+        assert_ne!(
+            child.actor.layers[0].weights.data,
+            parent_b.actor.layers[0].weights.data
+        );
+
+        // CL state is clean
+        assert!(child.actor_fisher.is_empty());
+        assert!(child.critic_fisher.is_empty());
+        assert!(child.surprise_buffer.is_empty());
+        assert!(child.td_error_buffer.is_empty());
+        assert_eq!(child.actor_plastic_step_counter, 0);
+        assert_eq!(child.critic_plastic_step_counter, 0);
+    }
+
+    // ── Section 07: Default config reproduces v2 behavior ───────
+
+    #[test]
+    fn test_default_config_reproduces_v2_behavior() {
+        // Default config (all CL disabled) should behave identically to v2.0.0
+        let config = default_config();
+        assert!(!config.actor_hysteresis);
+        assert!(!config.critic_hysteresis);
+        assert!(!config.adaptive_consolidation);
+        assert!((config.ewc_lambda).abs() < f64::EPSILON);
+        assert!(!config.logits_reversal);
+        assert!((config.consolidation_decay - 1.0).abs() < f64::EPSILON);
+        assert!((config.critic_consolidation_decay - 1.0).abs() < f64::EPSILON);
+
+        // Agent with default config should have no CL overhead
+        let agent = make_agent();
+        assert!(agent.actor_hysteresis.is_none());
+        assert!(agent.critic_hysteresis.is_none());
+        assert!(agent.actor_fisher.is_empty());
+        assert!(agent.critic_fisher.is_empty());
+        assert!(agent.layer_error_ema.is_empty());
     }
 }

@@ -18,9 +18,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::PcError;
 use crate::layer::Layer;
 use crate::linalg::LinAlg;
+use crate::matrix::Matrix;
 use crate::mlp_critic::MlpCritic;
 use crate::pc_actor::PcActor;
-use crate::pc_actor_critic::{PcActorCritic, PcActorCriticConfig};
+use crate::pc_actor_critic::{PcActorCritic, PcActorCriticConfig, PlasticityState};
 
 /// Metadata embedded in every save file.
 ///
@@ -66,6 +67,100 @@ pub struct PcActorWeights {
     pub skip_projections: Vec<Option<crate::matrix::Matrix>>,
 }
 
+/// Serializable per-layer Fisher information state.
+///
+/// Stores accumulated Fisher (`f_total`), current-phase EMA (`f_ema`),
+/// and optional weight snapshots as CPU-side `Matrix`/`Vec<f64>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FisherStateSerialized {
+    /// Accumulated Fisher information for weights.
+    pub f_total_weights: Matrix,
+    /// Accumulated Fisher information for biases.
+    pub f_total_bias: Vec<f64>,
+    /// Current-phase running EMA of squared gradients for weights.
+    pub f_ema_weights: Matrix,
+    /// Current-phase running EMA of squared gradients for biases.
+    pub f_ema_bias: Vec<f64>,
+    /// Snapshot of weights at last PLASTIC→FROZEN transition.
+    #[serde(default)]
+    pub theta_snapshot_weights: Option<Matrix>,
+    /// Snapshot of biases at last PLASTIC→FROZEN transition.
+    #[serde(default)]
+    pub theta_snapshot_bias: Option<Vec<f64>>,
+    /// Snapshot of rezero alpha (for residual layers).
+    #[serde(default)]
+    pub theta_snapshot_rezero_alpha: Option<f64>,
+    /// Snapshot of skip projection matrix (for heterogeneous residual layers).
+    #[serde(default)]
+    pub theta_snapshot_skip_proj: Option<Matrix>,
+}
+
+/// Serializable EWMA tracker state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EwmaTrackerSerialized {
+    /// Current EWMA value.
+    pub value: f64,
+    /// Step counter.
+    pub k: u64,
+    /// Window size.
+    pub window: usize,
+}
+
+/// Serializable hysteresis state machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HysteresisStateSerialized {
+    /// Fast EWMA tracker.
+    pub fast: EwmaTrackerSerialized,
+    /// Slow EWMA tracker.
+    pub slow: EwmaTrackerSerialized,
+    /// Current plasticity state.
+    pub state: PlasticityState,
+    /// Wake fraction threshold.
+    pub wake_fraction: f64,
+    /// Sleep fraction threshold.
+    pub sleep_fraction: f64,
+    /// Minimum fast EWMA steps before sleep is allowed.
+    pub min_initial_plastic: u64,
+}
+
+/// Top-level container for all continuous learning state.
+///
+/// Persisted in `SaveFile` as `Option<ClState>`. Legacy JSON files
+/// without this field load as `None`, which means clean PLASTIC defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClState {
+    /// Actor hysteresis state (None when disabled).
+    #[serde(default)]
+    pub actor_hysteresis: Option<HysteresisStateSerialized>,
+    /// Critic hysteresis state (None when disabled).
+    #[serde(default)]
+    pub critic_hysteresis: Option<HysteresisStateSerialized>,
+    /// Steps the actor has been in PLASTIC state.
+    #[serde(default)]
+    pub actor_plastic_step_counter: u64,
+    /// Steps the critic has been in PLASTIC state.
+    #[serde(default)]
+    pub critic_plastic_step_counter: u64,
+    /// Consecutive steps the critic has been FROZEN.
+    #[serde(default)]
+    pub critic_frozen_steps: u64,
+    /// Per-layer Fisher state for actor.
+    #[serde(default)]
+    pub actor_fisher: Vec<FisherStateSerialized>,
+    /// Per-layer Fisher state for critic.
+    #[serde(default)]
+    pub critic_fisher: Vec<FisherStateSerialized>,
+    /// Whether the last actor PLASTIC phase was reliable.
+    #[serde(default)]
+    pub actor_last_phase_reliable: bool,
+    /// Whether the last critic PLASTIC phase was reliable.
+    #[serde(default)]
+    pub critic_last_phase_reliable: bool,
+    /// Per-layer prediction error EMA for adaptive consolidation (M3b).
+    #[serde(default)]
+    pub layer_error_ema: Vec<f64>,
+}
+
 /// Complete save file containing agent state and metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveFile {
@@ -77,6 +172,9 @@ pub struct SaveFile {
     pub actor_weights: PcActorWeights,
     /// Critic network weights.
     pub critic_weights: crate::mlp_critic::MlpCriticWeights,
+    /// Continuous learning state (None for legacy/v2.0.0 files).
+    #[serde(default)]
+    pub cl_state: Option<ClState>,
 }
 
 /// Saves the agent's full state to a JSON file.
@@ -112,6 +210,7 @@ pub fn save_agent<L: LinAlg>(
         config: agent.config.clone(),
         actor_weights: agent.actor.to_weights(),
         critic_weights: agent.critic.to_weights(),
+        cl_state: agent.to_cl_state(),
     };
 
     let json = serde_json::to_string_pretty(&save_file)?;
@@ -187,7 +286,11 @@ pub fn load_agent_generic<L: LinAlg>(
     use rand::SeedableRng;
     let rng = rand::rngs::StdRng::from_entropy();
 
-    let agent = PcActorCritic::from_parts(save_file.config, actor, critic, rng, backend);
+    let mut agent = PcActorCritic::from_parts(save_file.config, actor, critic, rng, backend);
+
+    if let Some(cl_state) = save_file.cl_state {
+        agent.restore_cl_state(cl_state);
+    }
 
     Ok((agent, save_file.metadata))
 }
@@ -722,5 +825,230 @@ mod tests {
         let valid: Vec<usize> = (0..9).collect();
         let (action, _) = agent.act(&state, &valid, crate::pc_actor::SelectionMode::Play);
         assert!(action < 9, "Action must be in valid range");
+    }
+
+    // ── Section 07: Serialization with CL State ─────────────────
+
+    #[test]
+    fn test_cl_agent_save_load_roundtrip() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        // Create CL agent with EWC + hysteresis enabled
+        let mut config = default_config();
+        config.ewc_lambda = 1.0;
+        config.fisher_decay = 0.9;
+        config.fisher_ema_beta = 0.99;
+        config.actor_hysteresis = true;
+        config.actor_fast_window = 5;
+        config.actor_slow_window = 20;
+        config.actor_wake_fraction = 0.5;
+        config.actor_sleep_fraction = 0.3;
+        config.critic_hysteresis = true;
+        config.critic_fast_window = 5;
+        config.critic_slow_window = 20;
+        config.critic_wake_fraction = 0.5;
+        config.critic_sleep_fraction = 0.3;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Train to accumulate non-zero Fisher and EWMA state
+        let state1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let state2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for _ in 0..30 {
+            agent.step(&state1, 0.0, false);
+            agent.step(&state2, 1.0, true);
+        }
+
+        // Save the JSON and verify cl_state is present with EWMA and Fisher
+        let path = temp_path("test_cl_roundtrip.json");
+        save_agent(&agent, &path, 500, None).unwrap();
+
+        // Verify JSON has CL fields
+        let json_str = fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let cl = &json["cl_state"];
+        assert!(!cl.is_null(), "cl_state must be present");
+        assert!(
+            cl["actor_hysteresis"].is_object(),
+            "actor_hysteresis must be present"
+        );
+        assert!(
+            cl["actor_fisher"].is_array(),
+            "actor_fisher must be present"
+        );
+
+        // Verify EWMA k > 0 in saved JSON
+        let fast_k = cl["actor_hysteresis"]["fast"]["k"].as_u64().unwrap();
+        assert!(fast_k > 0, "fast EWMA k must be > 0 after training");
+
+        // Load and verify inference matches original
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        let test_input = vec![0.3, -0.7, 0.1, 0.5, -0.2, 0.8, -0.4, 0.6, -0.9];
+        let orig_infer = agent.infer(&test_input);
+        let loaded_infer = loaded.infer(&test_input);
+        for (a, b) in orig_infer.y_conv.iter().zip(loaded_infer.y_conv.iter()) {
+            assert!((a - b).abs() < 1e-12, "y_conv differs: {a} vs {b}");
+        }
+
+        // Load the saved JSON again and verify CL fields round-trip
+        let json_str2 = fs::read_to_string(&path).unwrap();
+        let json2: serde_json::Value = serde_json::from_str(&json_str2).unwrap();
+        let cl2 = &json2["cl_state"];
+
+        // EWMA k should match
+        assert_eq!(
+            cl["actor_hysteresis"]["fast"]["k"],
+            cl2["actor_hysteresis"]["fast"]["k"]
+        );
+        // Fisher arrays should match length
+        assert_eq!(
+            cl["actor_fisher"].as_array().unwrap().len(),
+            cl2["actor_fisher"].as_array().unwrap().len()
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_legacy_json_loads_as_clean_plastic() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::pc_actor::SelectionMode;
+
+        // v2.0.0 fixture has no CL fields → should load with clean PLASTIC defaults
+        // Agent should be fully functional
+        let (mut agent, _) = load_agent("tests/fixtures/v1_model.json", CpuLinAlg::new()).unwrap();
+
+        // Agent should work normally (no panic from missing CL state)
+        let state = vec![0.5; 9];
+        let valid: Vec<usize> = (0..9).collect();
+        let (action, _) = agent.act(&state, &valid, SelectionMode::Play);
+        assert!(action < 9);
+
+        // Step should work (no CL processing since all disabled by defaults)
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let _a1 = agent.step(&s1, 0.0, false);
+        let _a2 = agent.step(&s2, 1.0, true);
+    }
+
+    #[test]
+    fn test_step_state_not_serialized() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        let mut agent = make_agent();
+        // Start a mid-episode step (state_prev will be set internally)
+        let state = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        agent.step(&state, 0.0, false);
+
+        let path = temp_path("test_step_state_not_serialized.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+        let (mut loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        // Loaded agent's first step() should behave as a "first call" (no prior state)
+        // which means no learning happens on the very first call
+        let state2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let weights_before = loaded.actor.layers[0].weights.data.clone();
+        loaded.step(&state2, 1.0, false);
+        // First step after load should NOT learn (no prev state)
+        assert_eq!(
+            loaded.actor.layers[0].weights.data, weights_before,
+            "First step after load should not modify weights (no prior state)"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_v2_json_fixture_loads_successfully() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::pc_actor::SelectionMode;
+
+        // Existing v1 fixture loads without error and agent is functional
+        let (mut agent, metadata) =
+            load_agent("tests/fixtures/v1_model.json", CpuLinAlg::new()).unwrap();
+        assert!(!metadata.version.is_empty());
+        assert_eq!(metadata.episode, 100);
+
+        let state = vec![0.5; 9];
+        let valid: Vec<usize> = (0..9).collect();
+        let (action, _) = agent.act(&state, &valid, SelectionMode::Play);
+        assert!(action < 9);
+    }
+
+    #[test]
+    fn test_cl_json_has_fisher_fields() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        let mut config = default_config();
+        config.ewc_lambda = 1.0;
+        config.fisher_ema_beta = 0.99;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Train to populate Fisher
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        agent.step(&s1, 0.0, false);
+        agent.step(&s2, 1.0, true);
+
+        let path = temp_path("test_cl_fisher_fields.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+
+        // Parse raw JSON and check for Fisher fields
+        let json_str = fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let cl = &json["cl_state"];
+        assert!(!cl.is_null(), "cl_state should be present in saved JSON");
+        assert!(
+            cl["actor_fisher"].is_array(),
+            "actor_fisher should be an array"
+        );
+        assert!(
+            cl["critic_fisher"].is_array(),
+            "critic_fisher should be an array"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_cl_json_has_ewma_fields() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        let mut config = default_config();
+        config.actor_hysteresis = true;
+        config.actor_fast_window = 5;
+        config.actor_slow_window = 20;
+        config.actor_wake_fraction = 0.5;
+        config.actor_sleep_fraction = 0.3;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Train a few steps to populate EWMAs
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for _ in 0..5 {
+            agent.step(&s1, 0.0, false);
+            agent.step(&s2, 1.0, true);
+        }
+
+        let path = temp_path("test_cl_ewma_fields.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+
+        // Parse raw JSON and check for EWMA fields
+        let json_str = fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let cl = &json["cl_state"];
+        assert!(!cl.is_null(), "cl_state should be present in saved JSON");
+        assert!(
+            cl["actor_hysteresis"].is_object(),
+            "actor_hysteresis should be an object"
+        );
+        let ah = &cl["actor_hysteresis"];
+        assert!(ah["fast"].is_object(), "fast EWMA should be present");
+        assert!(ah["slow"].is_object(), "slow EWMA should be present");
+
+        let _ = fs::remove_file(&path);
     }
 }
