@@ -595,7 +595,7 @@ impl<L: LinAlg> PcActor<L> {
     }
 
     /// Returns the rezero_alpha/skip_projections index for hidden layer `i`.
-    fn skip_alpha_index(&self, i: usize) -> Option<usize> {
+    pub(crate) fn skip_alpha_index(&self, i: usize) -> Option<usize> {
         if !self.is_skip_layer(i) {
             return None;
         }

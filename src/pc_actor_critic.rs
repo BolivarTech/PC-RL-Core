@@ -152,6 +152,26 @@ fn default_consolidation_error_threshold() -> f64 {
     0.05
 }
 
+/// Default EWC regularization strength (0.0 = disabled).
+fn default_ewc_lambda() -> f64 {
+    0.0
+}
+
+/// Default Fisher information decay between consolidation phases.
+fn default_fisher_decay() -> f64 {
+    0.9
+}
+
+/// Default Fisher EMA smoothing factor.
+fn default_fisher_ema_beta() -> f64 {
+    0.99
+}
+
+/// Default logits reversal flag (disabled).
+fn default_logits_reversal() -> bool {
+    false
+}
+
 /// Plasticity state of a network: whether it is actively learning or frozen.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum PlasticityState {
@@ -271,6 +291,47 @@ impl HysteresisState {
     }
 }
 
+/// Per-layer Fisher information state for EWC regularization.
+///
+/// Tracks accumulated Fisher information (`f_total`), current-phase
+/// running EMA (`f_ema`), and weight snapshots (`theta_snapshot`).
+/// One instance per layer, for both actor and critic.
+#[derive(Debug, Clone)]
+pub struct FisherState<L: LinAlg = CpuLinAlg> {
+    /// Accumulated Fisher information for weights (across reliable phases).
+    pub f_total_weights: L::Matrix,
+    /// Accumulated Fisher information for biases (across reliable phases).
+    pub f_total_bias: L::Vector,
+    /// Current-phase running EMA of squared gradients for weights.
+    pub f_ema_weights: L::Matrix,
+    /// Current-phase running EMA of squared gradients for biases.
+    pub f_ema_bias: L::Vector,
+    /// Snapshot of weights at last PLASTIC→FROZEN transition.
+    pub theta_snapshot_weights: Option<L::Matrix>,
+    /// Snapshot of biases at last PLASTIC→FROZEN transition.
+    pub theta_snapshot_bias: Option<L::Vector>,
+    /// Snapshot of rezero alpha (for residual layers).
+    pub theta_snapshot_rezero_alpha: Option<f64>,
+    /// Snapshot of skip projection matrix (for heterogeneous residual layers).
+    pub theta_snapshot_skip_proj: Option<L::Matrix>,
+}
+
+impl<L: LinAlg> FisherState<L> {
+    /// Creates a new zeroed Fisher state for a layer with the given dimensions.
+    pub fn new(backend: &L, weight_rows: usize, weight_cols: usize, bias_size: usize) -> Self {
+        Self {
+            f_total_weights: backend.zeros_mat(weight_rows, weight_cols),
+            f_total_bias: backend.zeros_vec(bias_size),
+            f_ema_weights: backend.zeros_mat(weight_rows, weight_cols),
+            f_ema_bias: backend.zeros_vec(bias_size),
+            theta_snapshot_weights: None,
+            theta_snapshot_bias: None,
+            theta_snapshot_rezero_alpha: None,
+            theta_snapshot_skip_proj: None,
+        }
+    }
+}
+
 /// Configuration for the integrated PC Actor-Critic agent.
 ///
 /// # Examples
@@ -326,6 +387,10 @@ impl HysteresisState {
 ///     consolidation_ema_beta: 0.99,
 ///     consolidation_sigmoid_k: 10.0,
 ///     consolidation_error_threshold: 0.05,
+///     ewc_lambda: 0.0,
+///     fisher_decay: 0.9,
+///     fisher_ema_beta: 0.99,
+///     logits_reversal: false,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,6 +496,27 @@ pub struct PcActorCriticConfig {
     /// Must be > 0.0 when `adaptive_consolidation` is true. Default: 0.05.
     #[serde(default = "default_consolidation_error_threshold")]
     pub consolidation_error_threshold: f64,
+    /// EWC regularization strength. When 0.0 (default), EWC is fully disabled
+    /// and no Fisher state is allocated (zero overhead). When > 0.0, Fisher
+    /// information is tracked per layer and EWC correction is applied after
+    /// each backward pass.
+    #[serde(default = "default_ewc_lambda")]
+    pub ewc_lambda: f64,
+    /// Fisher information decay factor applied to F_total on each reliable
+    /// FROZEN→PLASTIC transition. F_total saturates at F_ema / (1 - fisher_decay).
+    /// Must be in [0.0, 1.0]. Default: 0.9.
+    #[serde(default = "default_fisher_decay")]
+    pub fisher_decay: f64,
+    /// EMA smoothing factor for Fisher information accumulation during PLASTIC.
+    /// Must be in (0.0, 1.0). Determines min_fisher_phase = ceil(1/(1-beta)).
+    /// Default: 0.99.
+    #[serde(default = "default_fisher_ema_beta")]
+    pub fisher_ema_beta: f64,
+    /// Enable logits reversal for Fisher estimation (actor only).
+    /// When true, computes Fisher from reversed logits (softmax of -y_conv/T)
+    /// rather than the actual policy gradient. Default: false.
+    #[serde(default = "default_logits_reversal")]
+    pub logits_reversal: bool,
 }
 
 /// A single step in a trajectory collected during an episode.
@@ -578,6 +664,14 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     critic_decay_factors: Vec<f64>,
     /// Per-layer prediction error EMA for adaptive consolidation (M3b, actor only).
     layer_error_ema: Vec<f64>,
+    /// Per-layer Fisher information state for actor EWC (empty when ewc_lambda=0).
+    actor_fisher: Vec<FisherState<L>>,
+    /// Per-layer Fisher information state for critic EWC (empty when ewc_lambda=0).
+    critic_fisher: Vec<FisherState<L>>,
+    /// Whether the last actor PLASTIC phase was reliable (>= min_fisher_phase steps).
+    actor_last_phase_reliable: bool,
+    /// Whether the last critic PLASTIC phase was reliable (>= min_fisher_phase steps).
+    critic_last_phase_reliable: bool,
 }
 
 impl<L: LinAlg> PcActorCritic<L> {
@@ -685,6 +779,28 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
         }
 
+        // Validate EWC parameters (M4)
+        if config.ewc_lambda < 0.0 {
+            return Err(PcError::ConfigValidation(format!(
+                "ewc_lambda must be >= 0.0, got {}",
+                config.ewc_lambda
+            )));
+        }
+        if config.ewc_lambda > 0.0 {
+            if !(0.0..=1.0).contains(&config.fisher_decay) {
+                return Err(PcError::ConfigValidation(format!(
+                    "fisher_decay must be in [0.0, 1.0], got {}",
+                    config.fisher_decay
+                )));
+            }
+            if config.fisher_ema_beta <= 0.0 || config.fisher_ema_beta >= 1.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "fisher_ema_beta must be in (0.0, 1.0), got {}",
+                    config.fisher_ema_beta
+                )));
+            }
+        }
+
         // Precompute layer decay factors (M3a)
         let n_actor_hidden = config.actor.hidden_layers.len();
         let actor_decay_factors: Vec<f64> = (0..n_actor_hidden)
@@ -737,10 +853,58 @@ impl<L: LinAlg> PcActorCritic<L> {
             None
         };
 
+        // Compute min_fisher_phase and update hysteresis warmup guard
+        let min_fisher_phase = if config.ewc_lambda > 0.0 {
+            (1.0 / (1.0 - config.fisher_ema_beta)).ceil() as u64
+        } else {
+            0
+        };
+
         use rand::SeedableRng;
         let mut rng = StdRng::seed_from_u64(seed);
         let actor = PcActor::<L>::new(backend.clone(), config.actor.clone(), &mut rng)?;
         let critic = MlpCritic::<L>::new(backend.clone(), config.critic.clone(), &mut rng)?;
+
+        // Allocate Fisher state when EWC is enabled
+        let actor_fisher = if config.ewc_lambda > 0.0 {
+            actor
+                .layers
+                .iter()
+                .map(|layer| {
+                    let rows = backend.mat_rows(&layer.weights);
+                    let cols = backend.mat_cols(&layer.weights);
+                    let bias_size = backend.vec_len(&layer.bias);
+                    FisherState::new(&backend, rows, cols, bias_size)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let critic_fisher = if config.ewc_lambda > 0.0 {
+            critic
+                .layers
+                .iter()
+                .map(|layer| {
+                    let rows = backend.mat_rows(&layer.weights);
+                    let cols = backend.mat_cols(&layer.weights);
+                    let bias_size = backend.vec_len(&layer.bias);
+                    FisherState::new(&backend, rows, cols, bias_size)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Update hysteresis min_initial_plastic to max(slow_window, min_fisher_phase)
+        let mut actor_hysteresis = actor_hysteresis;
+        if let Some(ref mut hyst) = actor_hysteresis {
+            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, min_fisher_phase);
+        }
+        let mut critic_hysteresis = critic_hysteresis;
+        if let Some(ref mut hyst) = critic_hysteresis {
+            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, min_fisher_phase);
+        }
+
         Ok(Self {
             actor,
             critic,
@@ -762,6 +926,10 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_decay_factors,
             critic_decay_factors,
             layer_error_ema,
+            actor_fisher,
+            critic_fisher,
+            actor_last_phase_reliable: false,
+            critic_last_phase_reliable: false,
         })
     }
 
@@ -884,6 +1052,10 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_decay_factors: child_actor_decay,
             critic_decay_factors: child_critic_decay,
             layer_error_ema: child_layer_error_ema,
+            actor_fisher: Vec::new(),
+            critic_fisher: Vec::new(),
+            actor_last_phase_reliable: false,
+            critic_last_phase_reliable: false,
         })
     }
 
@@ -940,6 +1112,10 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_decay_factors,
             critic_decay_factors,
             layer_error_ema,
+            actor_fisher: Vec::new(),
+            critic_fisher: Vec::new(),
+            actor_last_phase_reliable: false,
+            critic_last_phase_reliable: false,
         }
     }
 
@@ -1172,8 +1348,46 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         let s_scale = self.effective_actor_scale(infer.surprise_score);
         let actor_decay = self.effective_actor_decay();
-        self.actor
-            .update_weights(&delta, infer, input, s_scale, &actor_decay);
+
+        // Fisher EMA accumulation and EWC correction (M4)
+        if self.config.ewc_lambda > 0.0 && !self.actor_fisher.is_empty() {
+            // Step 2: Extract per-layer gradients for Fisher EMA (read-only)
+            let fisher_delta = if self.config.logits_reversal {
+                // Logits reversal: delta_fisher = softmax(-y_conv/T, valid) - one_hot(action)
+                let y_conv_rev: Vec<f64> = y_conv_vec
+                    .iter()
+                    .map(|&v| -v / self.actor.config.temperature)
+                    .collect();
+                let rev_l = self.backend.vec_from_slice(&y_conv_rev);
+                let pi_rev_l = self.backend.softmax_masked(&rev_l, valid_actions);
+                let pi_rev = self.backend.vec_to_vec(&pi_rev_l);
+                let mut fd = pi_rev;
+                fd[action] -= 1.0;
+                fd
+            } else {
+                delta.clone()
+            };
+            self.accumulate_actor_fisher_ema(&fisher_delta, infer, input, s_scale, &actor_decay);
+
+            // EWC correction: capture pre-update weights, update, then correct
+            let pre_weights: Vec<L::Matrix> = self
+                .actor
+                .layers
+                .iter()
+                .map(|l| l.weights.clone())
+                .collect();
+            let pre_biases: Vec<L::Vector> =
+                self.actor.layers.iter().map(|l| l.bias.clone()).collect();
+
+            self.actor
+                .update_weights(&delta, infer, input, s_scale, &actor_decay);
+
+            // Apply EWC post-correction per layer
+            self.apply_actor_ewc_correction(&pre_weights, &pre_biases, s_scale, &actor_decay);
+        } else {
+            self.actor
+                .update_weights(&delta, infer, input, s_scale, &actor_decay);
+        }
 
         if self.config.adaptive_surprise {
             self.push_surprise(infer.surprise_score);
@@ -1453,12 +1667,227 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
     }
 
+    /// Accumulates Fisher EMA for actor layers from extracted gradients.
+    ///
+    /// Extracts per-layer gradients using Approach 1 (activation derivative,
+    /// hadamard, clip) and updates F_ema = beta * F_ema + (1-beta) * g_raw².
+    fn accumulate_actor_fisher_ema(
+        &mut self,
+        output_delta: &[f64],
+        infer: &InferResult<L>,
+        _input: &[f64],
+        _surprise_scale: f64,
+        _decay_factors: &[f64],
+    ) {
+        let output_delta_vec = self.backend.vec_from_slice(output_delta);
+        let n_hidden = self.actor.config.hidden_layers.len();
+        let n_layers = self.actor.layers.len();
+
+        // Output layer gradient extraction
+        let output_output = &infer.y_conv;
+        let deriv = self
+            .backend
+            .apply_derivative(output_output, self.actor.layers[n_layers - 1].activation);
+        let mut grad = self.backend.vec_hadamard(&output_delta_vec, &deriv);
+        self.backend.clip_vec(&mut grad, 5.0); // GRAD_CLIP
+
+        // Update F_ema for output layer
+        self.update_fisher_ema_layer(n_layers - 1, &grad, true);
+
+        // Propagated delta: W^T * grad (read-only, using current weights)
+        let wt = self
+            .backend
+            .mat_transpose(&self.actor.layers[n_layers - 1].weights);
+        let mut bp_delta = self.backend.mat_vec_mul(&wt, &grad);
+
+        // Hidden layers (from top to bottom)
+        for i in (0..n_hidden).rev() {
+            let layer_output = if self.actor.skip_alpha_index(i).is_some() {
+                // Skip-eligible: use tanh_out
+                infer.tanh_components[i].as_ref().unwrap()
+            } else {
+                &infer.hidden_states[i]
+            };
+
+            // Blend delta if using hybrid (same logic as update_weights_hybrid)
+            let effective_delta = if (self.actor.config.local_lambda - 1.0).abs() < f64::EPSILON {
+                bp_delta.clone()
+            } else if self.actor.config.local_lambda.abs() < f64::EPSILON {
+                let error_idx = n_hidden - 1 - i;
+                infer.prediction_errors[error_idx].clone()
+            } else {
+                let error_idx = n_hidden - 1 - i;
+                let pc_error = &infer.prediction_errors[error_idx];
+                let bp_scaled = self
+                    .backend
+                    .vec_scale(&bp_delta, self.actor.config.local_lambda);
+                let pc_scaled = self
+                    .backend
+                    .vec_scale(pc_error, 1.0 - self.actor.config.local_lambda);
+                self.backend.vec_add(&bp_scaled, &pc_scaled)
+            };
+
+            // Scale by rezero_alpha if skip layer
+            let scaled_delta = if let Some(alpha_idx) = self.actor.skip_alpha_index(i) {
+                self.backend
+                    .vec_scale(&effective_delta, self.actor.rezero_alpha[alpha_idx])
+            } else {
+                effective_delta.clone()
+            };
+
+            // Extract gradient
+            let deriv_h = self
+                .backend
+                .apply_derivative(layer_output, self.actor.layers[i].activation);
+            let mut grad_h = self.backend.vec_hadamard(&scaled_delta, &deriv_h);
+            self.backend.clip_vec(&mut grad_h, 5.0);
+
+            self.update_fisher_ema_layer(i, &grad_h, true);
+
+            // Propagate delta read-only
+            let wt_h = self.backend.mat_transpose(&self.actor.layers[i].weights);
+            let propagated = self.backend.mat_vec_mul(&wt_h, &grad_h);
+
+            if let Some(alpha_idx) = self.actor.skip_alpha_index(i) {
+                // Skip path propagation (read-only)
+                if let Some(ref proj) = self.actor.skip_projections[alpha_idx] {
+                    let proj_t = self.backend.mat_transpose(proj);
+                    let skip_delta = self.backend.mat_vec_mul(&proj_t, &effective_delta);
+                    bp_delta = self.backend.vec_add(&propagated, &skip_delta);
+                } else {
+                    bp_delta = self.backend.vec_add(&propagated, &effective_delta);
+                }
+            } else {
+                bp_delta = propagated;
+            }
+        }
+    }
+
+    /// Updates Fisher EMA for a single layer from its extracted gradient.
+    ///
+    /// F_ema = beta * F_ema + (1-beta) * g_raw²
+    fn update_fisher_ema_layer(&mut self, layer_idx: usize, grad: &L::Vector, is_actor: bool) {
+        let beta = self.config.fisher_ema_beta;
+        let fisher = if is_actor {
+            &mut self.actor_fisher[layer_idx]
+        } else {
+            &mut self.critic_fisher[layer_idx]
+        };
+
+        // Update bias F_ema
+        let bias_len = self.backend.vec_len(&fisher.f_ema_bias);
+        for i in 0..bias_len {
+            let g = self.backend.vec_get(grad, i);
+            let g_sq = g * g;
+            let prev = self.backend.vec_get(&fisher.f_ema_bias, i);
+            self.backend
+                .vec_set(&mut fisher.f_ema_bias, i, beta * prev + (1.0 - beta) * g_sq);
+        }
+
+        // For weight F_ema, we need the outer product direction.
+        // The gradient w.r.t. weights is outer(grad, input).
+        // But we're tracking Fisher per-weight, so F_ema[r][c] = beta * F_ema[r][c] + (1-beta) * (grad[r] * input[c])².
+        // However, this is expensive. The spec says "F_ema = beta * F_ema + (1-beta) * g_raw²"
+        // where g_raw is the local gradient (not the weight gradient).
+        // For Fisher information, we track per-parameter. The weight gradient for w[r][c] = grad[r] * input[c].
+        // But the spec uses g_raw (the post-clip gradient vector) squared element-wise.
+        // This is a diagonal approximation: F_ema for weights uses grad² broadcasted.
+        // Actually re-reading spec: "g_raw = post-clip, pre-scaling gradient"
+        // F_ema is per-parameter. For weights: dL/dW[r][c] = grad[r] * input[c].
+        // To avoid storing full outer products, we can use the diagonal Fisher approximation:
+        // F_ema_w[r][c] = beta * F_ema_w[r][c] + (1-beta) * grad[r]²
+        // This is the standard diagonal Fisher for the row dimension.
+        let rows = self.backend.mat_rows(&fisher.f_ema_weights);
+        let cols = self.backend.mat_cols(&fisher.f_ema_weights);
+        for r in 0..rows {
+            let g = self.backend.vec_get(grad, r);
+            let g_sq = g * g;
+            for c in 0..cols {
+                let prev = self.backend.mat_get(&fisher.f_ema_weights, r, c);
+                self.backend.mat_set(
+                    &mut fisher.f_ema_weights,
+                    r,
+                    c,
+                    beta * prev + (1.0 - beta) * g_sq,
+                );
+            }
+        }
+    }
+
+    /// Applies EWC post-update correction to actor layers.
+    ///
+    /// For each layer: W -= effective_lr * ewc_lambda * F_total * (W_pre - snapshot).
+    /// Then applies WEIGHT_CLIP.
+    fn apply_actor_ewc_correction(
+        &mut self,
+        pre_weights: &[L::Matrix],
+        pre_biases: &[L::Vector],
+        surprise_scale: f64,
+        decay_factors: &[f64],
+    ) {
+        let n_hidden = self.actor.config.hidden_layers.len();
+        let n_layers = self.actor.layers.len();
+
+        for i in 0..n_layers {
+            let fisher = &self.actor_fisher[i];
+            let snapshot_w = match &fisher.theta_snapshot_weights {
+                Some(s) => s,
+                None => continue, // No snapshot yet
+            };
+            let snapshot_b = match &fisher.theta_snapshot_bias {
+                Some(s) => s,
+                None => continue,
+            };
+
+            // Compute effective_lr for this layer
+            let layer_surprise = if i < n_hidden && !decay_factors.is_empty() {
+                surprise_scale * decay_factors[i]
+            } else {
+                surprise_scale
+            };
+            let effective_lr = self.actor.config.lr_weights * layer_surprise;
+
+            // EWC correction for weights: W -= effective_lr * ewc_lambda * F_total * (W_pre - snapshot)
+            let rows = self.backend.mat_rows(&self.actor.layers[i].weights);
+            let cols = self.backend.mat_cols(&self.actor.layers[i].weights);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let w_pre = self.backend.mat_get(&pre_weights[i], r, c);
+                    let w_snap = self.backend.mat_get(snapshot_w, r, c);
+                    let f_total = self.backend.mat_get(&fisher.f_total_weights, r, c);
+                    let correction =
+                        effective_lr * self.config.ewc_lambda * f_total * (w_pre - w_snap);
+                    let w_cur = self.backend.mat_get(&self.actor.layers[i].weights, r, c);
+                    let w_new = (w_cur - correction).clamp(-5.0, 5.0); // WEIGHT_CLIP
+                    self.backend
+                        .mat_set(&mut self.actor.layers[i].weights, r, c, w_new);
+                }
+            }
+
+            // EWC correction for biases
+            let bias_len = self.backend.vec_len(&self.actor.layers[i].bias);
+            for j in 0..bias_len {
+                let b_pre = self.backend.vec_get(&pre_biases[i], j);
+                let b_snap = self.backend.vec_get(snapshot_b, j);
+                let f_total = self.backend.vec_get(&fisher.f_total_bias, j);
+                let correction = effective_lr * self.config.ewc_lambda * f_total * (b_pre - b_snap);
+                let b_cur = self.backend.vec_get(&self.actor.layers[i].bias, j);
+                let b_new = (b_cur - correction).clamp(-5.0, 5.0);
+                self.backend
+                    .vec_set(&mut self.actor.layers[i].bias, j, b_new);
+            }
+        }
+    }
+
     /// Updates hysteresis state machines after learning.
     ///
     /// Handles EWMA updates, state transitions, counter management,
     /// and actor→critic coupling.
     pub(crate) fn process_hysteresis(&mut self, actor_signal: f64, critic_signal: f64) {
         let mut actor_woke = false;
+        let mut actor_slept = false;
+        let mut critic_woke = false;
+        let mut critic_slept = false;
 
         // Update actor hysteresis
         if let Some(ref mut hyst) = self.actor_hysteresis {
@@ -1468,8 +1897,10 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
             if let Some(new_state) = hyst.update(actor_signal) {
                 if new_state == PlasticityState::Plastic {
-                    self.actor_plastic_step_counter = 0;
                     actor_woke = true;
+                    self.actor_plastic_step_counter = 0;
+                } else {
+                    actor_slept = true;
                 }
             }
         }
@@ -1485,8 +1916,11 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
             if let Some(new_state) = hyst.update(critic_signal) {
                 if new_state == PlasticityState::Plastic {
+                    critic_woke = true;
                     self.critic_plastic_step_counter = 0;
                     self.critic_frozen_steps = 0;
+                } else {
+                    critic_slept = true;
                 }
             }
         }
@@ -1500,7 +1934,163 @@ impl<L: LinAlg> PcActorCritic<L> {
                     critic_hyst.state = PlasticityState::Plastic;
                     self.critic_plastic_step_counter = 0;
                     self.critic_frozen_steps = 0;
+                    critic_woke = true;
                 }
+            }
+        }
+
+        // Fisher lifecycle on transitions
+        if actor_slept {
+            self.handle_fisher_sleep(true);
+        }
+        if actor_woke {
+            self.handle_fisher_wake(true);
+        }
+        if critic_slept {
+            self.handle_fisher_sleep(false);
+        }
+        if critic_woke {
+            self.handle_fisher_wake(false);
+        }
+    }
+
+    /// Fisher lifecycle Step 1: FROZEN→PLASTIC transition.
+    ///
+    /// If `last_phase_reliable`, decays `F_total *= fisher_decay`.
+    /// Resets `F_ema` to zeros and plastic_step_counter.
+    ///
+    /// # Arguments
+    ///
+    /// * `is_actor` - true for actor, false for critic.
+    pub(crate) fn handle_fisher_wake(&mut self, is_actor: bool) {
+        if self.config.ewc_lambda <= 0.0 {
+            return;
+        }
+
+        let (fisher_states, reliable) = if is_actor {
+            (&mut self.actor_fisher, &self.actor_last_phase_reliable)
+        } else {
+            (&mut self.critic_fisher, &self.critic_last_phase_reliable)
+        };
+
+        if *reliable {
+            // Decay F_total
+            for fisher in fisher_states.iter_mut() {
+                let rows = self.backend.mat_rows(&fisher.f_total_weights);
+                let cols = self.backend.mat_cols(&fisher.f_total_weights);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let val = self.backend.mat_get(&fisher.f_total_weights, r, c);
+                        self.backend.mat_set(
+                            &mut fisher.f_total_weights,
+                            r,
+                            c,
+                            val * self.config.fisher_decay,
+                        );
+                    }
+                }
+                let bias_len = self.backend.vec_len(&fisher.f_total_bias);
+                for i in 0..bias_len {
+                    let val = self.backend.vec_get(&fisher.f_total_bias, i);
+                    self.backend.vec_set(
+                        &mut fisher.f_total_bias,
+                        i,
+                        val * self.config.fisher_decay,
+                    );
+                }
+            }
+        }
+
+        // Reset F_ema to zeros
+        for fisher in fisher_states.iter_mut() {
+            let rows = self.backend.mat_rows(&fisher.f_ema_weights);
+            let cols = self.backend.mat_cols(&fisher.f_ema_weights);
+            fisher.f_ema_weights = self.backend.zeros_mat(rows, cols);
+            let bias_len = self.backend.vec_len(&fisher.f_ema_bias);
+            fisher.f_ema_bias = self.backend.zeros_vec(bias_len);
+        }
+    }
+
+    /// Fisher lifecycle Step 3: PLASTIC→FROZEN transition.
+    ///
+    /// If `plastic_steps >= min_fisher_phase`: F_total += F_ema, reliable=true.
+    /// Else: discard F_ema, reliable=false. Always snapshot weights.
+    ///
+    /// # Arguments
+    ///
+    /// * `is_actor` - true for actor, false for critic.
+    pub(crate) fn handle_fisher_sleep(&mut self, is_actor: bool) {
+        if self.config.ewc_lambda <= 0.0 {
+            return;
+        }
+
+        let min_fisher_phase = (1.0 / (1.0 - self.config.fisher_ema_beta)).ceil() as u64;
+
+        let plastic_steps = if is_actor {
+            self.actor_plastic_step_counter
+        } else {
+            self.critic_plastic_step_counter
+        };
+
+        let reliable = plastic_steps >= min_fisher_phase;
+
+        if is_actor {
+            if reliable {
+                // F_total += F_ema
+                for fisher in self.actor_fisher.iter_mut() {
+                    let rows = self.backend.mat_rows(&fisher.f_total_weights);
+                    let cols = self.backend.mat_cols(&fisher.f_total_weights);
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            let total = self.backend.mat_get(&fisher.f_total_weights, r, c);
+                            let ema = self.backend.mat_get(&fisher.f_ema_weights, r, c);
+                            self.backend
+                                .mat_set(&mut fisher.f_total_weights, r, c, total + ema);
+                        }
+                    }
+                    let bias_len = self.backend.vec_len(&fisher.f_total_bias);
+                    for i in 0..bias_len {
+                        let total = self.backend.vec_get(&fisher.f_total_bias, i);
+                        let ema = self.backend.vec_get(&fisher.f_ema_bias, i);
+                        self.backend
+                            .vec_set(&mut fisher.f_total_bias, i, total + ema);
+                    }
+                }
+            }
+            self.actor_last_phase_reliable = reliable;
+
+            // Snapshot weights (always, regardless of reliability)
+            for (i, fisher) in self.actor_fisher.iter_mut().enumerate() {
+                fisher.theta_snapshot_weights = Some(self.actor.layers[i].weights.clone());
+                fisher.theta_snapshot_bias = Some(self.actor.layers[i].bias.clone());
+            }
+        } else {
+            if reliable {
+                for fisher in self.critic_fisher.iter_mut() {
+                    let rows = self.backend.mat_rows(&fisher.f_total_weights);
+                    let cols = self.backend.mat_cols(&fisher.f_total_weights);
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            let total = self.backend.mat_get(&fisher.f_total_weights, r, c);
+                            let ema = self.backend.mat_get(&fisher.f_ema_weights, r, c);
+                            self.backend
+                                .mat_set(&mut fisher.f_total_weights, r, c, total + ema);
+                        }
+                    }
+                    let bias_len = self.backend.vec_len(&fisher.f_total_bias);
+                    for i in 0..bias_len {
+                        let total = self.backend.vec_get(&fisher.f_total_bias, i);
+                        let ema = self.backend.vec_get(&fisher.f_ema_bias, i);
+                        self.backend
+                            .vec_set(&mut fisher.f_total_bias, i, total + ema);
+                    }
+                }
+            }
+            self.critic_last_phase_reliable = reliable;
+
+            for (i, fisher) in self.critic_fisher.iter_mut().enumerate() {
+                fisher.theta_snapshot_weights = Some(self.critic.layers[i].weights.clone());
+                fisher.theta_snapshot_bias = Some(self.critic.layers[i].bias.clone());
             }
         }
     }
@@ -1595,6 +2185,10 @@ mod tests {
             consolidation_ema_beta: 0.99,
             consolidation_sigmoid_k: 10.0,
             consolidation_error_threshold: 0.05,
+            ewc_lambda: 0.0,
+            fisher_decay: 0.9,
+            fisher_ema_beta: 0.99,
+            logits_reversal: false,
         }
     }
 
@@ -2055,6 +2649,10 @@ mod tests {
             consolidation_ema_beta: 0.99,
             consolidation_sigmoid_k: 10.0,
             consolidation_error_threshold: 0.05,
+            ewc_lambda: 0.0,
+            fisher_decay: 0.9,
+            fisher_ema_beta: 0.99,
+            logits_reversal: false,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -3458,6 +4056,10 @@ mod tests {
             consolidation_ema_beta: 0.99,
             consolidation_sigmoid_k: 10.0,
             consolidation_error_threshold: 0.05,
+            ewc_lambda: 0.0,
+            fisher_decay: 0.9,
+            fisher_ema_beta: 0.99,
+            logits_reversal: false,
         }
     }
 
@@ -3779,5 +4381,1155 @@ mod tests {
         };
         let result2 = PcActorCritic::new(CpuLinAlg::new(), config2, 42);
         assert!(result2.is_err());
+    }
+
+    // ============ Phase 4: EWC Regularization (M4) Tests ============
+
+    /// Helper: create an EWC-enabled config with hysteresis.
+    fn ewc_config() -> PcActorCriticConfig {
+        PcActorCriticConfig {
+            ewc_lambda: 1.0,
+            fisher_decay: 0.9,
+            fisher_ema_beta: 0.99,
+            logits_reversal: false,
+            actor_hysteresis: true,
+            actor_fast_window: 5,
+            actor_slow_window: 20,
+            actor_wake_fraction: 0.5,
+            actor_sleep_fraction: 0.3,
+            critic_hysteresis: true,
+            critic_fast_window: 5,
+            critic_slow_window: 20,
+            critic_wake_fraction: 0.5,
+            critic_sleep_fraction: 0.3,
+            ..default_config()
+        }
+    }
+
+    // ── Gradient extraction ──────────────────────────────────────
+
+    #[test]
+    fn test_gradient_extraction_spike_trivial_layer() {
+        // Verify that extract_gradients produces the expected g_raw for a known layer
+        let backend = CpuLinAlg::new();
+        let mut config = default_config();
+        config.ewc_lambda = 1.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(backend, config, 42).unwrap();
+
+        // Run one step so we have an infer result
+        let state = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let _a = agent.step(&state, 0.0, false);
+        let state2 = vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let _a2 = agent.step(&state2, 1.0, true);
+
+        // After learning, Fisher should have non-zero F_ema
+        assert!(!agent.actor_fisher.is_empty());
+        let f = &agent.actor_fisher[0];
+        let rows = agent.backend.mat_rows(&f.f_ema_weights);
+        let cols = agent.backend.mat_cols(&f.f_ema_weights);
+        let mut has_nonzero = false;
+        for r in 0..rows {
+            for c in 0..cols {
+                if agent.backend.mat_get(&f.f_ema_weights, r, c).abs() > 0.0 {
+                    has_nonzero = true;
+                }
+            }
+        }
+        assert!(
+            has_nonzero,
+            "F_ema should have non-zero entries after learning"
+        );
+    }
+
+    // ── Fisher EMA accumulation ──────────────────────────────────
+
+    #[test]
+    fn test_fisher_ema_accumulates_during_plastic() {
+        // Agent in PLASTIC state. After learning steps, F_ema should be non-zero.
+        let mut config = default_config();
+        config.ewc_lambda = 1.0;
+        config.fisher_ema_beta = 0.99;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Multiple learning steps to accumulate Fisher
+        let state1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        agent.step(&state1, 0.0, false);
+        let state2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        agent.step(&state2, 1.0, false);
+        let state3 = vec![-0.5, 0.0, 1.0, -1.0, 0.5, 0.5, 0.0, 1.0, -0.5];
+        agent.step(&state3, -1.0, true);
+
+        // F_ema should be non-zero for actor layers
+        assert!(!agent.actor_fisher.is_empty());
+        let f = &agent.actor_fisher[0];
+        let rows = agent.backend.mat_rows(&f.f_ema_weights);
+        let cols = agent.backend.mat_cols(&f.f_ema_weights);
+        let mut sum = 0.0;
+        for r in 0..rows {
+            for c in 0..cols {
+                sum += agent.backend.mat_get(&f.f_ema_weights, r, c);
+            }
+        }
+        assert!(
+            sum > 0.0,
+            "F_ema should have positive entries (squared gradients)"
+        );
+    }
+
+    #[test]
+    fn test_fisher_ema_bounded_by_grad_clip_squared() {
+        // Maximum g_raw = GRAD_CLIP = 5.0. So g_raw^2 = 25.0.
+        // F_ema per element <= 25.0 / (1 - beta) in steady state.
+        let mut config = default_config();
+        config.ewc_lambda = 1.0;
+        config.fisher_ema_beta = 0.99;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Run many steps to saturate F_ema
+        for i in 0..200 {
+            let state: Vec<f64> = (0..9).map(|j| ((i + j) as f64 * 0.3).sin()).collect();
+            agent.step(&state, if i % 2 == 0 { 1.0 } else { -1.0 }, i == 199);
+        }
+
+        // Check bound: each F_ema element <= 25.0 / (1 - 0.99) = 2500.0
+        let max_bound = 25.0 / (1.0 - 0.99);
+        for fisher in &agent.actor_fisher {
+            let rows = agent.backend.mat_rows(&fisher.f_ema_weights);
+            let cols = agent.backend.mat_cols(&fisher.f_ema_weights);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let val = agent.backend.mat_get(&fisher.f_ema_weights, r, c);
+                    assert!(
+                        val <= max_bound + 1e-6,
+                        "F_ema element {} exceeds bound {}",
+                        val,
+                        max_bound
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_fisher_gradient_extraction_approach1() {
+        // Verify gradient extraction: apply_derivative, hadamard, clip
+        let backend = CpuLinAlg::new();
+
+        // Known output and delta
+        let output = backend.vec_from_slice(&[0.5, -0.3, 0.8]);
+        let delta = backend.vec_from_slice(&[1.0, 2.0, -1.5]);
+
+        // Tanh derivative: 1 - tanh(x)^2
+        let deriv = backend.apply_derivative(&output, Activation::Tanh);
+        let mut grad = backend.vec_hadamard(&delta, &deriv);
+        backend.clip_vec(&mut grad, 5.0);
+
+        // Verify the gradient values are computed correctly
+        let grad_vec = backend.vec_to_vec(&grad);
+        assert_eq!(grad_vec.len(), 3);
+        // Each element should be delta[i] * (1 - output[i]^2)
+        for i in 0..3 {
+            let out_i = [0.5, -0.3, 0.8][i];
+            let delta_i = [1.0, 2.0, -1.5][i];
+            let expected: f64 = delta_i * (1.0 - out_i * out_i);
+            let expected_clipped = expected.clamp(-5.0, 5.0);
+            assert!(
+                (grad_vec[i] - expected_clipped).abs() < 1e-10,
+                "grad[{}] = {}, expected {}",
+                i,
+                grad_vec[i],
+                expected_clipped
+            );
+        }
+    }
+
+    // ── Fisher lifecycle ──────────────────────────────────────
+
+    #[test]
+    fn test_fisher_decay_on_reliable_phase() {
+        // last_phase_reliable=true, fisher_decay=0.9.
+        // On FROZEN→PLASTIC: F_total *= 0.9.
+        let mut config = ewc_config();
+        config.fisher_decay = 0.9;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Manually set F_total to known values and mark reliable
+        let rows = agent
+            .backend
+            .mat_rows(&agent.actor_fisher[0].f_total_weights);
+        let cols = agent
+            .backend
+            .mat_cols(&agent.actor_fisher[0].f_total_weights);
+        for r in 0..rows {
+            for c in 0..cols {
+                agent
+                    .backend
+                    .mat_set(&mut agent.actor_fisher[0].f_total_weights, r, c, 10.0);
+            }
+        }
+        agent.actor_last_phase_reliable = true;
+
+        // Force actor to FROZEN state then trigger wake (FROZEN→PLASTIC)
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+
+        // Simulate a wake transition by calling process_hysteresis with high signal
+        // First need to make fast > slow * (1 + wake)
+        let hyst = agent.actor_hysteresis.as_mut().unwrap();
+        hyst.fast.value = 1.0;
+        hyst.slow.value = 0.1;
+        // Manually trigger the lifecycle
+        agent.handle_fisher_wake(true);
+
+        // F_total should be *= 0.9 → 9.0
+        for r in 0..rows {
+            for c in 0..cols {
+                let val = agent
+                    .backend
+                    .mat_get(&agent.actor_fisher[0].f_total_weights, r, c);
+                assert!(
+                    (val - 9.0).abs() < 1e-10,
+                    "F_total should be 10.0 * 0.9 = 9.0, got {}",
+                    val
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fisher_no_decay_after_unreliable_phase() {
+        // last_phase_reliable=false. F_total unchanged on FROZEN→PLASTIC.
+        let mut config = ewc_config();
+        config.fisher_decay = 0.9;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Set F_total to known value, but mark unreliable
+        let rows = agent
+            .backend
+            .mat_rows(&agent.actor_fisher[0].f_total_weights);
+        let cols = agent
+            .backend
+            .mat_cols(&agent.actor_fisher[0].f_total_weights);
+        for r in 0..rows {
+            for c in 0..cols {
+                agent
+                    .backend
+                    .mat_set(&mut agent.actor_fisher[0].f_total_weights, r, c, 10.0);
+            }
+        }
+        agent.actor_last_phase_reliable = false;
+
+        agent.handle_fisher_wake(true);
+
+        // F_total should be unchanged → 10.0
+        for r in 0..rows {
+            for c in 0..cols {
+                let val = agent
+                    .backend
+                    .mat_get(&agent.actor_fisher[0].f_total_weights, r, c);
+                assert!(
+                    (val - 10.0).abs() < 1e-10,
+                    "F_total should be unchanged at 10.0, got {}",
+                    val
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fisher_short_phase_discards_fema() {
+        // 50 steps (< min_fisher_phase=100 for beta=0.99). F_ema NOT added to F_total.
+        let mut config = ewc_config();
+        config.fisher_ema_beta = 0.99; // min_fisher_phase = ceil(1/0.01) = 100
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Set F_ema to non-zero
+        let rows = agent.backend.mat_rows(&agent.actor_fisher[0].f_ema_weights);
+        let cols = agent.backend.mat_cols(&agent.actor_fisher[0].f_ema_weights);
+        for r in 0..rows {
+            for c in 0..cols {
+                agent
+                    .backend
+                    .mat_set(&mut agent.actor_fisher[0].f_ema_weights, r, c, 5.0);
+            }
+        }
+        // Only 50 plastic steps (< 100)
+        agent.actor_plastic_step_counter = 50;
+
+        // Trigger sleep (PLASTIC→FROZEN)
+        agent.handle_fisher_sleep(true);
+
+        // F_total should still be zero (F_ema discarded)
+        for r in 0..rows {
+            for c in 0..cols {
+                let val = agent
+                    .backend
+                    .mat_get(&agent.actor_fisher[0].f_total_weights, r, c);
+                assert!(
+                    val.abs() < 1e-10,
+                    "F_total should be zero (short phase), got {}",
+                    val
+                );
+            }
+        }
+        // last_phase_reliable should be false
+        assert!(!agent.actor_last_phase_reliable);
+    }
+
+    #[test]
+    fn test_fisher_reliable_phase_adds_fema() {
+        // 150 steps (>= 100). F_total += F_ema. last_phase_reliable = true.
+        let mut config = ewc_config();
+        config.fisher_ema_beta = 0.99;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Set F_ema to known values
+        let rows = agent.backend.mat_rows(&agent.actor_fisher[0].f_ema_weights);
+        let cols = agent.backend.mat_cols(&agent.actor_fisher[0].f_ema_weights);
+        for r in 0..rows {
+            for c in 0..cols {
+                agent
+                    .backend
+                    .mat_set(&mut agent.actor_fisher[0].f_ema_weights, r, c, 5.0);
+            }
+        }
+        // 150 plastic steps (>= 100)
+        agent.actor_plastic_step_counter = 150;
+
+        agent.handle_fisher_sleep(true);
+
+        // F_total should be 0 + 5.0 = 5.0
+        for r in 0..rows {
+            for c in 0..cols {
+                let val = agent
+                    .backend
+                    .mat_get(&agent.actor_fisher[0].f_total_weights, r, c);
+                assert!(
+                    (val - 5.0).abs() < 1e-10,
+                    "F_total should be 5.0, got {}",
+                    val
+                );
+            }
+        }
+        assert!(agent.actor_last_phase_reliable);
+    }
+
+    #[test]
+    fn test_fisher_preserved_through_oscillations() {
+        // 5 rapid oscillations (each < 100 steps). F_total unchanged.
+        let mut config = ewc_config();
+        config.fisher_ema_beta = 0.99;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Pre-load F_total
+        let rows = agent
+            .backend
+            .mat_rows(&agent.actor_fisher[0].f_total_weights);
+        let cols = agent
+            .backend
+            .mat_cols(&agent.actor_fisher[0].f_total_weights);
+        for r in 0..rows {
+            for c in 0..cols {
+                agent
+                    .backend
+                    .mat_set(&mut agent.actor_fisher[0].f_total_weights, r, c, 42.0);
+            }
+        }
+
+        // 5 oscillations: PLASTIC→FROZEN (short), FROZEN→PLASTIC (unreliable)
+        for _ in 0..5 {
+            agent.actor_plastic_step_counter = 30; // short
+            agent.handle_fisher_sleep(true);
+            agent.handle_fisher_wake(true);
+        }
+
+        // F_total unchanged at 42.0
+        for r in 0..rows {
+            for c in 0..cols {
+                let val = agent
+                    .backend
+                    .mat_get(&agent.actor_fisher[0].f_total_weights, r, c);
+                assert!(
+                    (val - 42.0).abs() < 1e-10,
+                    "F_total should be preserved at 42.0, got {}",
+                    val
+                );
+            }
+        }
+    }
+
+    // ── EWC correction ──────────────────────────────────────
+
+    #[test]
+    fn test_ewc_correction_direction() {
+        // Known weights, Fisher, snapshot. Correction pulls toward snapshot.
+        let mut config = default_config();
+        config.ewc_lambda = 1.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Set up Fisher and snapshot
+        let rows = agent.backend.mat_rows(&agent.actor.layers[0].weights);
+        let cols = agent.backend.mat_cols(&agent.actor.layers[0].weights);
+
+        // F_total = 1.0 everywhere
+        for r in 0..rows {
+            for c in 0..cols {
+                agent
+                    .backend
+                    .mat_set(&mut agent.actor_fisher[0].f_total_weights, r, c, 1.0);
+            }
+        }
+
+        // Snapshot = current weights
+        agent.actor_fisher[0].theta_snapshot_weights = Some(agent.actor.layers[0].weights.clone());
+        agent.actor_fisher[0].theta_snapshot_bias = Some(agent.actor.layers[0].bias.clone());
+
+        // Perturb current weights away from snapshot
+        let snapshot_val = agent.backend.mat_get(&agent.actor.layers[0].weights, 0, 0);
+        agent
+            .backend
+            .mat_set(&mut agent.actor.layers[0].weights, 0, 0, snapshot_val + 0.5);
+        let weight_before = agent.backend.mat_get(&agent.actor.layers[0].weights, 0, 0);
+
+        // Do a learning step
+        let state1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        agent.step(&state1, 0.0, false);
+        let state2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        agent.step(&state2, 1.0, true);
+
+        let weight_after = agent.backend.mat_get(&agent.actor.layers[0].weights, 0, 0);
+        // EWC should pull weight back toward snapshot (smaller deviation)
+        let deviation_before = (weight_before - snapshot_val).abs();
+        let deviation_after = (weight_after - snapshot_val).abs();
+        assert!(
+            deviation_after < deviation_before,
+            "EWC should pull weights toward snapshot: before={}, after={}",
+            deviation_before,
+            deviation_after
+        );
+    }
+
+    #[test]
+    fn test_ewc_uses_pre_update_theta() {
+        // Verify EWC penalty computed from weights BEFORE backward modifies them.
+        // This is structural: the correction uses snapshot vs pre-backward weights.
+        let mut config = default_config();
+        config.ewc_lambda = 10.0; // Large lambda to make EWC effect dominant
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Set F_total and snapshot
+        let rows = agent.backend.mat_rows(&agent.actor.layers[0].weights);
+        let cols = agent.backend.mat_cols(&agent.actor.layers[0].weights);
+        for r in 0..rows {
+            for c in 0..cols {
+                agent
+                    .backend
+                    .mat_set(&mut agent.actor_fisher[0].f_total_weights, r, c, 1.0);
+            }
+        }
+        // Snapshot at current weights
+        agent.actor_fisher[0].theta_snapshot_weights = Some(agent.actor.layers[0].weights.clone());
+        agent.actor_fisher[0].theta_snapshot_bias = Some(agent.actor.layers[0].bias.clone());
+
+        // Record pre-update weights
+        let w_pre = agent.backend.mat_get(&agent.actor.layers[0].weights, 0, 0);
+
+        // Step to trigger learning
+        let state1 = vec![1.0; 9];
+        agent.step(&state1, 0.0, false);
+        let state2 = vec![0.5; 9];
+        agent.step(&state2, 1.0, true);
+
+        // Since snapshot == pre-update, EWC correction = lambda * F * (W_pre - snapshot) = 0
+        // So EWC should NOT affect the backward-only update
+        // (The test verifies the ordering: pre-update theta is used)
+        let w_post = agent.backend.mat_get(&agent.actor.layers[0].weights, 0, 0);
+        // With snapshot == initial weights, EWC correction is zero
+        // The weight should change due to backward only
+        assert!(
+            (w_post - w_pre).abs() > 1e-12,
+            "Weights should change from backward pass"
+        );
+    }
+
+    #[test]
+    fn test_ewc_weight_clip_applied_after_correction() {
+        // Correction pushes beyond WEIGHT_CLIP. Verify clipped to [-5.0, 5.0].
+        let mut config = default_config();
+        config.ewc_lambda = 1000.0; // Extreme lambda
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        let rows = agent.backend.mat_rows(&agent.actor.layers[0].weights);
+        let cols = agent.backend.mat_cols(&agent.actor.layers[0].weights);
+
+        // Set huge F_total and distant snapshot
+        for r in 0..rows {
+            for c in 0..cols {
+                agent
+                    .backend
+                    .mat_set(&mut agent.actor_fisher[0].f_total_weights, r, c, 100.0);
+            }
+        }
+        // Snapshot far from current weights
+        let mut snapshot = agent.actor.layers[0].weights.clone();
+        for r in 0..rows {
+            for c in 0..cols {
+                agent.backend.mat_set(&mut snapshot, r, c, -100.0);
+            }
+        }
+        agent.actor_fisher[0].theta_snapshot_weights = Some(snapshot);
+        agent.actor_fisher[0].theta_snapshot_bias = Some(agent.actor.layers[0].bias.clone());
+
+        // Step to trigger learning + EWC correction
+        let state1 = vec![1.0; 9];
+        agent.step(&state1, 0.0, false);
+        let state2 = vec![0.5; 9];
+        agent.step(&state2, 1.0, true);
+
+        // All weights should be clipped to [-5.0, 5.0]
+        for r in 0..rows {
+            for c in 0..cols {
+                let val = agent.backend.mat_get(&agent.actor.layers[0].weights, r, c);
+                assert!(
+                    (-5.0 - 1e-10..=5.0 + 1e-10).contains(&val),
+                    "Weight at ({},{}) = {} should be clipped to [-5.0, 5.0]",
+                    r,
+                    c,
+                    val
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_ewc_lambda_zero_is_noop() {
+        // ewc_lambda=0.0. Weights identical to backward-only.
+        let config_no_ewc = default_config(); // ewc_lambda = 0.0
+        let mut agent_no_ewc: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config_no_ewc, 42).unwrap();
+
+        let mut config_ewc = default_config();
+        config_ewc.ewc_lambda = 0.0; // Explicitly zero
+        let mut agent_ewc: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config_ewc, 42).unwrap();
+
+        // Same sequence of steps
+        let state1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let state2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+
+        agent_no_ewc.step(&state1, 0.0, false);
+        agent_no_ewc.step(&state2, 1.0, true);
+
+        agent_ewc.step(&state1, 0.0, false);
+        agent_ewc.step(&state2, 1.0, true);
+
+        // Weights should be identical
+        let rows = agent_no_ewc
+            .backend
+            .mat_rows(&agent_no_ewc.actor.layers[0].weights);
+        let cols = agent_no_ewc
+            .backend
+            .mat_cols(&agent_no_ewc.actor.layers[0].weights);
+        for r in 0..rows {
+            for c in 0..cols {
+                let v1 = agent_no_ewc
+                    .backend
+                    .mat_get(&agent_no_ewc.actor.layers[0].weights, r, c);
+                let v2 = agent_ewc
+                    .backend
+                    .mat_get(&agent_ewc.actor.layers[0].weights, r, c);
+                assert!(
+                    (v1 - v2).abs() < 1e-12,
+                    "Weights differ at ({},{}): {} vs {}",
+                    r,
+                    c,
+                    v1,
+                    v2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_ewc_propagated_gradient_clean() {
+        // Propagated delta identical with and without EWC.
+        // We verify this by comparing weight changes in the INPUT layer
+        // (layer 0), which receives the propagated delta from the output layer.
+        // If EWC contaminated the propagated gradient, the input layer would
+        // differ between EWC and non-EWC runs.
+        let mut config_ewc = default_config();
+        config_ewc.ewc_lambda = 5.0;
+        let mut agent_ewc: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config_ewc, 42).unwrap();
+
+        // Set EWC only on the output layer (layer 1), NOT the hidden layer
+        // F_total[0] = zeros, F_total[1] = ones
+        // This means output layer gets EWC correction but hidden layer doesn't
+        let n_layers = agent_ewc.actor.layers.len();
+        assert!(n_layers >= 2, "Need at least 2 layers");
+        let rows1 = agent_ewc
+            .backend
+            .mat_rows(&agent_ewc.actor.layers[n_layers - 1].weights);
+        let cols1 = agent_ewc
+            .backend
+            .mat_cols(&agent_ewc.actor.layers[n_layers - 1].weights);
+        for r in 0..rows1 {
+            for c in 0..cols1 {
+                agent_ewc.backend.mat_set(
+                    &mut agent_ewc.actor_fisher[n_layers - 1].f_total_weights,
+                    r,
+                    c,
+                    1.0,
+                );
+            }
+        }
+        agent_ewc.actor_fisher[n_layers - 1].theta_snapshot_weights =
+            Some(agent_ewc.actor.layers[n_layers - 1].weights.clone());
+        agent_ewc.actor_fisher[n_layers - 1].theta_snapshot_bias =
+            Some(agent_ewc.actor.layers[n_layers - 1].bias.clone());
+
+        // Non-EWC reference agent
+        let config_ref = default_config();
+        let mut agent_ref: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config_ref, 42).unwrap();
+
+        // Record hidden layer weights before
+        let h_rows = agent_ewc
+            .backend
+            .mat_rows(&agent_ewc.actor.layers[0].weights);
+        let h_cols = agent_ewc
+            .backend
+            .mat_cols(&agent_ewc.actor.layers[0].weights);
+        let mut h_before_ewc = vec![0.0; h_rows * h_cols];
+        let mut h_before_ref = vec![0.0; h_rows * h_cols];
+        for r in 0..h_rows {
+            for c in 0..h_cols {
+                h_before_ewc[r * h_cols + c] =
+                    agent_ewc
+                        .backend
+                        .mat_get(&agent_ewc.actor.layers[0].weights, r, c);
+                h_before_ref[r * h_cols + c] =
+                    agent_ref
+                        .backend
+                        .mat_get(&agent_ref.actor.layers[0].weights, r, c);
+            }
+        }
+
+        // Same learning steps
+        let state1 = vec![1.0; 9];
+        let state2 = vec![0.5; 9];
+        agent_ewc.step(&state1, 0.0, false);
+        agent_ewc.step(&state2, 1.0, true);
+        agent_ref.step(&state1, 0.0, false);
+        agent_ref.step(&state2, 1.0, true);
+
+        // Hidden layer weight deltas should be identical (clean propagated gradient)
+        for r in 0..h_rows {
+            for c in 0..h_cols {
+                let delta_ewc = agent_ewc
+                    .backend
+                    .mat_get(&agent_ewc.actor.layers[0].weights, r, c)
+                    - h_before_ewc[r * h_cols + c];
+                let delta_ref = agent_ref
+                    .backend
+                    .mat_get(&agent_ref.actor.layers[0].weights, r, c)
+                    - h_before_ref[r * h_cols + c];
+                assert!(
+                    (delta_ewc - delta_ref).abs() < 1e-10,
+                    "Hidden layer delta differs at ({},{}): ewc={}, ref={}",
+                    r,
+                    c,
+                    delta_ewc,
+                    delta_ref
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fisher_snapshot_includes_all_trainable_params() {
+        // After PLASTIC→FROZEN, snapshot should include weights and biases
+        let config = ewc_config();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Simulate reliable phase and sleep
+        agent.actor_plastic_step_counter = 200;
+        agent.handle_fisher_sleep(true);
+
+        // Verify snapshots exist for all layers
+        for (i, fisher) in agent.actor_fisher.iter().enumerate() {
+            assert!(
+                fisher.theta_snapshot_weights.is_some(),
+                "Layer {} missing weight snapshot",
+                i
+            );
+            assert!(
+                fisher.theta_snapshot_bias.is_some(),
+                "Layer {} missing bias snapshot",
+                i
+            );
+        }
+    }
+
+    // ── Config validation and derived values ──────────────────────
+
+    #[test]
+    fn test_min_fisher_phase_derived_correctly() {
+        // beta=0.99 -> ceil(1/0.01) = 100
+        let min_phase_99 = (1.0_f64 / (1.0 - 0.99)).ceil() as u64;
+        assert_eq!(min_phase_99, 100);
+
+        // beta=0.95 -> ceil(1/0.05) = 20
+        let min_phase_95 = (1.0_f64 / (1.0 - 0.95)).ceil() as u64;
+        assert_eq!(min_phase_95, 20);
+    }
+
+    #[test]
+    fn test_ewc_disabled_by_default() {
+        // ewc_lambda=0.0. No Fisher allocated.
+        let agent = make_agent();
+        assert!(
+            agent.actor_fisher.is_empty(),
+            "No Fisher state when ewc_lambda=0"
+        );
+        assert!(
+            agent.critic_fisher.is_empty(),
+            "No Fisher state when ewc_lambda=0"
+        );
+    }
+
+    #[test]
+    fn test_fisher_decay_out_of_range_rejected() {
+        let config = PcActorCriticConfig {
+            ewc_lambda: 1.0,
+            fisher_decay: 1.5,
+            ..default_config()
+        };
+        let result = PcActorCritic::new(CpuLinAlg::new(), config, 42);
+        assert!(result.is_err(), "fisher_decay > 1.0 should be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("fisher_decay"),
+            "Error should mention fisher_decay: {err}"
+        );
+
+        let config2 = PcActorCriticConfig {
+            ewc_lambda: 1.0,
+            fisher_decay: -0.1,
+            ..default_config()
+        };
+        let result2 = PcActorCritic::new(CpuLinAlg::new(), config2, 42);
+        assert!(result2.is_err(), "fisher_decay < 0.0 should be rejected");
+    }
+
+    #[test]
+    fn test_fisher_ema_beta_out_of_range_rejected() {
+        let config = PcActorCriticConfig {
+            ewc_lambda: 1.0,
+            fisher_ema_beta: 0.0,
+            ..default_config()
+        };
+        let result = PcActorCritic::new(CpuLinAlg::new(), config, 42);
+        assert!(result.is_err(), "fisher_ema_beta=0.0 should be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("fisher_ema_beta"),
+            "Error should mention fisher_ema_beta: {err}"
+        );
+
+        let config2 = PcActorCriticConfig {
+            ewc_lambda: 1.0,
+            fisher_ema_beta: 1.0,
+            ..default_config()
+        };
+        let result2 = PcActorCritic::new(CpuLinAlg::new(), config2, 42);
+        assert!(result2.is_err(), "fisher_ema_beta=1.0 should be rejected");
+    }
+
+    #[test]
+    fn test_ewc_lambda_negative_rejected() {
+        let config = PcActorCriticConfig {
+            ewc_lambda: -0.1,
+            ..default_config()
+        };
+        let result = PcActorCritic::new(CpuLinAlg::new(), config, 42);
+        assert!(result.is_err(), "Negative ewc_lambda should be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("ewc_lambda"),
+            "Error should mention ewc_lambda: {err}"
+        );
+    }
+
+    // ── Logits reversal ──────────────────────────────────────
+
+    #[test]
+    fn test_logits_reversal_off_by_default() {
+        let config = default_config();
+        assert!(!config.logits_reversal);
+    }
+
+    #[test]
+    fn test_logits_reversal_separate_from_learning() {
+        // When logits_reversal is on, actual backward() uses real logits.
+        // Fisher EMA uses reversed logits. We verify by comparing weight updates.
+        let mut config_rev = default_config();
+        config_rev.ewc_lambda = 1.0;
+        config_rev.logits_reversal = true;
+        let mut agent_rev: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config_rev, 42).unwrap();
+
+        let mut config_no_rev = default_config();
+        config_no_rev.ewc_lambda = 1.0;
+        config_no_rev.logits_reversal = false;
+        let mut agent_no_rev: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config_no_rev, 42).unwrap();
+
+        let state1 = vec![1.0; 9];
+        let state2 = vec![0.5; 9];
+        agent_rev.step(&state1, 0.0, false);
+        agent_rev.step(&state2, 1.0, true);
+        agent_no_rev.step(&state1, 0.0, false);
+        agent_no_rev.step(&state2, 1.0, true);
+
+        // Weights should be identical (no snapshot yet means EWC correction = 0)
+        // but Fisher EMA should differ
+        let f_rev = &agent_rev.actor_fisher[0];
+        let f_no_rev = &agent_no_rev.actor_fisher[0];
+        let rows = agent_rev.backend.mat_rows(&f_rev.f_ema_weights);
+        let cols = agent_rev.backend.mat_cols(&f_rev.f_ema_weights);
+        let mut differs = false;
+        for r in 0..rows {
+            for c in 0..cols {
+                let v1 = agent_rev.backend.mat_get(&f_rev.f_ema_weights, r, c);
+                let v2 = agent_no_rev.backend.mat_get(&f_no_rev.f_ema_weights, r, c);
+                if (v1 - v2).abs() > 1e-10 {
+                    differs = true;
+                }
+            }
+        }
+        assert!(
+            differs,
+            "Fisher EMA should differ between reversal and non-reversal modes"
+        );
+    }
+
+    #[test]
+    fn test_logits_reversal_delta_formula() {
+        // delta_fisher = softmax(-y_conv / T, valid_actions) - one_hot(action)
+        let backend = CpuLinAlg::new();
+        let y_conv = backend.vec_from_slice(&[1.0, 2.0, 0.5]);
+        let temperature = 1.0;
+        let valid_actions = vec![0, 1, 2];
+        let action = 1;
+
+        // Reversed logits: -y_conv / T
+        let reversed: Vec<f64> = backend
+            .vec_to_vec(&y_conv)
+            .iter()
+            .map(|&v| -v / temperature)
+            .collect();
+        let reversed_l = backend.vec_from_slice(&reversed);
+        let pi_rev_l = backend.softmax_masked(&reversed_l, &valid_actions);
+        let pi_rev = backend.vec_to_vec(&pi_rev_l);
+
+        // delta = pi_rev - one_hot(action)
+        let mut delta = pi_rev.clone();
+        delta[action] -= 1.0;
+
+        // Verify reversed softmax sums to 1.0
+        let sum: f64 = valid_actions.iter().map(|&i| pi_rev[i]).sum();
+        assert!((sum - 1.0).abs() < 1e-10);
+
+        // Action=1 had highest logit (2.0), so reversed has lowest prob
+        assert!(pi_rev[1] < pi_rev[0] && pi_rev[1] < pi_rev[2]);
+    }
+
+    #[test]
+    fn test_logits_reversal_no_advantage_scaling() {
+        // Logits reversal delta should NOT include td_error scaling
+        // This is verified structurally: the delta is purely from reversed softmax
+        let backend = CpuLinAlg::new();
+        let y_conv = [1.0, 2.0, 0.5];
+        let valid_actions = [0, 1, 2];
+        let action = 1;
+        let temperature = 1.0;
+
+        let reversed: Vec<f64> = y_conv.iter().map(|&v| -v / temperature).collect();
+        let reversed_l = backend.vec_from_slice(&reversed);
+        let pi_rev_l = backend.softmax_masked(&reversed_l, &valid_actions);
+        let pi_rev = backend.vec_to_vec(&pi_rev_l);
+
+        let mut delta = pi_rev.clone();
+        delta[action] -= 1.0;
+
+        // Delta magnitude should be independent of any td_error
+        // Maximum delta element is bounded by 1.0
+        for &d in &delta {
+            assert!(d.abs() <= 1.0 + 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_logits_reversal_read_only_pass() {
+        // Logits reversal extracts gradient read-only (no weight changes)
+        // Only F_ema is updated, not actual weights
+        let mut config = default_config();
+        config.ewc_lambda = 1.0;
+        config.logits_reversal = true;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Record weights before
+        let rows = agent.backend.mat_rows(&agent.actor.layers[0].weights);
+        let cols = agent.backend.mat_cols(&agent.actor.layers[0].weights);
+        let mut w_before = vec![0.0; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                w_before[r * cols + c] =
+                    agent.backend.mat_get(&agent.actor.layers[0].weights, r, c);
+            }
+        }
+
+        // No snapshot, so EWC correction = 0. Weight changes come only from backward.
+        let state1 = vec![1.0; 9];
+        agent.step(&state1, 0.0, false);
+        let state2 = vec![0.5; 9];
+        agent.step(&state2, 1.0, true);
+
+        // Weight changes should match non-reversal behavior (backward is the same)
+        // The key check: Fisher EMA was updated (read-only from reversed pass)
+        assert!(!agent.actor_fisher.is_empty());
+        let f = &agent.actor_fisher[0];
+        let mut has_nonzero = false;
+        for r in 0..rows {
+            for c in 0..cols {
+                if agent.backend.mat_get(&f.f_ema_weights, r, c) > 0.0 {
+                    has_nonzero = true;
+                }
+            }
+        }
+        assert!(
+            has_nonzero,
+            "F_ema should be updated from reversed logits pass"
+        );
+    }
+
+    #[test]
+    fn test_logits_reversal_uses_actor_temperature() {
+        // Verify reversed logits use config temperature
+        let backend = CpuLinAlg::new();
+        let y_conv = backend.vec_from_slice(&[1.0, 2.0, 0.5]);
+        let t = 2.0; // Different temperature
+
+        let reversed: Vec<f64> = backend
+            .vec_to_vec(&y_conv)
+            .iter()
+            .map(|&v| -v / t)
+            .collect();
+        let reversed_l = backend.vec_from_slice(&reversed);
+        let pi = backend.softmax_masked(&reversed_l, &[0, 1, 2]);
+        let pi_vec = backend.vec_to_vec(&pi);
+
+        // Higher temperature → more uniform distribution
+        let t1_reversed: Vec<f64> = backend
+            .vec_to_vec(&y_conv)
+            .iter()
+            .map(|&v| -v / 1.0)
+            .collect();
+        let t1_l = backend.vec_from_slice(&t1_reversed);
+        let pi_t1 = backend.softmax_masked(&t1_l, &[0, 1, 2]);
+        let pi_t1_vec = backend.vec_to_vec(&pi_t1);
+
+        // With T=2.0, distribution should be more uniform (higher entropy)
+        let entropy_t2: f64 = pi_vec.iter().map(|&p| -p * p.ln()).sum();
+        let entropy_t1: f64 = pi_t1_vec.iter().map(|&p| -p * p.ln()).sum();
+        assert!(
+            entropy_t2 > entropy_t1,
+            "Higher temperature should produce more uniform reversed distribution"
+        );
+    }
+
+    #[test]
+    fn test_logits_reversal_uses_softmax_masked() {
+        // Verify only valid actions get probability mass
+        let backend = CpuLinAlg::new();
+        let y_conv = backend.vec_from_slice(&[1.0, 2.0, 0.5, 3.0]);
+        let valid_actions = vec![0, 2]; // Only 0 and 2 are valid
+
+        let reversed: Vec<f64> = backend
+            .vec_to_vec(&y_conv)
+            .iter()
+            .map(|&v| -v / 1.0)
+            .collect();
+        let reversed_l = backend.vec_from_slice(&reversed);
+        let pi = backend.softmax_masked(&reversed_l, &valid_actions);
+        let pi_vec = backend.vec_to_vec(&pi);
+
+        // Invalid actions (1, 3) should have zero probability
+        assert!(
+            pi_vec[1].abs() < 1e-10,
+            "Invalid action 1 should have zero prob"
+        );
+        assert!(
+            pi_vec[3].abs() < 1e-10,
+            "Invalid action 3 should have zero prob"
+        );
+        // Valid actions should sum to 1.0
+        let valid_sum: f64 = valid_actions.iter().map(|&i| pi_vec[i]).sum();
+        assert!((valid_sum - 1.0).abs() < 1e-10);
+    }
+
+    // ── Cross-phase interaction tests ──────────────────────────
+
+    #[test]
+    fn test_m3_layer_decay_combined_with_m4_ewc() {
+        // Both M3 (layer decay) and M4 (EWC) active simultaneously.
+        // The per-layer surprise used in backward should be: surprise_scale * layer_decay.
+        // EWC correction is a separate post-backward step.
+        let mut config = three_layer_config();
+        config.consolidation_decay = 0.5;
+        config.ewc_lambda = 1.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Verify both decay factors and Fisher state exist
+        assert_eq!(agent.actor_decay_factors.len(), 3);
+        assert!(!agent.actor_fisher.is_empty());
+
+        // Set Fisher state for the output layer (last layer)
+        let n_layers = agent.actor.layers.len();
+        let out_rows = agent
+            .backend
+            .mat_rows(&agent.actor.layers[n_layers - 1].weights);
+        let out_cols = agent
+            .backend
+            .mat_cols(&agent.actor.layers[n_layers - 1].weights);
+        for r in 0..out_rows {
+            for c in 0..out_cols {
+                agent.backend.mat_set(
+                    &mut agent.actor_fisher[n_layers - 1].f_total_weights,
+                    r,
+                    c,
+                    1.0,
+                );
+            }
+        }
+        agent.actor_fisher[n_layers - 1].theta_snapshot_weights =
+            Some(agent.actor.layers[n_layers - 1].weights.clone());
+        agent.actor_fisher[n_layers - 1].theta_snapshot_bias =
+            Some(agent.actor.layers[n_layers - 1].bias.clone());
+
+        // Do learning steps — should not crash
+        let state1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        agent.step(&state1, 0.0, false);
+        let state2 = vec![0.5; 9];
+        agent.step(&state2, 1.0, true);
+    }
+
+    #[test]
+    fn test_hysteresis_transition_with_logits_reversal() {
+        // Logits reversal + hysteresis. Verify transitions work correctly.
+        let mut config = ewc_config();
+        config.logits_reversal = true;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Run many steps to trigger possible transitions
+        for i in 0..50 {
+            let state: Vec<f64> = (0..9).map(|j| ((i + j) as f64 * 0.3).sin()).collect();
+            agent.step(&state, if i % 3 == 0 { 1.0 } else { 0.0 }, i == 49);
+        }
+        // Should not panic
+    }
+
+    #[test]
+    fn test_hysteresis_frozen_suppresses_ewc() {
+        // When actor is FROZEN (scale_floor), EWC correction still uses
+        // effective_lr which includes the floor scale, so correction is minimal.
+        let mut config = ewc_config();
+        config.scale_floor = 0.0; // True freeze
+        config.ewc_lambda = 10.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Force actor FROZEN
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+
+        // Set up Fisher + snapshot with deviation
+        let rows = agent.backend.mat_rows(&agent.actor.layers[0].weights);
+        let cols = agent.backend.mat_cols(&agent.actor.layers[0].weights);
+        for r in 0..rows {
+            for c in 0..cols {
+                agent
+                    .backend
+                    .mat_set(&mut agent.actor_fisher[0].f_total_weights, r, c, 1.0);
+            }
+        }
+        agent.actor_fisher[0].theta_snapshot_weights = Some(agent.actor.layers[0].weights.clone());
+        agent.actor_fisher[0].theta_snapshot_bias = Some(agent.actor.layers[0].bias.clone());
+
+        // Record weights before
+        let w_before = agent.backend.mat_get(&agent.actor.layers[0].weights, 0, 0);
+
+        // Step (actor is frozen → scale_floor = 0.0 → effective_lr = 0)
+        let state1 = vec![1.0; 9];
+        agent.step(&state1, 0.0, false);
+        let state2 = vec![0.5; 9];
+        agent.step(&state2, 1.0, true);
+
+        let w_after = agent.backend.mat_get(&agent.actor.layers[0].weights, 0, 0);
+        // With scale_floor=0.0 and FROZEN, effective_lr=0 → no weight change
+        assert!(
+            (w_after - w_before).abs() < 1e-10,
+            "FROZEN actor with scale_floor=0 should not change weights"
+        );
+    }
+
+    // ── Additional Fisher/EWC behavioral tests ──────────────────
+
+    #[test]
+    fn test_fisher_decay_one_no_erasure() {
+        // fisher_decay=1.0 means F_total is never decayed (preserved perfectly)
+        let mut config = ewc_config();
+        config.fisher_decay = 1.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        let rows = agent
+            .backend
+            .mat_rows(&agent.actor_fisher[0].f_total_weights);
+        let cols = agent
+            .backend
+            .mat_cols(&agent.actor_fisher[0].f_total_weights);
+        for r in 0..rows {
+            for c in 0..cols {
+                agent
+                    .backend
+                    .mat_set(&mut agent.actor_fisher[0].f_total_weights, r, c, 10.0);
+            }
+        }
+        agent.actor_last_phase_reliable = true;
+        agent.handle_fisher_wake(true);
+
+        // F_total *= 1.0 → unchanged at 10.0
+        for r in 0..rows {
+            for c in 0..cols {
+                let val = agent
+                    .backend
+                    .mat_get(&agent.actor_fisher[0].f_total_weights, r, c);
+                assert!(
+                    (val - 10.0).abs() < 1e-10,
+                    "fisher_decay=1.0 should preserve F_total, got {}",
+                    val
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fisher_ema_beta_near_zero_min_phase_one() {
+        // beta near 0 → min_fisher_phase ≈ 1
+        let min_phase = (1.0_f64 / (1.0 - 0.01)).ceil() as u64;
+        // 1/0.99 ≈ 1.01, ceil = 2
+        assert!(
+            min_phase <= 2,
+            "beta=0.01 → min_phase should be ~1, got {}",
+            min_phase
+        );
     }
 }

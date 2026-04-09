@@ -309,6 +309,10 @@ mod tests {
             consolidation_ema_beta: 0.99,
             consolidation_sigmoid_k: 10.0,
             consolidation_error_threshold: 0.05,
+            ewc_lambda: 0.0,
+            fisher_decay: 0.9,
+            fisher_ema_beta: 0.99,
+            logits_reversal: false,
         }
     }
 
