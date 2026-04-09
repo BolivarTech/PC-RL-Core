@@ -52,6 +52,16 @@ fn default_entropy_coeff() -> f64 {
     0.01
 }
 
+/// Default scale floor for surprise-to-learning-rate mapping.
+fn default_scale_floor() -> f64 {
+    0.0
+}
+
+/// Default scale ceiling for surprise-to-learning-rate mapping.
+fn default_scale_ceil() -> f64 {
+    2.0
+}
+
 /// Configuration for the integrated PC Actor-Critic agent.
 ///
 /// # Examples
@@ -87,6 +97,8 @@ fn default_entropy_coeff() -> f64 {
 ///     adaptive_surprise: true,
 ///     surprise_buffer_size: 400,
 ///     entropy_coeff: 0.01,
+///     scale_floor: 0.0,
+///     scale_ceil: 2.0,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +126,18 @@ pub struct PcActorCriticConfig {
     /// Entropy regularization coefficient. Default: 0.01.
     #[serde(default = "default_entropy_coeff")]
     pub entropy_coeff: f64,
+    /// Floor of the surprise-to-learning-rate scale mapping.
+    /// When surprise is at or below the low threshold, `surprise_scale()`
+    /// returns this value. Set to 0.0 for true freeze behavior.
+    /// Default: 0.0.
+    #[serde(default = "default_scale_floor")]
+    pub scale_floor: f64,
+    /// Ceiling of the surprise-to-learning-rate scale mapping.
+    /// When surprise is at or above the high threshold, `surprise_scale()`
+    /// returns this value. Must be strictly greater than `scale_floor`.
+    /// Default: 2.0.
+    #[serde(default = "default_scale_ceil")]
+    pub scale_ceil: f64,
 }
 
 /// A single step in a trajectory collected during an episode.
@@ -265,6 +289,18 @@ impl<L: LinAlg> PcActorCritic<L> {
             return Err(PcError::ConfigValidation(format!(
                 "surprise_buffer_size must be >= 10 when adaptive_surprise is enabled, got {}",
                 config.surprise_buffer_size
+            )));
+        }
+        if config.scale_floor < 0.0 {
+            return Err(PcError::ConfigValidation(format!(
+                "scale_floor must be >= 0.0, got {}",
+                config.scale_floor
+            )));
+        }
+        if config.scale_ceil <= config.scale_floor {
+            return Err(PcError::ConfigValidation(format!(
+                "scale_ceil must be > scale_floor, got scale_ceil={} scale_floor={}",
+                config.scale_ceil, config.scale_floor
             )));
         }
 
@@ -664,13 +700,13 @@ impl<L: LinAlg> PcActorCritic<L> {
         };
 
         if surprise <= low {
-            0.1
+            self.config.scale_floor
         } else if surprise >= high {
-            2.0
+            self.config.scale_ceil
         } else {
             // Linear interpolation
             let t = (surprise - low) / (high - low);
-            0.1 + t * (2.0 - 0.1)
+            self.config.scale_floor + t * (self.config.scale_ceil - self.config.scale_floor)
         }
     }
 
@@ -900,6 +936,8 @@ mod tests {
             adaptive_surprise: false,
             surprise_buffer_size: 100,
             entropy_coeff: 0.01,
+            scale_floor: 0.1, // v2.0.0 compat: existing tests expect 0.1 floor
+            scale_ceil: 2.0,
         }
     }
 
@@ -1340,6 +1378,8 @@ mod tests {
             adaptive_surprise: false,
             surprise_buffer_size: 100,
             entropy_coeff: 0.0, // no entropy to isolate gradient effect
+            scale_floor: 0.1,
+            scale_ceil: 2.0,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -2081,6 +2121,113 @@ mod tests {
         assert!(
             result.is_err(),
             "step_masked with empty valid_actions should panic"
+        );
+    }
+
+    // ── configurable scale range tests (Phase 1 — M1) ───────────
+
+    /// Helper: create config with custom scale floor/ceil.
+    fn config_with_scale(floor: f64, ceil: f64) -> PcActorCriticConfig {
+        let mut cfg = default_config();
+        cfg.scale_floor = floor;
+        cfg.scale_ceil = ceil;
+        cfg
+    }
+
+    #[test]
+    fn test_scale_floor_zero_produces_zero_scale() {
+        let cfg = config_with_scale(0.0, 2.0);
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let scale = agent.surprise_scale(0.01); // below low=0.02
+        assert!(
+            scale.abs() < 1e-12,
+            "Expected 0.0 for surprise below low with floor=0.0, got {scale}"
+        );
+    }
+
+    #[test]
+    fn test_scale_floor_0_1_ceil_2_0_matches_v2() {
+        let cfg = config_with_scale(0.1, 2.0);
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        // Below low threshold -> floor
+        let s_low = agent.surprise_scale(0.01);
+        assert!(
+            (s_low - 0.1).abs() < 1e-12,
+            "Expected 0.1 below low, got {s_low}"
+        );
+        // Above high threshold -> ceil
+        let s_high = agent.surprise_scale(0.20);
+        assert!(
+            (s_high - 2.0).abs() < 1e-12,
+            "Expected 2.0 above high, got {s_high}"
+        );
+        // Midpoint -> in range
+        let midpoint = (0.02 + 0.15) / 2.0;
+        let s_mid = agent.surprise_scale(midpoint);
+        assert!(
+            s_mid > 0.1 && s_mid < 2.0,
+            "Expected midpoint in (0.1, 2.0), got {s_mid}"
+        );
+    }
+
+    #[test]
+    fn test_scale_ceil_custom_value() {
+        let cfg = config_with_scale(0.0, 3.0);
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let scale = agent.surprise_scale(0.20); // above high=0.15
+        assert!(
+            (scale - 3.0).abs() < 1e-12,
+            "Expected 3.0 above high with ceil=3.0, got {scale}"
+        );
+    }
+
+    #[test]
+    fn test_scale_interpolation_midpoint() {
+        let cfg = config_with_scale(0.0, 2.0);
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let midpoint = (0.02 + 0.15) / 2.0;
+        let scale = agent.surprise_scale(midpoint);
+        // t = 0.5, expected = 0.0 + 0.5 * (2.0 - 0.0) = 1.0
+        assert!(
+            (scale - 1.0).abs() < 1e-12,
+            "Expected 1.0 at midpoint with floor=0.0/ceil=2.0, got {scale}"
+        );
+    }
+
+    #[test]
+    fn test_scale_floor_negative_rejected() {
+        let cfg = config_with_scale(-0.1, 2.0);
+        let result: Result<PcActorCritic, _> = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_err(), "Negative scale_floor should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("scale_floor"),
+            "Error should mention scale_floor: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_scale_ceil_less_than_floor_rejected() {
+        let cfg = config_with_scale(2.0, 1.0);
+        let result: Result<PcActorCritic, _> = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            result.is_err(),
+            "scale_ceil < scale_floor should be rejected"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("scale_ceil"),
+            "Error should mention scale_ceil: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_scale_floor_equals_ceil_degenerate() {
+        let cfg = config_with_scale(1.0, 1.0);
+        let result: Result<PcActorCritic, _> = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            result.is_err(),
+            "scale_floor == scale_ceil should be rejected (ceil must be > floor)"
         );
     }
 }
