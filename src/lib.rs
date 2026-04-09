@@ -39,7 +39,10 @@ pub use matrix::{
 };
 pub use mlp_critic::{MlpCritic, MlpCriticConfig, MlpCriticWeights};
 pub use pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
-pub use pc_actor_critic::{ActivationCache, PcActorCritic, PcActorCriticConfig, TrajectoryStep};
+pub use pc_actor_critic::{
+    ActivationCache, EwmaTracker, PcActorCritic, PcActorCriticConfig, PlasticityState,
+    TrajectoryStep,
+};
 pub use serializer::{
     checkpoint_filename, load_agent, load_agent_generic, save_agent, save_checkpoint,
     AgentMetadata, PcActorWeights, SaveFile, TrainingMetrics,
