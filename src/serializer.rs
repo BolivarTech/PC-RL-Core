@@ -1051,4 +1051,61 @@ mod tests {
 
         let _ = fs::remove_file(&path);
     }
+
+    /// MAGI finding #4: v2.0.0 fixture must load with fully inert CL state.
+    /// Load → verify to_cl_state() is None → step() → save → reload → verify
+    /// round-trip preserves weights and CL stays inert.
+    #[test]
+    fn test_v2_fixture_roundtrip_inert_cl_state() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        // Load the v2.0.0 (pre-CL) fixture
+        let (mut loaded_agent, _) =
+            load_agent("tests/fixtures/v1_model.json", CpuLinAlg::new()).unwrap();
+
+        // CL state must be None (all defaults — no Fisher, no hysteresis, no EMA)
+        assert!(
+            loaded_agent.to_cl_state().is_none(),
+            "v2.0.0 fixture must have no CL state (all defaults)"
+        );
+
+        // step() on a legacy agent should work with zero CL overhead
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let _a1 = loaded_agent.step(&s1, 0.0, false);
+        let _a2 = loaded_agent.step(&s2, 1.0, true);
+
+        // After step, CL state should still be None (no CL features enabled)
+        assert!(
+            loaded_agent.to_cl_state().is_none(),
+            "step() on default-config agent must not create CL state"
+        );
+
+        // Save, reload, verify round-trip fidelity
+        let rt_path = temp_path("test_v2_roundtrip.json");
+        save_agent(&loaded_agent, &rt_path, 100, None).unwrap();
+        let (reloaded, _) = load_agent(&rt_path, CpuLinAlg::new()).unwrap();
+
+        // Round-tripped agent must also have no CL state
+        assert!(
+            reloaded.to_cl_state().is_none(),
+            "Round-tripped v2.0.0 agent must still have no CL state"
+        );
+
+        // Verify actor weights survived the round-trip (f64 JSON roundtrip tolerance)
+        for (i, (a, b)) in loaded_agent.actor.layers[0]
+            .weights
+            .data
+            .iter()
+            .zip(reloaded.actor.layers[0].weights.data.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-14,
+                "Actor weight[{i}] drift after round-trip: {a} vs {b}"
+            );
+        }
+
+        let _ = fs::remove_file(&rt_path);
+    }
 }
