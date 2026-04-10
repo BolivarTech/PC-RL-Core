@@ -883,6 +883,12 @@ impl<L: LinAlg> PcActorCritic<L> {
             };
         let td_error = target - v_s;
 
+        // Guard: if td_error is non-finite (e.g. NaN reward), skip all updates
+        // to prevent silent corruption of weights, Fisher, and buffers.
+        if !td_error.is_finite() {
+            return 0.0;
+        }
+
         // Update critic with per-layer consolidation decay
         let critic_scale = self.critic_surprise_scale(td_error.abs());
         let loss = self.critic.update_with_decay(
@@ -1182,7 +1188,11 @@ impl<L: LinAlg> PcActorCritic<L> {
     }
 
     /// Pushes a surprise score into the adaptive buffer (circular).
+    /// Non-finite values are silently dropped to prevent buffer corruption.
     fn push_surprise(&mut self, surprise: f64) {
+        if !surprise.is_finite() {
+            return;
+        }
         if self.surprise_buffer.len() >= self.config.surprise_buffer_size {
             self.surprise_buffer.pop_front();
         }
@@ -1190,7 +1200,11 @@ impl<L: LinAlg> PcActorCritic<L> {
     }
 
     /// Pushes a |TD error| into the critic adaptive buffer (circular).
+    /// Non-finite values are silently dropped to prevent buffer corruption.
     fn push_td_error(&mut self, td_error: f64) {
+        if !td_error.is_finite() {
+            return;
+        }
         if self.td_error_buffer.len() >= self.config.surprise_buffer_size {
             self.td_error_buffer.pop_front();
         }
@@ -5502,9 +5516,63 @@ mod tests {
             agent.layer_error_ema
         );
 
-        // All values must be finite
+        // All values must be finite and reflect actual prediction errors (not just noise)
         for (i, &v) in agent.layer_error_ema.iter().enumerate() {
             assert!(v.is_finite(), "layer_error_ema[{i}] must be finite: {v}");
+            assert!(
+                v > 1e-6,
+                "layer_error_ema[{i}] must reflect actual prediction errors (> 1e-6), got {v}"
+            );
+        }
+    }
+
+    /// MAGI v3 W1 (Caspar): NaN reward must not corrupt weights.
+    /// td_error computed from NaN reward is NaN — learn_continuous must
+    /// short-circuit before updating weights, critic, or buffers.
+    #[test]
+    fn test_nan_reward_does_not_corrupt_weights() {
+        let mut agent: PcActorCritic = make_agent();
+
+        // Train normally first to get non-trivial weights
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for _ in 0..5 {
+            agent.step(&s1, 1.0, false);
+            agent.step(&s2, -1.0, true);
+        }
+
+        // Capture weights before NaN
+        let actor_weights_before: Vec<f64> = agent.actor.layers[0].weights.data.clone();
+        let critic_weights_before: Vec<f64> = agent.critic.layers[0].weights.data.clone();
+
+        // Feed NaN reward
+        agent.step(&s1, 0.0, false); // first call stores state, no learning
+        agent.step(&s2, f64::NAN, false); // second call triggers learn_continuous with NaN reward
+
+        // Weights must be unchanged (td_error guard skips the entire update)
+        assert_eq!(
+            agent.actor.layers[0].weights.data, actor_weights_before,
+            "Actor weights must be unchanged after NaN reward"
+        );
+        assert_eq!(
+            agent.critic.layers[0].weights.data, critic_weights_before,
+            "Critic weights must be unchanged after NaN reward"
+        );
+
+        // Surprise buffer must not contain NaN
+        for (i, &s) in agent.surprise_buffer.iter().enumerate() {
+            assert!(
+                s.is_finite(),
+                "surprise_buffer[{i}] became non-finite after NaN reward: {s}"
+            );
+        }
+
+        // TD error buffer must not contain NaN
+        for (i, &t) in agent.td_error_buffer.iter().enumerate() {
+            assert!(
+                t.is_finite(),
+                "td_error_buffer[{i}] became non-finite after NaN reward: {t}"
+            );
         }
     }
 }
