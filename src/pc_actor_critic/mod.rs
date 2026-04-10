@@ -106,6 +106,34 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
 }
 
 impl<L: LinAlg> PcActorCritic<L> {
+    /// Precomputes per-hidden-layer decay factors for actor and critic (M3a),
+    /// plus per-layer error EMA initialization for adaptive consolidation (M3b).
+    ///
+    /// Returns `(actor_decay_factors, critic_decay_factors, layer_error_ema)`.
+    fn compute_decay_factors(config: &PcActorCriticConfig) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let n_ah = config.actor.hidden_layers.len();
+        let actor_decay_factors: Vec<f64> = (0..n_ah)
+            .map(|i| config.consolidation_decay.powi((n_ah - 1 - i) as i32))
+            .collect();
+
+        let n_ch = config.critic.hidden_layers.len();
+        let critic_decay_factors: Vec<f64> = (0..n_ch)
+            .map(|i| {
+                config
+                    .critic_consolidation_decay
+                    .powi((n_ch - 1 - i) as i32)
+            })
+            .collect();
+
+        let layer_error_ema = if config.adaptive_consolidation {
+            vec![0.0; n_ah]
+        } else {
+            Vec::new()
+        };
+
+        (actor_decay_factors, critic_decay_factors, layer_error_ema)
+    }
+
     /// Creates a new PC Actor-Critic agent.
     ///
     /// # Arguments
@@ -232,30 +260,8 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
         }
 
-        // Precompute layer decay factors (M3a)
-        let n_actor_hidden = config.actor.hidden_layers.len();
-        let actor_decay_factors: Vec<f64> = (0..n_actor_hidden)
-            .map(|i| {
-                config
-                    .consolidation_decay
-                    .powi((n_actor_hidden - 1 - i) as i32)
-            })
-            .collect();
-        let n_critic_hidden = config.critic.hidden_layers.len();
-        let critic_decay_factors: Vec<f64> = (0..n_critic_hidden)
-            .map(|i| {
-                config
-                    .critic_consolidation_decay
-                    .powi((n_critic_hidden - 1 - i) as i32)
-            })
-            .collect();
-
-        // Per-layer error EMA for adaptive consolidation (M3b)
-        let layer_error_ema = if config.adaptive_consolidation {
-            vec![0.0; n_actor_hidden]
-        } else {
-            Vec::new()
-        };
+        let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
+            Self::compute_decay_factors(&config);
 
         // Build hysteresis state machines when enabled
         let actor_hysteresis = if config.actor_hysteresis {
@@ -443,24 +449,8 @@ impl<L: LinAlg> PcActorCritic<L> {
             &mut rng,
         )?;
 
-        // Precompute crossover child decay factors
-        let n_ah = child_config.actor.hidden_layers.len();
-        let child_actor_decay: Vec<f64> = (0..n_ah)
-            .map(|i| child_config.consolidation_decay.powi((n_ah - 1 - i) as i32))
-            .collect();
-        let n_ch = child_config.critic.hidden_layers.len();
-        let child_critic_decay: Vec<f64> = (0..n_ch)
-            .map(|i| {
-                child_config
-                    .critic_consolidation_decay
-                    .powi((n_ch - 1 - i) as i32)
-            })
-            .collect();
-        let child_layer_error_ema = if child_config.adaptive_consolidation {
-            vec![0.0; n_ah]
-        } else {
-            Vec::new()
-        };
+        let (child_actor_decay, child_critic_decay, child_layer_error_ema) =
+            Self::compute_decay_factors(&child_config);
 
         Ok(Self {
             actor,
@@ -505,23 +495,8 @@ impl<L: LinAlg> PcActorCritic<L> {
         rng: StdRng,
         backend: L,
     ) -> Self {
-        let n_ah = config.actor.hidden_layers.len();
-        let actor_decay_factors: Vec<f64> = (0..n_ah)
-            .map(|i| config.consolidation_decay.powi((n_ah - 1 - i) as i32))
-            .collect();
-        let n_ch = config.critic.hidden_layers.len();
-        let critic_decay_factors: Vec<f64> = (0..n_ch)
-            .map(|i| {
-                config
-                    .critic_consolidation_decay
-                    .powi((n_ch - 1 - i) as i32)
-            })
-            .collect();
-        let layer_error_ema = if config.adaptive_consolidation {
-            vec![0.0; n_ah]
-        } else {
-            Vec::new()
-        };
+        let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
+            Self::compute_decay_factors(&config);
         Self {
             actor,
             critic,
@@ -5099,5 +5074,42 @@ mod tests {
         let agent = make_agent();
         let cl = agent.to_cl_state();
         assert!(cl.is_none(), "default agent has no CL state to serialize");
+    }
+
+    #[test]
+    fn test_compute_decay_factors_matches_manual() {
+        let mut cfg = default_config();
+        cfg.consolidation_decay = 0.5;
+        cfg.critic_consolidation_decay = 0.8;
+        cfg.adaptive_consolidation = true;
+        cfg.consolidation_ema_beta = 0.99;
+        cfg.consolidation_sigmoid_k = 10.0;
+        cfg.consolidation_error_threshold = 0.05;
+        cfg.actor = PcActorConfig {
+            hidden_layers: vec![
+                LayerDef {
+                    size: 10,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 10,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 10,
+                    activation: Activation::Tanh,
+                },
+            ],
+            ..cfg.actor
+        };
+        let (actor_decay, critic_decay, error_ema) =
+            PcActorCritic::<CpuLinAlg>::compute_decay_factors(&cfg);
+        assert_eq!(actor_decay.len(), 3);
+        assert!((actor_decay[0] - 0.25).abs() < f64::EPSILON);
+        assert!((actor_decay[1] - 0.5).abs() < f64::EPSILON);
+        assert!((actor_decay[2] - 1.0).abs() < f64::EPSILON);
+        assert_eq!(critic_decay.len(), 1);
+        assert_eq!(error_ema.len(), 3);
+        assert!(error_ema.iter().all(|&v| v == 0.0));
     }
 }
