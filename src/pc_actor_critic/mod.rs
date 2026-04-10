@@ -961,6 +961,22 @@ impl<L: LinAlg> PcActorCritic<L> {
                 .update_weights(&delta, infer, input, s_scale, &actor_decay);
         }
 
+        // Update per-layer prediction error EMA for adaptive consolidation (M3b)
+        if self.config.adaptive_consolidation && !self.layer_error_ema.is_empty() {
+            let beta = self.config.consolidation_ema_beta;
+            for (i, ema) in self.layer_error_ema.iter_mut().enumerate() {
+                if i < infer.prediction_errors.len() {
+                    let error_vec = &infer.prediction_errors[i];
+                    let rms = {
+                        let v = self.backend.vec_to_vec(error_vec);
+                        let sum_sq: f64 = v.iter().map(|&x| x * x).sum();
+                        (sum_sq / v.len().max(1) as f64).sqrt()
+                    };
+                    *ema = beta * *ema + (1.0 - beta) * rms;
+                }
+            }
+        }
+
         if self.config.adaptive_surprise {
             self.push_surprise(infer.surprise_score);
         }
@@ -5444,6 +5460,51 @@ mod tests {
                     "After zero input: actor layer {li} weight {wi} is not finite: {w}"
                 );
             }
+        }
+    }
+
+    /// MAGI v2 W1: layer_error_ema must be updated during learn_continuous()
+    /// when adaptive_consolidation is enabled. Without the update, the EMA
+    /// stays at 0.0 forever and the sigmoid produces a constant decay factor.
+    #[test]
+    fn test_m3b_layer_error_ema_updates_during_learning() {
+        let mut cfg = default_config();
+        cfg.adaptive_consolidation = true;
+        cfg.consolidation_ema_beta = 0.99;
+        cfg.consolidation_sigmoid_k = 10.0;
+        cfg.consolidation_error_threshold = 0.05;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // layer_error_ema should start at 0.0
+        assert!(
+            agent.layer_error_ema.iter().all(|&v| v == 0.0),
+            "layer_error_ema should start at 0.0"
+        );
+
+        // Train with diverse states to generate non-zero prediction errors
+        let states: Vec<Vec<f64>> = (0..20)
+            .map(|i| {
+                (0..9)
+                    .map(|j| ((i * 7 + j * 13) % 100) as f64 / 50.0 - 1.0)
+                    .collect()
+            })
+            .collect();
+        for pair in states.chunks(2) {
+            agent.step(&pair[0], 0.5, false);
+            agent.step(&pair[1], -0.5, true);
+        }
+
+        // After learning, layer_error_ema must have been updated (non-zero)
+        let any_nonzero = agent.layer_error_ema.iter().any(|&v| v > 0.0);
+        assert!(
+            any_nonzero,
+            "layer_error_ema must be updated during learning, got {:?}",
+            agent.layer_error_ema
+        );
+
+        // All values must be finite
+        for (i, &v) in agent.layer_error_ema.iter().enumerate() {
+            assert!(v.is_finite(), "layer_error_ema[{i}] must be finite: {v}");
         }
     }
 }
