@@ -2342,12 +2342,6 @@ mod tests {
     // ── Phase 4 Cycle 4.1: ActivationCache construction and recording ──
 
     #[test]
-    fn test_activation_cache_new_creates_empty() {
-        let cache: ActivationCache = ActivationCache::new(3);
-        assert_eq!(cache.batch_size(), 0);
-    }
-
-    #[test]
     fn test_activation_cache_record_increments_batch_size() {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];

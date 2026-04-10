@@ -139,3 +139,14 @@ pub(crate) fn cache_to_matrices<L: LinAlg>(
 
     matrices
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_activation_cache_new_creates_empty() {
+        let cache: ActivationCache = ActivationCache::new(3);
+        assert_eq!(cache.batch_size(), 0);
+    }
+}
