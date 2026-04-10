@@ -69,3 +69,105 @@ impl EwmaTracker {
         self.value
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ewma_warmup_exact_mean() {
+        let mut tracker = EwmaTracker::new(10);
+        tracker.update(1.0);
+        tracker.update(2.0);
+        let result = tracker.update(3.0);
+        assert!((result - 2.0).abs() < f64::EPSILON);
+        assert!((tracker.value - 2.0).abs() < f64::EPSILON);
+        assert_eq!(tracker.k, 3);
+    }
+
+    #[test]
+    fn ewma_warmup_single_value() {
+        let mut tracker = EwmaTracker::new(10);
+        let result = tracker.update(5.0);
+        assert!((result - 5.0).abs() < f64::EPSILON);
+        assert_eq!(tracker.k, 1);
+    }
+
+    #[test]
+    fn ewma_steady_state_ema() {
+        let mut tracker = EwmaTracker::new(10);
+        // Fill warmup with constant 1.0
+        for _ in 0..10 {
+            tracker.update(1.0);
+        }
+        assert_eq!(tracker.k, 10);
+        // Now in steady state. Feed 2.0 and verify EMA formula.
+        let prev = tracker.value;
+        let result = tracker.update(2.0);
+        let expected = prev + (2.0 - prev) / 10.0;
+        assert!((result - expected).abs() < 1e-12);
+        assert_eq!(tracker.k, 11);
+    }
+
+    #[test]
+    fn ewma_k_monotonic_never_resets() {
+        let mut tracker = EwmaTracker::new(50);
+        for i in 1..=1000 {
+            tracker.update(i as f64);
+            assert_eq!(tracker.k, i as u64);
+        }
+    }
+
+    #[test]
+    fn ewma_warmup_to_steady_transition() {
+        let n = 5usize;
+        let mut tracker = EwmaTracker::new(n);
+        // Warmup: feed 1.0, 2.0, 3.0, 4.0, 5.0
+        for i in 1..=n {
+            tracker.update(i as f64);
+        }
+        // At k=N=5: value should be mean(1,2,3,4,5) = 3.0
+        assert!((tracker.value - 3.0).abs() < f64::EPSILON);
+        assert_eq!(tracker.k, n as u64);
+
+        // k=N+1: EMA formula with alpha=1/N=0.2
+        let prev = tracker.value;
+        let val = 10.0;
+        let result = tracker.update(val);
+        // divisor = min(5, 6) = 5, so: 3.0 + (10.0 - 3.0) / 5 = 4.4
+        let expected = prev + (val - prev) / n as f64;
+        assert!((result - expected).abs() < 1e-12);
+        assert_eq!(tracker.k, (n + 1) as u64);
+    }
+
+    #[test]
+    fn plasticity_state_default_is_plastic() {
+        let state = PlasticityState::default();
+        assert_eq!(state, PlasticityState::Plastic);
+    }
+
+    #[test]
+    fn plasticity_state_serde_roundtrip() {
+        let frozen = PlasticityState::Frozen;
+        let json = serde_json::to_string(&frozen).unwrap();
+        let loaded: PlasticityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, PlasticityState::Frozen);
+
+        let plastic = PlasticityState::Plastic;
+        let json = serde_json::to_string(&plastic).unwrap();
+        let loaded: PlasticityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded, PlasticityState::Plastic);
+    }
+
+    #[test]
+    fn ewma_tracker_serde_roundtrip() {
+        let mut tracker = EwmaTracker::new(10);
+        tracker.update(3.0);
+        tracker.update(7.0);
+        let json = serde_json::to_string(&tracker).unwrap();
+        let loaded: EwmaTracker = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.k, tracker.k);
+        assert!((loaded.value - tracker.value).abs() < f64::EPSILON);
+        assert_eq!(loaded.window, tracker.window);
+    }
+}
