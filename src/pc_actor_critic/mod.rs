@@ -1084,24 +1084,28 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// The selected action index (guaranteed to be in `valid_actions`).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `valid_actions` is empty.
+    /// Returns `PcError::ConfigValidation` if `valid_actions` is empty.
     pub fn step_masked(
         &mut self,
         state: &[f64],
         valid_actions: &[usize],
         reward: f64,
         terminal: bool,
-    ) -> usize {
-        assert!(!valid_actions.is_empty(), "valid_actions must not be empty");
-        self.step_inner(
+    ) -> Result<usize, PcError> {
+        if valid_actions.is_empty() {
+            return Err(PcError::ConfigValidation(
+                "valid_actions must not be empty".to_string(),
+            ));
+        }
+        Ok(self.step_inner(
             state,
             valid_actions,
             reward,
             terminal,
             Some(valid_actions.to_vec()),
-        )
+        ))
     }
 
     /// Shared implementation for `step()` and `step_masked()`.
@@ -2802,7 +2806,7 @@ mod tests {
         let s2 = vec![0.5, 0.5, -1.0, 0.0, 1.0, -0.5, 0.0, -1.0, 0.5];
         let mask = vec![0, 2, 5];
 
-        let _a1 = agent_a.step_masked(&s1, &mask, 0.0, false);
+        let _a1 = agent_a.step_masked(&s1, &mask, 0.0, false).unwrap();
         let all_actions: Vec<usize> = (0..9).collect();
         let _a2 = agent_a.step(&s2, 1.0, false);
 
@@ -2879,7 +2883,7 @@ mod tests {
             let mut agent: PcActorCritic =
                 PcActorCritic::new(CpuLinAlg::new(), default_config(), seed).unwrap();
             let state = vec![0.5; 9];
-            let action = agent.step_masked(&state, &valid, 0.0, false);
+            let action = agent.step_masked(&state, &valid, 0.0, false).unwrap();
             assert!(
                 valid.contains(&action),
                 "seed={seed}: action {action} not in valid set {valid:?}"
@@ -2958,13 +2962,15 @@ mod tests {
     fn step_masked_empty_valid_actions_handled() {
         let mut agent: PcActorCritic = make_agent();
         let state = vec![0.5; 9];
-        // Empty valid actions should panic
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            agent.step_masked(&state, &[], 0.0, false)
-        }));
+        let result = agent.step_masked(&state, &[], 0.0, false);
         assert!(
             result.is_err(),
-            "step_masked with empty valid_actions should panic"
+            "step_masked with empty valid_actions should return Err"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("valid_actions must not be empty"),
+            "error message should mention valid_actions: {err_msg}"
         );
     }
 
