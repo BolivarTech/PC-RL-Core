@@ -62,7 +62,13 @@ impl EwmaTracker {
     ///
     /// During warmup (`k <= window`), computes the exact arithmetic mean.
     /// After warmup, applies `A(k) = A(k-1) + (val - A(k-1)) / window`.
+    ///
+    /// Non-finite inputs (NaN, Inf, -Inf) are silently dropped — the tracker
+    /// retains its previous value and `k` is not incremented.
     pub fn update(&mut self, val: f64) -> f64 {
+        if !val.is_finite() {
+            return self.value;
+        }
         self.k += 1;
         let divisor = std::cmp::min(self.window as u64, self.k);
         self.value += (val - self.value) / divisor as f64;
@@ -169,5 +175,56 @@ mod tests {
         assert_eq!(loaded.k, tracker.k);
         assert!((loaded.value - tracker.value).abs() < f64::EPSILON);
         assert_eq!(loaded.window, tracker.window);
+    }
+
+    /// MAGI v2 W2: NaN input must not corrupt the EWMA tracker.
+    /// NaN/Inf should be silently dropped, preserving the last valid value.
+    #[test]
+    fn ewma_nan_input_does_not_silently_corrupt() {
+        let mut tracker = EwmaTracker::new(10);
+        tracker.update(1.0);
+        tracker.update(2.0);
+        tracker.update(3.0);
+        let value_before = tracker.value;
+        let k_before = tracker.k;
+
+        // Feed NaN — must NOT corrupt
+        let result = tracker.update(f64::NAN);
+        assert!(
+            result.is_finite(),
+            "update(NaN) must return finite value, got {result}"
+        );
+        assert!(
+            (tracker.value - value_before).abs() < f64::EPSILON,
+            "NaN must not change EWMA value: before={value_before}, after={}",
+            tracker.value
+        );
+        assert_eq!(tracker.k, k_before, "NaN must not increment k");
+
+        // Feed Inf — must NOT corrupt
+        let result = tracker.update(f64::INFINITY);
+        assert!(
+            result.is_finite(),
+            "update(Inf) must return finite value, got {result}"
+        );
+        assert!(
+            (tracker.value - value_before).abs() < f64::EPSILON,
+            "Inf must not change EWMA value"
+        );
+
+        // Feed -Inf — must NOT corrupt
+        let result = tracker.update(f64::NEG_INFINITY);
+        assert!(
+            result.is_finite(),
+            "update(-Inf) must return finite value, got {result}"
+        );
+
+        // Normal values must still work after NaN/Inf events
+        let result = tracker.update(5.0);
+        assert!(result.is_finite(), "Normal update after NaN must work");
+        assert!(
+            (tracker.value - value_before).abs() > f64::EPSILON,
+            "Normal update after NaN must change value"
+        );
     }
 }
