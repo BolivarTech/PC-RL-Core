@@ -18,8 +18,12 @@ use rand::rngs::StdRng;
 use crate::error::PcError;
 use crate::linalg::cpu::CpuLinAlg;
 use crate::linalg::LinAlg;
-use crate::mlp_critic::{MlpCritic, MlpCriticConfig};
-use crate::pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
+use crate::mlp_critic::MlpCritic;
+#[cfg(test)]
+use crate::mlp_critic::MlpCriticConfig;
+#[cfg(test)]
+use crate::pc_actor::PcActorConfig;
+use crate::pc_actor::{InferResult, PcActor, SelectionMode};
 use crate::pc_actor_critic::trajectory::cache_to_matrices;
 
 pub mod config;
