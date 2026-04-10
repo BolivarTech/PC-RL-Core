@@ -5112,4 +5112,84 @@ mod tests {
         assert_eq!(error_ema.len(), 3);
         assert!(error_ema.iter().all(|&v| v == 0.0));
     }
+
+    /// MAGI finding #5: Crossover between parents with different hidden
+    /// topologies must reset all CL state and the child must be able to
+    /// step() without panic.
+    #[test]
+    fn test_crossover_topology_mismatch_resets_cl_and_runs() {
+        // Parent A: 3 hidden layers [12,12,8] with EWC
+        let mut config_a = three_layer_config();
+        config_a.ewc_lambda = 1.0;
+        config_a.fisher_ema_beta = 0.99;
+        config_a.actor_hysteresis = true;
+        config_a.critic_hysteresis = true;
+        config_a.adaptive_surprise = true;
+        config_a.surprise_buffer_size = 100;
+
+        let mut parent_a: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config_a.clone(), 42).unwrap();
+
+        // Parent B: 1 hidden layer [18] (default topology)
+        let config_b = default_config();
+        let mut parent_b: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), config_b.clone(), 123).unwrap();
+
+        // Train both parents to accumulate Fisher / CL state
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for _ in 0..5 {
+            parent_a.step(&s1, 0.0, false);
+            parent_a.step(&s2, 1.0, true);
+            parent_b.step(&s1, 0.0, false);
+            parent_b.step(&s2, -1.0, true);
+        }
+
+        // Build caches — use child_config = config_a (3-layer topology)
+        let (ac_a, cc_a) = build_caches_for_agent(&mut parent_a, 20);
+        let (ac_b, cc_b) = build_caches_for_agent(&mut parent_b, 20);
+
+        // Crossover: [12,12,8] × [18] → child inherits config_a topology
+        let child: PcActorCritic = PcActorCritic::crossover(
+            &parent_a,
+            &parent_b,
+            &ac_a,
+            &ac_b,
+            &cc_a,
+            &cc_b,
+            0.5,
+            config_a.clone(),
+            99,
+        )
+        .unwrap();
+
+        // CL state must be fully reset (no parent Fisher leakage)
+        assert!(
+            child.actor_fisher.is_empty(),
+            "Child actor_fisher must be empty after cross-topology crossover"
+        );
+        assert!(
+            child.critic_fisher.is_empty(),
+            "Child critic_fisher must be empty after cross-topology crossover"
+        );
+        assert!(child.actor_hysteresis.is_none());
+        assert!(child.critic_hysteresis.is_none());
+        assert_eq!(child.actor_plastic_step_counter, 0);
+        assert_eq!(child.critic_plastic_step_counter, 0);
+        assert_eq!(child.critic_frozen_steps, 0);
+        assert!(!child.actor_last_phase_reliable);
+        assert!(!child.critic_last_phase_reliable);
+
+        // to_cl_state() should return None (all defaults after reset)
+        assert!(
+            child.to_cl_state().is_none(),
+            "Cross-topology child should have clean CL defaults"
+        );
+
+        // Child must be able to step() without panic despite topology mismatch parents
+        let mut child = child;
+        let _a1 = child.step(&s1, 0.0, false);
+        let _a2 = child.step(&s2, 1.0, true);
+        // If we got here, no panic occurred
+    }
 }
