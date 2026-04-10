@@ -30,7 +30,7 @@ pub const GRAD_CLIP: f64 = 5.0;
 /// assert_eq!(m.rows, 2);
 /// assert_eq!(m.cols, 3);
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Matrix {
     /// Flat row-major storage.
     pub data: Vec<f64>,

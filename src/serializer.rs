@@ -71,7 +71,7 @@ pub struct PcActorWeights {
 ///
 /// Stores accumulated Fisher (`f_total`), current-phase EMA (`f_ema`),
 /// and optional weight snapshots as CPU-side `Matrix`/`Vec<f64>`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FisherStateSerialized {
     /// Accumulated Fisher information for weights.
     pub f_total_weights: Matrix,
@@ -96,7 +96,7 @@ pub struct FisherStateSerialized {
 }
 
 /// Serializable EWMA tracker state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EwmaTrackerSerialized {
     /// Current EWMA value.
     pub value: f64,
@@ -107,7 +107,7 @@ pub struct EwmaTrackerSerialized {
 }
 
 /// Serializable hysteresis state machine.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HysteresisStateSerialized {
     /// Fast EWMA tracker.
     pub fast: EwmaTrackerSerialized,
@@ -127,7 +127,7 @@ pub struct HysteresisStateSerialized {
 ///
 /// Persisted in `SaveFile` as `Option<ClState>`. Legacy JSON files
 /// without this field load as `None`, which means clean PLASTIC defaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClState {
     /// Actor hysteresis state (None when disabled).
     #[serde(default)]

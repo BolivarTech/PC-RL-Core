@@ -560,21 +560,9 @@ impl<L: LinAlg> PcActorCritic<L> {
             ClState, EwmaTrackerSerialized, FisherStateSerialized, HysteresisStateSerialized,
         };
 
-        let has_cl = self.actor_hysteresis.is_some()
-            || self.critic_hysteresis.is_some()
-            || !self.actor_fisher.is_empty()
-            || !self.critic_fisher.is_empty()
-            || self.actor_plastic_step_counter > 0
-            || self.critic_plastic_step_counter > 0
-            || self.critic_frozen_steps > 0
-            || !self.layer_error_ema.is_empty()
-            || self.actor_last_phase_reliable
-            || self.critic_last_phase_reliable;
-
-        if !has_cl {
-            return None;
-        }
-
+        // Build the ClState unconditionally, then compare against the default.
+        // This ensures any new CL field that gets a non-default value is
+        // automatically detected — no manual OR-chain to extend.
         let serialize_ewma = |t: &EwmaTracker| EwmaTrackerSerialized {
             value: t.value,
             k: t.k,
@@ -617,7 +605,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
         };
 
-        Some(ClState {
+        let cl = ClState {
             actor_hysteresis: self.actor_hysteresis.as_ref().map(serialize_hysteresis),
             critic_hysteresis: self.critic_hysteresis.as_ref().map(serialize_hysteresis),
             actor_plastic_step_counter: self.actor_plastic_step_counter,
@@ -636,7 +624,13 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_last_phase_reliable: self.actor_last_phase_reliable,
             critic_last_phase_reliable: self.critic_last_phase_reliable,
             layer_error_ema: self.layer_error_ema.clone(),
-        })
+        };
+
+        if cl == ClState::default() {
+            None
+        } else {
+            Some(cl)
+        }
     }
 
     /// Restores continuous learning state from a serialized `ClState`.
@@ -5083,5 +5077,27 @@ mod tests {
         assert!(agent.actor_fisher.is_empty());
         assert!(agent.critic_fisher.is_empty());
         assert!(agent.layer_error_ema.is_empty());
+    }
+
+    #[test]
+    fn test_to_cl_state_detects_any_nondefault_cl_field() {
+        let mut cfg = default_config();
+        cfg.adaptive_consolidation = true;
+        cfg.consolidation_ema_beta = 0.99;
+        cfg.consolidation_sigmoid_k = 10.0;
+        cfg.consolidation_error_threshold = 0.05;
+        let agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let cl = agent.to_cl_state();
+        assert!(
+            cl.is_some(),
+            "to_cl_state should detect non-empty layer_error_ema"
+        );
+    }
+
+    #[test]
+    fn test_to_cl_state_returns_none_for_pure_default_agent() {
+        let agent = make_agent();
+        let cl = agent.to_cl_state();
+        assert!(cl.is_none(), "default agent has no CL state to serialize");
     }
 }
