@@ -69,3 +69,121 @@ impl HysteresisState {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hysteresis_wake_transition() {
+        let mut hyst = HysteresisState {
+            fast: EwmaTracker::new(5),
+            slow: EwmaTracker::new(20),
+            state: PlasticityState::Frozen,
+            wake_fraction: 0.5,
+            sleep_fraction: 0.3,
+            min_initial_plastic: 100,
+        };
+        // Manually set slow EWMA past warmup at 0.05
+        hyst.slow.value = 0.05;
+        hyst.slow.k = 50;
+        hyst.fast.value = 0.06;
+        hyst.fast.k = 10;
+        // Feed high signal: fast jumps well above wake threshold
+        // fast = 0.06 + (1.0 - 0.06)/5 = 0.248
+        // slow = 0.05 + (1.0 - 0.05)/20 = 0.0975
+        // Wake: 0.248 > 0.0975 * 1.5 = 0.14625 → yes
+        let result = hyst.update(1.0);
+        assert_eq!(result, Some(PlasticityState::Plastic));
+        assert_eq!(hyst.state, PlasticityState::Plastic);
+    }
+
+    #[test]
+    fn hysteresis_sleep_transition() {
+        let mut hyst = HysteresisState {
+            fast: EwmaTracker::new(5),
+            slow: EwmaTracker::new(20),
+            state: PlasticityState::Plastic,
+            wake_fraction: 0.5,
+            sleep_fraction: 0.3,
+            min_initial_plastic: 100,
+        };
+        // Past warmup and above min_initial_plastic
+        hyst.slow.value = 0.3;
+        hyst.slow.k = 200;
+        hyst.fast.value = 0.22;
+        hyst.fast.k = 200;
+        // Feed low signal:
+        // fast = 0.22 + (0.0 - 0.22)/5 = 0.176
+        // slow = 0.3 + (0.0 - 0.3)/20 = 0.285
+        // Sleep: 0.176 < 0.285 * 0.7 = 0.1995 → yes
+        // fast.k = 201 >= 100 → guard lifts
+        let result = hyst.update(0.0);
+        assert_eq!(result, Some(PlasticityState::Frozen));
+        assert_eq!(hyst.state, PlasticityState::Frozen);
+    }
+
+    #[test]
+    fn hysteresis_warmup_guard_suppresses_sleep() {
+        let mut hyst = HysteresisState {
+            fast: EwmaTracker::new(5),
+            slow: EwmaTracker::new(20),
+            state: PlasticityState::Plastic,
+            wake_fraction: 0.5,
+            sleep_fraction: 0.3,
+            min_initial_plastic: 100,
+        };
+        // fast.k < min_initial_plastic — sleep condition met but guard active
+        hyst.fast.k = 50;
+        hyst.fast.value = 0.1;
+        hyst.slow.k = 50;
+        hyst.slow.value = 0.5;
+        for _ in 0..10 {
+            let result = hyst.update(0.05);
+            assert_eq!(result, None);
+        }
+        // fast.k = 60, still < 100
+        assert_eq!(hyst.state, PlasticityState::Plastic);
+    }
+
+    #[test]
+    fn hysteresis_warmup_guard_lifts() {
+        let mut hyst = HysteresisState {
+            fast: EwmaTracker::new(5),
+            slow: EwmaTracker::new(20),
+            state: PlasticityState::Plastic,
+            wake_fraction: 0.5,
+            sleep_fraction: 0.3,
+            min_initial_plastic: 100,
+        };
+        hyst.fast.k = 99;
+        hyst.fast.value = 0.1;
+        hyst.slow.k = 99;
+        hyst.slow.value = 0.5;
+        // After update(0.0): fast.k=100 >= 100, guard lifts
+        // fast = 0.1 + (0.0 - 0.1)/5 = 0.08
+        // slow = 0.5 + (0.0 - 0.5)/20 = 0.475
+        // Sleep: 0.08 < 0.475 * 0.7 = 0.3325 → yes
+        let result = hyst.update(0.0);
+        assert_eq!(result, Some(PlasticityState::Frozen));
+        assert_eq!(hyst.state, PlasticityState::Frozen);
+    }
+
+    #[test]
+    fn hysteresis_no_false_wake_on_noise() {
+        let mut hyst = HysteresisState {
+            fast: EwmaTracker::new(5),
+            slow: EwmaTracker::new(20),
+            state: PlasticityState::Frozen,
+            wake_fraction: 0.5,
+            sleep_fraction: 0.3,
+            min_initial_plastic: 100,
+        };
+        // Feed constant signal — both converge to 0.1, no separation
+        for _ in 0..50 {
+            let result = hyst.update(0.1);
+            assert_eq!(result, None);
+        }
+        assert_eq!(hyst.state, PlasticityState::Frozen);
+    }
+}
