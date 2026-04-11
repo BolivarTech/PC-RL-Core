@@ -898,6 +898,57 @@ impl<L: LinAlg> PcActorCritic<L> {
         next_infer: &InferResult<L>,
         terminal: bool,
     ) -> f64 {
+        self.learn_continuous_inner(
+            input,
+            infer,
+            action,
+            valid_actions,
+            reward,
+            next_input,
+            next_infer,
+            terminal,
+            self.config.gamma,
+            None,
+        )
+    }
+
+    /// Inner implementation for single-step TD(0) continuous learning.
+    ///
+    /// Called by `learn_continuous` and by TD(n) flush with custom
+    /// `gamma_power` and pre-computed V(s).
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Current state.
+    /// * `infer` - Inference result from `act` at current state.
+    /// * `action` - Action taken.
+    /// * `valid_actions` - Valid actions at current state.
+    /// * `reward` - Reward received.
+    /// * `next_input` - Next state.
+    /// * `next_infer` - Inference result from `act` at next state.
+    /// * `terminal` - Whether the episode ended.
+    /// * `gamma_power` - Effective discount factor (`γⁿ` for TD(n) flush,
+    ///   `γ` for TD(0)).
+    /// * `pre_v_s` - Pre-computed V(s). When `Some`, skips the internal
+    ///   critic forward pass for the current state.
+    ///
+    /// # Returns
+    ///
+    /// Critic loss for this step.
+    #[allow(clippy::too_many_arguments)]
+    fn learn_continuous_inner(
+        &mut self,
+        input: &[f64],
+        infer: &InferResult<L>,
+        action: usize,
+        valid_actions: &[usize],
+        reward: f64,
+        next_input: &[f64],
+        next_infer: &InferResult<L>,
+        terminal: bool,
+        gamma_power: f64,
+        pre_v_s: Option<f64>,
+    ) -> f64 {
         // Build critic inputs
         let latent_vec = self.backend.vec_to_vec(&infer.latent_concat);
         let mut critic_input = input.to_vec();
@@ -907,19 +958,14 @@ impl<L: LinAlg> PcActorCritic<L> {
         let mut next_critic_input = next_input.to_vec();
         next_critic_input.extend_from_slice(&next_latent_vec);
 
-        let v_s = self.critic.forward(&critic_input);
+        let v_s = pre_v_s.unwrap_or_else(|| self.critic.forward(&critic_input));
         let v_next = if terminal {
             0.0
         } else {
             self.critic.forward(&next_critic_input)
         };
 
-        let target = reward
-            + if terminal {
-                0.0
-            } else {
-                self.config.gamma * v_next
-            };
+        let target = reward + if terminal { 0.0 } else { gamma_power * v_next };
         let td_error = target - v_s;
 
         // Guard: if td_error is non-finite (e.g. NaN reward), skip all updates
