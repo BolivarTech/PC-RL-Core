@@ -144,6 +144,9 @@ pub struct ClState {
     /// Consecutive steps the critic has been FROZEN.
     #[serde(default)]
     pub critic_frozen_steps: u64,
+    /// Consecutive steps the actor has been FROZEN.
+    #[serde(default)]
+    pub actor_frozen_steps: u64,
     /// Per-layer Fisher state for actor.
     #[serde(default)]
     pub actor_fisher: Vec<FisherStateSerialized>,
@@ -406,6 +409,8 @@ mod tests {
             critic_sleep_fraction: 0.3,
             actor_wakes_critic: false,
             actor_wakes_critic_threshold: 1000,
+            critic_wakes_actor: false,
+            critic_wakes_actor_threshold: 1000,
             consolidation_decay: 1.0,
             critic_consolidation_decay: 1.0,
             adaptive_consolidation: false,

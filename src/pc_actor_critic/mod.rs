@@ -85,6 +85,8 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     critic_plastic_step_counter: u64,
     /// Consecutive steps the critic has been FROZEN.
     critic_frozen_steps: u64,
+    /// Consecutive steps the actor has been FROZEN.
+    actor_frozen_steps: u64,
     /// Circular buffer of recent |TD errors| for critic adaptive scale.
     td_error_buffer: VecDeque<f64>,
     /// Last TD error from learn_continuous (transient, for hysteresis).
@@ -394,6 +396,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_plastic_step_counter: 0,
             critic_plastic_step_counter: 0,
             critic_frozen_steps: 0,
+            actor_frozen_steps: 0,
             td_error_buffer: VecDeque::new(),
             last_td_error: 0.0,
             actor_decay_factors,
@@ -505,6 +508,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_plastic_step_counter: 0,
             critic_plastic_step_counter: 0,
             critic_frozen_steps: 0,
+            actor_frozen_steps: 0,
             td_error_buffer: VecDeque::new(),
             last_td_error: 0.0,
             actor_decay_factors: child_actor_decay,
@@ -551,6 +555,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_plastic_step_counter: 0,
             critic_plastic_step_counter: 0,
             critic_frozen_steps: 0,
+            actor_frozen_steps: 0,
             td_error_buffer: VecDeque::new(),
             last_td_error: 0.0,
             actor_decay_factors,
@@ -625,6 +630,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_plastic_step_counter: self.actor_plastic_step_counter,
             critic_plastic_step_counter: self.critic_plastic_step_counter,
             critic_frozen_steps: self.critic_frozen_steps,
+            actor_frozen_steps: self.actor_frozen_steps,
             actor_fisher: self
                 .actor_fisher
                 .iter()
@@ -678,6 +684,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         self.actor_plastic_step_counter = cl_state.actor_plastic_step_counter;
         self.critic_plastic_step_counter = cl_state.critic_plastic_step_counter;
         self.critic_frozen_steps = cl_state.critic_frozen_steps;
+        self.actor_frozen_steps = cl_state.actor_frozen_steps;
         self.actor_last_phase_reliable = cl_state.actor_last_phase_reliable;
         self.critic_last_phase_reliable = cl_state.critic_last_phase_reliable;
 
@@ -1708,7 +1715,10 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         // Update actor hysteresis
         if let Some(ref mut hyst) = self.actor_hysteresis {
-            // Increment counter for pre-transition state
+            // Increment counters for pre-transition state
+            if hyst.state == PlasticityState::Frozen {
+                self.actor_frozen_steps += 1;
+            }
             if hyst.state == PlasticityState::Plastic {
                 self.actor_plastic_step_counter += 1;
             }
@@ -1716,6 +1726,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                 if new_state == PlasticityState::Plastic {
                     actor_woke = true;
                     self.actor_plastic_step_counter = 0;
+                    self.actor_frozen_steps = 0;
                 } else {
                     actor_slept = true;
                 }
@@ -1749,9 +1760,34 @@ impl<L: LinAlg> PcActorCritic<L> {
                     && self.critic_frozen_steps >= self.config.actor_wakes_critic_threshold
                 {
                     critic_hyst.state = PlasticityState::Plastic;
+                    critic_hyst.fast.k = 0;
+                    critic_hyst.slow.k = 0;
                     self.critic_plastic_step_counter = 0;
                     self.critic_frozen_steps = 0;
                     critic_woke = true;
+                }
+            }
+        }
+
+        // Critic wakes actor coupling (reverse direction).
+        // Both couplings can coexist safely: no cascade is possible because
+        // the target guard checks "state == Frozen" — a network that just
+        // woke (naturally or via coupling) is Plastic, so the reverse
+        // coupling's guard fails. EWMA warmup (k=0 on transition) prevents
+        // immediate re-sleep, and frozen_steps threshold prevents immediate
+        // re-coupling. Fisher wake is appropriate for coupling-triggered
+        // transitions: fresh F_ema estimates are needed for the new phase.
+        if critic_woke && self.config.critic_wakes_actor {
+            if let Some(ref mut actor_hyst) = self.actor_hysteresis {
+                if actor_hyst.state == PlasticityState::Frozen
+                    && self.actor_frozen_steps >= self.config.critic_wakes_actor_threshold
+                {
+                    actor_hyst.state = PlasticityState::Plastic;
+                    actor_hyst.fast.k = 0;
+                    actor_hyst.slow.k = 0;
+                    self.actor_plastic_step_counter = 0;
+                    self.actor_frozen_steps = 0;
+                    actor_woke = true;
                 }
             }
         }
@@ -1970,6 +2006,8 @@ mod tests {
             critic_sleep_fraction: 0.3,
             actor_wakes_critic: false,
             actor_wakes_critic_threshold: 1000,
+            critic_wakes_actor: false,
+            critic_wakes_actor_threshold: 1000,
             consolidation_decay: 1.0,
             critic_consolidation_decay: 1.0,
             adaptive_consolidation: false,
@@ -2435,6 +2473,8 @@ mod tests {
             critic_sleep_fraction: 0.3,
             actor_wakes_critic: false,
             actor_wakes_critic_threshold: 1000,
+            critic_wakes_actor: false,
+            critic_wakes_actor_threshold: 1000,
             consolidation_decay: 1.0,
             critic_consolidation_decay: 1.0,
             adaptive_consolidation: false,
@@ -3627,6 +3667,8 @@ mod tests {
             critic_sleep_fraction: 0.3,
             actor_wakes_critic: false,
             actor_wakes_critic_threshold: 1000,
+            critic_wakes_actor: false,
+            critic_wakes_actor_threshold: 1000,
             consolidation_decay: 1.0,
             critic_consolidation_decay: 1.0,
             adaptive_consolidation: false,
@@ -5178,6 +5220,7 @@ mod tests {
         assert_eq!(child.actor_plastic_step_counter, 0);
         assert_eq!(child.critic_plastic_step_counter, 0);
         assert_eq!(child.critic_frozen_steps, 0);
+        assert_eq!(child.actor_frozen_steps, 0);
         assert!(child.surprise_buffer.is_empty());
         assert!(child.td_error_buffer.is_empty());
         assert!(child.state_prev.is_none());
@@ -6022,6 +6065,253 @@ mod tests {
         assert_ne!(
             agent_tdn.actor.layers[0].weights.data, agent_td0.actor.layers[0].weights.data,
             "TD(2) must produce different weights than TD(0)"
+        );
+    }
+
+    // ============ Bidirectional hysteresis coupling tests ============
+
+    #[test]
+    fn critic_wakes_actor_coupling_default_threshold() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.critic_wakes_actor = true;
+        // Default threshold = 1000
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Set both to FROZEN
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.actor_frozen_steps = 1000;
+
+        // Set up critic for wake transition
+        setup_for_wake(agent.critic_hysteresis.as_mut().unwrap());
+
+        agent.process_hysteresis(0.0, 1.0);
+
+        // Critic should be PLASTIC (natural wake)
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+        // Actor forced to PLASTIC via coupling
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+        // Counters reset
+        assert_eq!(agent.actor_plastic_step_counter, 0);
+        assert_eq!(agent.actor_frozen_steps, 0);
+    }
+
+    #[test]
+    fn critic_wakes_actor_respects_threshold() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.critic_wakes_actor = true;
+        cfg.critic_wakes_actor_threshold = 500;
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Both FROZEN, actor below custom threshold
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.actor_frozen_steps = 200;
+
+        setup_for_wake(agent.critic_hysteresis.as_mut().unwrap());
+        agent.process_hysteresis(0.0, 1.0);
+
+        // Critic wakes, but actor stays FROZEN (200 < 500 threshold)
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Frozen
+        );
+
+        // Now set actor above threshold and trigger again
+        agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.actor_frozen_steps = 500;
+        setup_for_wake(agent.critic_hysteresis.as_mut().unwrap());
+        agent.process_hysteresis(0.0, 1.0);
+
+        // Now coupling fires (500 >= 500)
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+    }
+
+    #[test]
+    fn critic_wakes_actor_off_by_default() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        // critic_wakes_actor defaults to false
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.actor_frozen_steps = 2000;
+
+        setup_for_wake(agent.critic_hysteresis.as_mut().unwrap());
+        agent.process_hysteresis(0.0, 1.0);
+
+        // Critic transitions to PLASTIC
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+        // Actor stays FROZEN (coupling disabled)
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Frozen
+        );
+    }
+
+    #[test]
+    fn actor_frozen_steps_increments_and_resets() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Set actor to FROZEN
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        assert_eq!(agent.actor_frozen_steps, 0);
+
+        // Each process_hysteresis with low signal increments frozen steps
+        agent.process_hysteresis(0.0, 0.0);
+        assert_eq!(agent.actor_frozen_steps, 1);
+
+        agent.process_hysteresis(0.0, 0.0);
+        assert_eq!(agent.actor_frozen_steps, 2);
+
+        agent.process_hysteresis(0.0, 0.0);
+        assert_eq!(agent.actor_frozen_steps, 3);
+
+        // Wake the actor — frozen steps reset to 0
+        setup_for_wake(agent.actor_hysteresis.as_mut().unwrap());
+        agent.process_hysteresis(1.0, 0.0);
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+        assert_eq!(agent.actor_frozen_steps, 0);
+    }
+
+    #[test]
+    fn coupling_wake_resets_ewma_k_prevents_refreeze() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.critic_wakes_actor = true;
+        cfg.critic_wakes_actor_threshold = 0; // immediate coupling
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Both FROZEN
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+
+        // Set up critic for natural wake
+        setup_for_wake(agent.critic_hysteresis.as_mut().unwrap());
+        agent.process_hysteresis(0.0, 1.0);
+
+        // Actor was woken via coupling — verify EWMA k reset
+        let actor_hyst = agent.actor_hysteresis.as_ref().unwrap();
+        assert_eq!(actor_hyst.state, PlasticityState::Plastic);
+        assert_eq!(actor_hyst.fast.k, 0);
+        assert_eq!(actor_hyst.slow.k, 0);
+
+        // Low signal should NOT cause immediate re-freeze because k=0
+        // means EWMA needs warmup before it can produce a valid sleep signal
+        agent.process_hysteresis(0.001, 0.001);
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic,
+            "EWMA warmup (k=0 reset) should prevent immediate re-freeze"
+        );
+    }
+
+    #[test]
+    fn actor_wakes_critic_resets_ewma_k() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.actor_wakes_critic = true;
+        cfg.actor_wakes_critic_threshold = 0; // immediate coupling
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Both FROZEN
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+
+        // Set critic EWMA to high k (stale values) so we can detect reset
+        agent.critic_hysteresis.as_mut().unwrap().fast.k = 500;
+        agent.critic_hysteresis.as_mut().unwrap().slow.k = 500;
+
+        // Set up actor for natural wake
+        setup_for_wake(agent.actor_hysteresis.as_mut().unwrap());
+        agent.process_hysteresis(1.0, 0.0);
+
+        // Critic was woken via coupling — verify EWMA k reset
+        let critic_hyst = agent.critic_hysteresis.as_ref().unwrap();
+        assert_eq!(critic_hyst.state, PlasticityState::Plastic);
+        assert_eq!(
+            critic_hyst.fast.k, 0,
+            "Coupling-forced wake must reset EWMA fast.k to 0"
+        );
+        assert_eq!(
+            critic_hyst.slow.k, 0,
+            "Coupling-forced wake must reset EWMA slow.k to 0"
+        );
+    }
+
+    #[test]
+    fn bidirectional_coupling_no_cascade() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.actor_wakes_critic = true;
+        cfg.critic_wakes_actor = true;
+        cfg.actor_wakes_critic_threshold = 0;
+        cfg.critic_wakes_actor_threshold = 0;
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Both FROZEN
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+
+        // Only critic set up to wake naturally, actor stays frozen naturally
+        setup_for_wake(agent.critic_hysteresis.as_mut().unwrap());
+
+        agent.process_hysteresis(0.0, 1.0);
+
+        // Critic wakes naturally
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+        // Actor wakes via critic→actor coupling
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+
+        // Now verify no reverse cascade: actor just woke, so actor_wakes_critic
+        // guard should NOT re-trigger (critic is already PLASTIC, not FROZEN)
+        // Process again with low signals — both should stay PLASTIC
+        agent.process_hysteresis(0.001, 0.001);
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic,
+            "No cascade: critic should stay PLASTIC"
+        );
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic,
+            "No cascade: actor should stay PLASTIC"
         );
     }
 }

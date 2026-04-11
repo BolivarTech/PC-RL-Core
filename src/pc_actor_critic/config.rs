@@ -112,6 +112,16 @@ fn default_actor_wakes_critic_threshold() -> u64 {
     1000
 }
 
+/// Default for critic-wakes-actor coupling (disabled).
+fn default_critic_wakes_actor() -> bool {
+    false
+}
+
+/// Default threshold for critic-wakes-actor coupling.
+fn default_critic_wakes_actor_threshold() -> u64 {
+    1000
+}
+
 /// Default actor consolidation decay base (1.0 = no decay).
 fn default_consolidation_decay() -> f64 {
     1.0
@@ -216,6 +226,8 @@ fn default_td_steps() -> usize {
 ///     critic_sleep_fraction: 0.3,
 ///     actor_wakes_critic: false,
 ///     actor_wakes_critic_threshold: 1000,
+///     critic_wakes_actor: false,
+///     critic_wakes_actor_threshold: 1000,
 ///     consolidation_decay: 1.0,
 ///     critic_consolidation_decay: 1.0,
 ///     adaptive_consolidation: false,
@@ -305,6 +317,15 @@ pub struct PcActorCriticConfig {
     /// Default: 1000.
     #[serde(default = "default_actor_wakes_critic_threshold")]
     pub actor_wakes_critic_threshold: u64,
+    /// Enable critic→actor coupling: when critic wakes, force actor to wake
+    /// if it has been frozen for at least `critic_wakes_actor_threshold` steps.
+    /// Default: false.
+    #[serde(default = "default_critic_wakes_actor")]
+    pub critic_wakes_actor: bool,
+    /// Minimum actor frozen steps before critic→actor coupling triggers.
+    /// Default: 1000.
+    #[serde(default = "default_critic_wakes_actor_threshold")]
+    pub critic_wakes_actor_threshold: u64,
     /// Actor fixed decay base for layer-wise consolidation (M3a).
     /// Layer i gets `consolidation_decay^(n_hidden - 1 - i)`.
     /// 1.0 = no decay (default). Must be in [0.0, 1.0].
