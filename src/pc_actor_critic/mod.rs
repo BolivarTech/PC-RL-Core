@@ -103,6 +103,36 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     actor_last_phase_reliable: bool,
     /// Whether the last critic PLASTIC phase was reliable (>= min_fisher_phase steps).
     critic_last_phase_reliable: bool,
+    /// Buffer for TD(n) transitions. Empty when td_steps=0.
+    td_buffer: VecDeque<TdTransition<L>>,
+}
+
+/// A single buffered transition for TD(n) computation.
+/// Transient — not serialized. Cleared on reset_step(), terminal, and crossover.
+#[derive(Debug, Clone)]
+struct TdTransition<L: LinAlg> {
+    /// State observation at this step.
+    state: L::Vector,
+    /// Inference result at this state.
+    infer: InferResult<L>,
+    /// Action taken.
+    action: usize,
+    /// Valid actions mask at this state.
+    valid_actions: Vec<usize>,
+    /// Reward received after taking this action.
+    reward: f64,
+}
+
+/// Computes the n-step discounted return from a slice of rewards.
+/// Pure function — no &self needed, avoids borrow conflicts during flush.
+fn compute_n_step_reward(gamma: f64, rewards: &[f64]) -> f64 {
+    let mut g = 0.0;
+    let mut gamma_power = 1.0;
+    for &r in rewards {
+        g += gamma_power * r;
+        gamma_power *= gamma;
+    }
+    g
 }
 
 impl<L: LinAlg> PcActorCritic<L> {
@@ -260,6 +290,12 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
         }
 
+        if config.td_steps == 1 {
+            return Err(PcError::ConfigValidation(
+                "td_steps=1 is not supported — use 0 for TD(0) or >= 2 for multi-step".to_string(),
+            ));
+        }
+
         let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
             Self::compute_decay_factors(&config);
 
@@ -367,6 +403,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             critic_fisher,
             actor_last_phase_reliable: false,
             critic_last_phase_reliable: false,
+            td_buffer: VecDeque::new(),
         })
     }
 
@@ -477,6 +514,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             critic_fisher: Vec::new(),
             actor_last_phase_reliable: false,
             critic_last_phase_reliable: false,
+            td_buffer: VecDeque::new(),
         })
     }
 
@@ -522,6 +560,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             critic_fisher: Vec::new(),
             actor_last_phase_reliable: false,
             critic_last_phase_reliable: false,
+            td_buffer: VecDeque::new(),
         }
     }
 
@@ -859,6 +898,57 @@ impl<L: LinAlg> PcActorCritic<L> {
         next_infer: &InferResult<L>,
         terminal: bool,
     ) -> f64 {
+        self.learn_continuous_inner(
+            input,
+            infer,
+            action,
+            valid_actions,
+            reward,
+            next_input,
+            next_infer,
+            terminal,
+            self.config.gamma,
+            None,
+        )
+    }
+
+    /// Inner implementation for single-step TD(0) continuous learning.
+    ///
+    /// Called by `learn_continuous` and by TD(n) flush with custom
+    /// `gamma_power` and pre-computed V(s).
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Current state.
+    /// * `infer` - Inference result from `act` at current state.
+    /// * `action` - Action taken.
+    /// * `valid_actions` - Valid actions at current state.
+    /// * `reward` - Reward received.
+    /// * `next_input` - Next state.
+    /// * `next_infer` - Inference result from `act` at next state.
+    /// * `terminal` - Whether the episode ended.
+    /// * `gamma_power` - Effective discount factor (`γⁿ` for TD(n) flush,
+    ///   `γ` for TD(0)).
+    /// * `pre_v_s` - Pre-computed V(s). When `Some`, skips the internal
+    ///   critic forward pass for the current state.
+    ///
+    /// # Returns
+    ///
+    /// Critic loss for this step.
+    #[allow(clippy::too_many_arguments)]
+    fn learn_continuous_inner(
+        &mut self,
+        input: &[f64],
+        infer: &InferResult<L>,
+        action: usize,
+        valid_actions: &[usize],
+        reward: f64,
+        next_input: &[f64],
+        next_infer: &InferResult<L>,
+        terminal: bool,
+        gamma_power: f64,
+        pre_v_s: Option<f64>,
+    ) -> f64 {
         // Build critic inputs
         let latent_vec = self.backend.vec_to_vec(&infer.latent_concat);
         let mut critic_input = input.to_vec();
@@ -868,19 +958,14 @@ impl<L: LinAlg> PcActorCritic<L> {
         let mut next_critic_input = next_input.to_vec();
         next_critic_input.extend_from_slice(&next_latent_vec);
 
-        let v_s = self.critic.forward(&critic_input);
+        let v_s = pre_v_s.unwrap_or_else(|| self.critic.forward(&critic_input));
         let v_next = if terminal {
             0.0
         } else {
             self.critic.forward(&next_critic_input)
         };
 
-        let target = reward
-            + if terminal {
-                0.0
-            } else {
-                self.config.gamma * v_next
-            };
+        let target = reward + if terminal { 0.0 } else { gamma_power * v_next };
         let td_error = target - v_s;
 
         // Guard: if td_error is non-finite (e.g. NaN reward), skip all updates
@@ -1132,20 +1217,75 @@ impl<L: LinAlg> PcActorCritic<L> {
                 .take()
                 .unwrap_or_else(|| (0..self.config.actor.output_size).collect());
 
-            self.learn_continuous(
-                &prev_state_vec,
-                &prev_infer,
-                prev_action,
-                &learn_mask,
-                reward,
-                state,
-                &current_infer,
-                terminal,
-            );
+            if self.config.td_steps == 0 {
+                // === TD(0): existing behavior, unchanged ===
+                self.learn_continuous(
+                    &prev_state_vec,
+                    &prev_infer,
+                    prev_action,
+                    &learn_mask,
+                    reward,
+                    state,
+                    &current_infer,
+                    terminal,
+                );
 
-            // Update hysteresis state machines after learning
-            if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
-                self.process_hysteresis(surprise_score, self.last_td_error.abs());
+                if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
+                    self.process_hysteresis(surprise_score, self.last_td_error.abs());
+                }
+            } else if terminal {
+                // === TD(n) terminal: push + flush ===
+                if reward.is_finite() {
+                    self.td_buffer.push_back(TdTransition {
+                        state: prev_state,
+                        infer: prev_infer,
+                        action: prev_action,
+                        valid_actions: learn_mask,
+                        reward,
+                    });
+                }
+                self.flush_td_buffer(state, &current_infer);
+            } else {
+                // === TD(n) non-terminal: buffer transition ===
+                if reward.is_finite() {
+                    self.td_buffer.push_back(TdTransition {
+                        state: prev_state,
+                        infer: prev_infer,
+                        action: prev_action,
+                        valid_actions: learn_mask,
+                        reward,
+                    });
+                }
+
+                if self.td_buffer.len() >= self.config.td_steps {
+                    let gamma = self.config.gamma;
+                    let n = self.td_buffer.len();
+                    let gamma_power = gamma.powi(n as i32);
+
+                    let rewards: Vec<f64> = self.td_buffer.iter().map(|t| t.reward).collect();
+                    let n_step_reward = compute_n_step_reward(gamma, &rewards);
+
+                    let oldest = self.td_buffer.pop_front().unwrap();
+                    let oldest_state_vec = self.backend.vec_to_vec(&oldest.state);
+                    let oldest_surprise = oldest.infer.surprise_score;
+
+                    self.learn_continuous_inner(
+                        &oldest_state_vec,
+                        &oldest.infer,
+                        oldest.action,
+                        &oldest.valid_actions,
+                        n_step_reward,
+                        state,
+                        &current_infer,
+                        false,
+                        gamma_power,
+                        None,
+                    );
+
+                    if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
+                        self.process_hysteresis(oldest_surprise, self.last_td_error.abs());
+                    }
+                }
             }
         }
 
@@ -1174,6 +1314,76 @@ impl<L: LinAlg> PcActorCritic<L> {
         action
     }
 
+    /// Flushes the TD(n) buffer at episode end.
+    /// Pre-computes V(s) before weight updates and injects via pre_v_s
+    /// to avoid stale-estimate bias (MAGI C2).
+    /// Calls process_hysteresis after each learning step (MAGI W1).
+    fn flush_td_buffer(&mut self, terminal_state: &[f64], terminal_infer: &InferResult<L>) {
+        let buffer: Vec<TdTransition<L>> = self.td_buffer.drain(..).collect();
+        if buffer.is_empty() {
+            return;
+        }
+
+        // Pre-compute all V(s) BEFORE any weight update (MAGI C2).
+        // These values are passed to learn_continuous_inner via pre_v_s
+        // so the internal critic.forward() is bypassed.
+        let v_s_values: Vec<f64> = buffer
+            .iter()
+            .map(|t| {
+                let state_vec = self.backend.vec_to_vec(&t.state);
+                let latent_vec = self.backend.vec_to_vec(&t.infer.latent_concat);
+                let mut critic_input = state_vec;
+                critic_input.extend_from_slice(&latent_vec);
+                self.critic.forward(&critic_input)
+            })
+            .collect();
+
+        let gamma = self.config.gamma;
+
+        // Pre-compute n-step returns via suffix-sum in O(K) instead of O(K²).
+        // g[k] = r[k] + γ*g[k+1], computed right-to-left.
+        let len = buffer.len();
+        let mut n_step_returns = vec![0.0; len];
+        for k in (0..len).rev() {
+            let next = if k + 1 < len {
+                n_step_returns[k + 1]
+            } else {
+                0.0
+            };
+            n_step_returns[k] = buffer[k].reward + gamma * next;
+        }
+
+        for (k, transition) in buffer.iter().enumerate() {
+            let n_step_reward = n_step_returns[k];
+
+            // gamma_power unused for terminal (V(s')=0), passed for API consistency
+            let remaining_steps = len - k;
+            let gamma_power = gamma.powi(remaining_steps as i32);
+
+            let state_vec = self.backend.vec_to_vec(&transition.state);
+            let surprise_score = transition.infer.surprise_score;
+
+            // Pass pre-computed V(s) via Some() — MAGI C2 enforcement
+            self.learn_continuous_inner(
+                &state_vec,
+                &transition.infer,
+                transition.action,
+                &transition.valid_actions,
+                n_step_reward,
+                terminal_state,
+                terminal_infer,
+                true,
+                gamma_power,
+                Some(v_s_values[k]),
+            );
+
+            // Process hysteresis after each flush step (MAGI W1)
+            if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
+                self.process_hysteresis(surprise_score, self.last_td_error.abs());
+            }
+        }
+    }
+
     /// Clears step-level internal state without affecting weights or learning state.
     ///
     /// After calling this method, the next `step()` or `step_masked()` call
@@ -1185,6 +1395,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         self.action_prev = None;
         self.infer_prev = None;
         self.valid_actions_prev = None;
+        self.td_buffer.clear();
     }
 
     /// Pushes a surprise score into the adaptive buffer (circular).
@@ -1769,6 +1980,7 @@ mod tests {
             fisher_decay: 0.9,
             fisher_ema_beta: 0.99,
             logits_reversal: false,
+            td_steps: 0,
         }
     }
 
@@ -2233,6 +2445,7 @@ mod tests {
             fisher_decay: 0.9,
             fisher_ema_beta: 0.99,
             logits_reversal: false,
+            td_steps: 0,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -3424,6 +3637,7 @@ mod tests {
             fisher_decay: 0.9,
             fisher_ema_beta: 0.99,
             logits_reversal: false,
+            td_steps: 0,
         }
     }
 
@@ -5574,5 +5788,240 @@ mod tests {
                 "td_error_buffer[{i}] became non-finite after NaN reward: {t}"
             );
         }
+    }
+
+    #[test]
+    fn test_td0_unchanged_with_td_steps_zero() {
+        // td_steps=0 must produce identical weights to current TD(0)
+        // Both agents use default_config() to ensure identical config (MAGI F1)
+        let mut cfg_a = default_config();
+        cfg_a.td_steps = 0;
+        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg_a, 42).unwrap();
+
+        let cfg_b = default_config(); // td_steps=0 by default
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg_b, 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+
+        for _ in 0..5 {
+            agent_a.step(&s1, 1.0, false);
+            agent_a.step(&s2, -1.0, true);
+            agent_b.step(&s1, 1.0, false);
+            agent_b.step(&s2, -1.0, true);
+        }
+
+        assert_eq!(
+            agent_a.actor.layers[0].weights.data, agent_b.actor.layers[0].weights.data,
+            "td_steps=0 must produce identical actor weights to default"
+        );
+        assert_eq!(
+            agent_a.critic.layers[0].weights.data, agent_b.critic.layers[0].weights.data,
+            "td_steps=0 must produce identical critic weights to default"
+        );
+    }
+
+    #[test]
+    fn test_td_n_return_computation() {
+        let gamma = 0.95;
+        let rewards = [1.0, 2.0, 3.0];
+        let expected = 1.0 + 0.95 * 2.0 + 0.95 * 0.95 * 3.0;
+        let result = compute_n_step_reward(gamma, &rewards);
+        assert!(
+            (result - expected).abs() < 1e-12,
+            "n-step return: expected {expected}, got {result}"
+        );
+    }
+
+    #[test]
+    fn test_td_n_return_single_step() {
+        let result = compute_n_step_reward(0.95, &[5.0]);
+        assert!((result - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_td_n_return_empty() {
+        let result = compute_n_step_reward(0.95, &[]);
+        assert!((result).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_td_n_buffer_fills_at_n() {
+        let mut cfg = default_config();
+        cfg.td_steps = 3;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let s3 = vec![0.0, 1.0, -1.0, 0.5, 0.0, -0.5, 1.0, -1.0, 0.5];
+        let s4 = vec![-0.5, 0.5, 0.0, -1.0, 1.0, 0.0, -0.5, 0.5, -1.0];
+
+        // Step 1: stores state_prev, no learning (first call)
+        agent.step(&s1, 0.0, false);
+
+        // Step 2: pushes transition into buffer. Buffer = 1.
+        let w_before = agent.actor.layers[0].weights.data.clone();
+        agent.step(&s2, 1.0, false);
+        let w_after_step2 = agent.actor.layers[0].weights.data.clone();
+        assert_eq!(w_before, w_after_step2, "Buffer not full — no learning yet");
+
+        // Step 3: pushes. Buffer = 2. Still not full.
+        agent.step(&s3, 0.5, false);
+        let w_after_step3 = agent.actor.layers[0].weights.data.clone();
+        assert_eq!(
+            w_before, w_after_step3,
+            "Buffer still not full — no learning"
+        );
+
+        // Step 4: pushes. Buffer = 3 = td_steps. NOW learning fires.
+        agent.step(&s4, -1.0, false);
+        let w_after_step4 = agent.actor.layers[0].weights.data.clone();
+        assert_ne!(
+            w_before, w_after_step4,
+            "Buffer full (3 = td_steps) — learning must fire"
+        );
+    }
+
+    #[test]
+    fn test_td_n_terminal_flush() {
+        // td_steps=5 but episode is only 3 steps → flush all at terminal
+        let mut cfg = default_config();
+        cfg.td_steps = 5;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let s3 = vec![0.0, 1.0, -1.0, 0.5, 0.0, -0.5, 1.0, -1.0, 0.5];
+
+        let w_before = agent.actor.layers[0].weights.data.clone();
+
+        agent.step(&s1, 0.0, false); // first call, no learning
+        agent.step(&s2, 1.0, false); // buffer: 1 transition
+        agent.step(&s3, -1.0, true); // terminal: flush 2 transitions
+
+        let w_after = agent.actor.layers[0].weights.data.clone();
+        assert_ne!(
+            w_before, w_after,
+            "Terminal flush must update weights even if buffer < td_steps"
+        );
+
+        // Buffer must be empty after terminal
+        assert!(
+            agent.td_buffer.is_empty(),
+            "td_buffer must be empty after terminal flush"
+        );
+    }
+
+    #[test]
+    fn test_td_n_reset_clears_buffer() {
+        let mut cfg = default_config();
+        cfg.td_steps = 5;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let s1 = vec![1.0; 9];
+        let s2 = vec![0.5; 9];
+        agent.step(&s1, 0.0, false);
+        agent.step(&s2, 1.0, false); // buffer has 1 transition
+
+        agent.reset_step();
+        assert!(
+            agent.td_buffer.is_empty(),
+            "reset_step must clear td_buffer"
+        );
+    }
+
+    #[test]
+    fn test_td_n_short_episode_monte_carlo() {
+        // td_steps=10 but episode is 2 steps → full Monte Carlo
+        let mut cfg = default_config();
+        cfg.td_steps = 10;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let w_before = agent.actor.layers[0].weights.data.clone();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        agent.step(&s1, 0.0, false);
+        agent.step(&s2, 5.0, true); // terminal flush with 1 transition
+
+        let w_after = agent.actor.layers[0].weights.data.clone();
+        assert_ne!(
+            w_before, w_after,
+            "Short episode must still learn at terminal"
+        );
+    }
+
+    #[test]
+    fn test_td_n_nan_reward_rejected_at_buffer() {
+        let mut cfg = default_config();
+        cfg.td_steps = 3;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let s1 = vec![1.0; 9];
+        let s2 = vec![0.5; 9];
+
+        agent.step(&s1, 0.0, false); // first call
+        agent.step(&s2, f64::NAN, false); // NaN reward: must NOT enter buffer
+
+        // Weights must be finite
+        for w in &agent.actor.layers[0].weights.data {
+            assert!(w.is_finite(), "Weight must be finite after NaN reward");
+        }
+    }
+
+    #[test]
+    fn test_td_n_serialization_config() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::serializer::{load_agent, save_agent};
+
+        let mut cfg = default_config();
+        cfg.td_steps = 4;
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let path = format!(
+            "{}/test_td_n_serde_{}.json",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        save_agent(&agent, &path, 100, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        assert_eq!(
+            loaded.config.td_steps, 4,
+            "td_steps must survive save/load round-trip"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_td_n_gamma_power_bootstrap() {
+        // TD(2) must produce different weights than TD(0)
+        let mut cfg_tdn = default_config();
+        cfg_tdn.td_steps = 2;
+        let mut agent_tdn: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_tdn, 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let s3 = vec![0.0, 1.0, -1.0, 0.5, 0.0, -0.5, 1.0, -1.0, 0.5];
+
+        agent_tdn.step(&s1, 0.0, false);
+        agent_tdn.step(&s2, 1.0, false);
+        agent_tdn.step(&s3, 2.0, false);
+
+        let mut cfg_td0 = default_config();
+        cfg_td0.td_steps = 0;
+        let mut agent_td0: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_td0, 42).unwrap();
+
+        agent_td0.step(&s1, 0.0, false);
+        agent_td0.step(&s2, 1.0, false);
+        agent_td0.step(&s3, 2.0, false);
+
+        assert_ne!(
+            agent_tdn.actor.layers[0].weights.data, agent_td0.actor.layers[0].weights.data,
+            "TD(2) must produce different weights than TD(0)"
+        );
     }
 }

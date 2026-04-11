@@ -162,6 +162,11 @@ fn default_logits_reversal() -> bool {
     false
 }
 
+/// Default TD(n) steps (0 = standard TD(0), zero overhead).
+fn default_td_steps() -> usize {
+    0
+}
+
 /// Configuration for the integrated PC Actor-Critic agent.
 ///
 /// # Examples
@@ -221,6 +226,7 @@ fn default_logits_reversal() -> bool {
 ///     fisher_decay: 0.9,
 ///     fisher_ema_beta: 0.99,
 ///     logits_reversal: false,
+///     td_steps: 0,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,4 +353,12 @@ pub struct PcActorCriticConfig {
     /// rather than the actual policy gradient. Default: false.
     #[serde(default = "default_logits_reversal")]
     pub logits_reversal: bool,
+    /// Number of steps for TD(n) return computation.
+    /// 0 = standard TD(0) (default, zero overhead). No buffer allocated.
+    /// n > 0 = accumulate n real reward steps before bootstrapping with V(s_{t+n}).
+    /// Recommended: 0 (TD(0)), 4-5 (TicTacToe), 8-10 (longer games).
+    /// Avoid td_steps=1 — use 0 for standard TD(0) or >= 2 for multi-step.
+    /// Memory: O(td_steps × network_size) per agent.
+    #[serde(default = "default_td_steps")]
+    pub td_steps: usize,
 }
