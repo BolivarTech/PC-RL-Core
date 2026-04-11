@@ -1383,6 +1383,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         self.action_prev = None;
         self.infer_prev = None;
         self.valid_actions_prev = None;
+        self.td_buffer.clear();
     }
 
     /// Pushes a surprise score into the adaptive buffer (circular).
@@ -5897,5 +5898,62 @@ mod tests {
             agent.td_buffer.is_empty(),
             "td_buffer must be empty after terminal flush"
         );
+    }
+
+    #[test]
+    fn test_td_n_reset_clears_buffer() {
+        let mut cfg = default_config();
+        cfg.td_steps = 5;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let s1 = vec![1.0; 9];
+        let s2 = vec![0.5; 9];
+        agent.step(&s1, 0.0, false);
+        agent.step(&s2, 1.0, false); // buffer has 1 transition
+
+        agent.reset_step();
+        assert!(
+            agent.td_buffer.is_empty(),
+            "reset_step must clear td_buffer"
+        );
+    }
+
+    #[test]
+    fn test_td_n_short_episode_monte_carlo() {
+        // td_steps=10 but episode is 2 steps → full Monte Carlo
+        let mut cfg = default_config();
+        cfg.td_steps = 10;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let w_before = agent.actor.layers[0].weights.data.clone();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        agent.step(&s1, 0.0, false);
+        agent.step(&s2, 5.0, true); // terminal flush with 1 transition
+
+        let w_after = agent.actor.layers[0].weights.data.clone();
+        assert_ne!(
+            w_before, w_after,
+            "Short episode must still learn at terminal"
+        );
+    }
+
+    #[test]
+    fn test_td_n_nan_reward_rejected_at_buffer() {
+        let mut cfg = default_config();
+        cfg.td_steps = 3;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let s1 = vec![1.0; 9];
+        let s2 = vec![0.5; 9];
+
+        agent.step(&s1, 0.0, false); // first call
+        agent.step(&s2, f64::NAN, false); // NaN reward: must NOT enter buffer
+
+        // Weights must be finite
+        for w in &agent.actor.layers[0].weights.data {
+            assert!(w.is_finite(), "Weight must be finite after NaN reward");
+        }
     }
 }
