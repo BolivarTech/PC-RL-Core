@@ -61,14 +61,26 @@ let config = PcActorCriticConfig {
     adaptive_surprise: true,
     surprise_buffer_size: 400,
     entropy_coeff: 0.0,
+    td_steps: 4,   // TD(4) n-step returns (0 = TD(0) default)
+    ..Default::default()  // CL features default to disabled
 };
 
 let backend = CpuLinAlg::new();
 let mut agent = PcActorCritic::new(backend, config, 42)?;
 
-// Training loop: act, collect trajectory steps, learn
+// Continuous learning loop (step API — TD(0) or TD(n))
+loop {
+    let action = agent.step(&state, reward, terminal);
+    // ... or with action masking:
+    let action = agent.step_masked(&state, &valid_actions, reward, terminal)?;
+
+    if terminal { break; }
+    // ... execute action in environment, get next state + reward ...
+}
+
+// Episodic learning (REINFORCE — alternative to step API)
 let (action, infer_result) = agent.act(&state, &valid_actions, SelectionMode::Training);
-// ... execute action in environment, collect TrajectoryStep per timestep ...
+// ... collect TrajectoryStep per timestep ...
 let avg_loss = agent.learn(&trajectory);
 
 // Evaluation (deterministic)
@@ -81,7 +93,7 @@ let (action, _) = agent.act(&state, &valid_actions, SelectionMode::Play);
 
 - **`PcActor<L: LinAlg>`** -- Policy network with predictive coding inference loop, residual skip connections, surprise scoring, and CCA crossover
 - **`MlpCritic<L: LinAlg>`** -- Standard MLP value function with MSE loss backpropagation and CCA crossover
-- **`PcActorCritic<L: LinAlg>`** -- Integrated agent combining actor and critic with surprise-based learning rate scheduling
+- **`PcActorCritic<L: LinAlg>`** -- Integrated agent combining actor and critic with surprise-based learning rate scheduling, continuous learning (CL), and TD(n) n-step returns
 - **`Layer<L: LinAlg>`** -- Dense layer with forward, transpose (PC top-down), and backward passes
 - **`LinAlg` trait** -- Backend-agnostic linear algebra interface (31 instance methods). Default implementation: `CpuLinAlg`
 - **`GolubKahanSvd`** -- O(n^3) SVD via bidiagonalization, used for CCA neuron alignment
@@ -95,6 +107,15 @@ let (action, _) = agent.act(&state, &valid_actions, SelectionMode::Play);
 **Adaptive Surprise Scheduling**: A circular buffer of recent surprise scores dynamically calibrates learning rate thresholds. Low surprise reduces LR (familiar states), high surprise boosts LR (novel states). Buffer-mediated damping protects learned representations during environment transitions.
 
 **CCA Crossover**: GA-ready crossover operator using Canonical Correlation Analysis to align neurons functionally before blending weights, solving the permutation problem. Supports dimension mismatches, layer count differences, and residual components.
+
+**Continuous Learning (v2.1.0)**: Surprise-driven plasticity modulation for non-stationary environments:
+- *M1 Scale Range*: Configurable surprise-to-learning-rate mapping (`scale_floor`/`scale_ceil`)
+- *M2 Dual-EWMA Hysteresis*: Automatic FROZEN/PLASTIC transitions via fast/slow surprise EWMAs
+- *M3 Consolidation Decay*: Per-layer exponential decay (fixed M3a) or adaptive sigmoid (M3b)
+- *M4 EWC Regularization*: Fisher diagonal with 3-step lifecycle (decay/accumulate/merge)
+- *NaN Safety*: Guards in EwmaTracker, learn_continuous, push_surprise, push_td_error
+
+**TD(n) N-Step Returns (v2.1.0)**: Configurable n-step temporal difference learning via `td_steps`. Buffers n transitions before bootstrapping with V(s_{t+n}). Terminal flush uses pre-computed V(s) to avoid stale-estimate bias. `td_steps=0` (default) preserves exact TD(0) behavior with zero overhead. See [docs/td_n_spec.md](docs/td_n_spec.md).
 
 ### Type Aliases
 
@@ -120,11 +141,19 @@ PC-RL-Core/
 │   ├── layer.rs                    # Layer<L: LinAlg> with PC top-down support
 │   ├── pc_actor.rs                 # PcActor<L> with inference loop, residual, crossover
 │   ├── mlp_critic.rs               # MlpCritic<L> value function, crossover
-│   ├── pc_actor_critic.rs          # PcActorCritic<L> agent, ActivationCache, crossover
-│   └── serializer.rs               # JSON persistence (CPU concrete bridge)
+│   ├── pc_actor_critic/            # PcActorCritic<L> directory submodule
+│   │   ├── mod.rs                  # Agent impl: act, step, learn, crossover, CL pipeline
+│   │   ├── config.rs               # PcActorCriticConfig + 31 serde defaults
+│   │   ├── ewma.rs                 # EwmaTracker + PlasticityState (with NaN guard)
+│   │   ├── hysteresis.rs           # HysteresisState dual-EWMA state machine
+│   │   ├── fisher.rs               # FisherState<L> for EWC regularization
+│   │   └── trajectory.rs           # TrajectoryStep<L> + ActivationCache<L>
+│   └── serializer.rs               # JSON persistence, ClState with backward compat
 ├── docs/
 │   ├── experiment_analysis.md      # 20 experimental phases, ~3,800 runs
-│   └── pc_actor_critic_paper.md    # DPC architecture paper
+│   ├── pc_actor_critic_paper.md    # DPC architecture paper
+│   ├── continuous_learning_spec.md # CL v2.1.0 specification
+│   └── td_n_spec.md               # TD(n) technical specification
 └── Cargo.toml
 ```
 
@@ -154,7 +183,7 @@ No PyTorch, TensorFlow, or any ML framework. Pure Rust from scratch.
 
 ## Testing
 
-392 unit tests + 20 doctests:
+516 unit tests + 21 doctests:
 
 ```bash
 cargo nextest run
