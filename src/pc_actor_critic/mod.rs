@@ -1706,7 +1706,9 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// Updates hysteresis state machines after learning.
     ///
     /// Handles EWMA updates, state transitions, counter management,
-    /// and actor→critic coupling.
+    /// and bidirectional actor↔critic coupling.
+    /// Each network uses its own signal (actor=surprise, critic=|TD error|).
+    /// Couplings are binary state overrides with EWMA k reset — no signal contamination.
     pub(crate) fn process_hysteresis(&mut self, actor_signal: f64, critic_signal: f64) {
         let mut actor_woke = false;
         let mut actor_slept = false;
@@ -1760,6 +1762,9 @@ impl<L: LinAlg> PcActorCritic<L> {
                     && self.critic_frozen_steps >= self.config.actor_wakes_critic_threshold
                 {
                     critic_hyst.state = PlasticityState::Plastic;
+                    // k=0 re-enables warmup guard. Next update() overwrites
+                    // stale value entirely (divisor=1), then warmup prevents
+                    // re-freeze for min_initial_plastic steps.
                     critic_hyst.fast.k = 0;
                     critic_hyst.slow.k = 0;
                     self.critic_plastic_step_counter = 0;
@@ -1783,6 +1788,9 @@ impl<L: LinAlg> PcActorCritic<L> {
                     && self.actor_frozen_steps >= self.config.critic_wakes_actor_threshold
                 {
                     actor_hyst.state = PlasticityState::Plastic;
+                    // k=0 re-enables warmup guard. Next update() overwrites
+                    // stale value entirely (divisor=1), then warmup prevents
+                    // re-freeze for min_initial_plastic steps.
                     actor_hyst.fast.k = 0;
                     actor_hyst.slow.k = 0;
                     self.actor_plastic_step_counter = 0;
@@ -2004,9 +2012,9 @@ mod tests {
             critic_slow_window: 100,
             critic_wake_fraction: 0.5,
             critic_sleep_fraction: 0.3,
-            actor_wakes_critic: false,
+            actor_wakes_critic: true,
             actor_wakes_critic_threshold: 1000,
-            critic_wakes_actor: false,
+            critic_wakes_actor: true,
             critic_wakes_actor_threshold: 1000,
             consolidation_decay: 1.0,
             critic_consolidation_decay: 1.0,
@@ -2471,9 +2479,9 @@ mod tests {
             critic_slow_window: 100,
             critic_wake_fraction: 0.5,
             critic_sleep_fraction: 0.3,
-            actor_wakes_critic: false,
+            actor_wakes_critic: true,
             actor_wakes_critic_threshold: 1000,
-            critic_wakes_actor: false,
+            critic_wakes_actor: true,
             critic_wakes_actor_threshold: 1000,
             consolidation_decay: 1.0,
             critic_consolidation_decay: 1.0,
@@ -3456,11 +3464,11 @@ mod tests {
     }
 
     #[test]
-    fn actor_wakes_critic_off_by_default() {
+    fn actor_wakes_critic_disabled_when_false() {
         let mut cfg = default_config();
         cfg.actor_hysteresis = true;
         cfg.critic_hysteresis = true;
-        // actor_wakes_critic defaults to false
+        cfg.actor_wakes_critic = false; // explicitly disable
         let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
         agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
@@ -3665,9 +3673,9 @@ mod tests {
             critic_slow_window: 100,
             critic_wake_fraction: 0.5,
             critic_sleep_fraction: 0.3,
-            actor_wakes_critic: false,
+            actor_wakes_critic: true,
             actor_wakes_critic_threshold: 1000,
-            critic_wakes_actor: false,
+            critic_wakes_actor: true,
             critic_wakes_actor_threshold: 1000,
             consolidation_decay: 1.0,
             critic_consolidation_decay: 1.0,
@@ -6145,11 +6153,11 @@ mod tests {
     }
 
     #[test]
-    fn critic_wakes_actor_off_by_default() {
+    fn critic_wakes_actor_disabled_when_false() {
         let mut cfg = default_config();
         cfg.actor_hysteresis = true;
         cfg.critic_hysteresis = true;
-        // critic_wakes_actor defaults to false
+        cfg.critic_wakes_actor = false; // explicitly disable
         let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
         agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;

@@ -102,9 +102,9 @@ fn default_critic_sleep_fraction() -> f64 {
     0.3
 }
 
-/// Default for actor-wakes-critic coupling (disabled).
+/// Default for actor-wakes-critic coupling (enabled).
 fn default_actor_wakes_critic() -> bool {
-    false
+    true
 }
 
 /// Default threshold for actor-wakes-critic coupling.
@@ -112,9 +112,9 @@ fn default_actor_wakes_critic_threshold() -> u64 {
     1000
 }
 
-/// Default for critic-wakes-actor coupling (disabled).
+/// Default for critic-wakes-actor coupling (enabled).
 fn default_critic_wakes_actor() -> bool {
-    false
+    true
 }
 
 /// Default threshold for critic-wakes-actor coupling.
@@ -224,9 +224,9 @@ fn default_td_steps() -> usize {
 ///     critic_slow_window: 100,
 ///     critic_wake_fraction: 0.5,
 ///     critic_sleep_fraction: 0.3,
-///     actor_wakes_critic: false,
+///     actor_wakes_critic: true,
 ///     actor_wakes_critic_threshold: 1000,
-///     critic_wakes_actor: false,
+///     critic_wakes_actor: true,
 ///     critic_wakes_actor_threshold: 1000,
 ///     consolidation_decay: 1.0,
 ///     critic_consolidation_decay: 1.0,
@@ -310,16 +310,21 @@ pub struct PcActorCriticConfig {
     pub critic_sleep_fraction: f64,
     /// Enable actor→critic coupling: when actor wakes, force critic to wake
     /// if it has been frozen for at least `actor_wakes_critic_threshold` steps.
-    /// Default: false.
+    /// EWMA k is reset on coupling-forced wake to prevent immediate re-freeze.
+    /// Only effective when both `actor_hysteresis` and `critic_hysteresis` are true.
+    /// Default: true.
     #[serde(default = "default_actor_wakes_critic")]
     pub actor_wakes_critic: bool,
     /// Minimum critic frozen steps before actor→critic coupling triggers.
     /// Default: 1000.
     #[serde(default = "default_actor_wakes_critic_threshold")]
     pub actor_wakes_critic_threshold: u64,
-    /// Enable critic→actor coupling: when critic wakes, force actor to wake
-    /// if it has been frozen for at least `critic_wakes_actor_threshold` steps.
-    /// Default: false.
+    /// Enable critic→actor coupling: when critic wakes (high |TD error|),
+    /// force actor to wake if it has been frozen for at least
+    /// `critic_wakes_actor_threshold` steps. EWMA k is reset on
+    /// coupling-forced wake to prevent immediate re-freeze.
+    /// Only effective when both `actor_hysteresis` and `critic_hysteresis` are true.
+    /// Default: true.
     #[serde(default = "default_critic_wakes_actor")]
     pub critic_wakes_actor: bool,
     /// Minimum actor frozen steps before critic→actor coupling triggers.
