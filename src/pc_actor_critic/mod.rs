@@ -104,7 +104,6 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// Whether the last critic PLASTIC phase was reliable (>= min_fisher_phase steps).
     critic_last_phase_reliable: bool,
     /// Buffer for TD(n) transitions. Empty when td_steps=0.
-    #[allow(dead_code)]
     td_buffer: VecDeque<TdTransition<L>>,
 }
 
@@ -113,19 +112,14 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
 #[derive(Debug, Clone)]
 struct TdTransition<L: LinAlg> {
     /// State observation at this step.
-    #[allow(dead_code)]
     state: L::Vector,
     /// Inference result at this state.
-    #[allow(dead_code)]
     infer: InferResult<L>,
     /// Action taken.
-    #[allow(dead_code)]
     action: usize,
     /// Valid actions mask at this state.
-    #[allow(dead_code)]
     valid_actions: Vec<usize>,
     /// Reward received after taking this action.
-    #[allow(dead_code)]
     reward: f64,
 }
 
@@ -294,6 +288,12 @@ impl<L: LinAlg> PcActorCritic<L> {
                     config.fisher_ema_beta
                 )));
             }
+        }
+
+        if config.td_steps == 1 {
+            return Err(PcError::ConfigValidation(
+                "td_steps=1 is not supported — use 0 for TD(0) or >= 2 for multi-step".to_string(),
+            ));
         }
 
         let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
@@ -1340,12 +1340,24 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         let gamma = self.config.gamma;
 
+        // Pre-compute n-step returns via suffix-sum in O(K) instead of O(K²).
+        // g[k] = r[k] + γ*g[k+1], computed right-to-left.
+        let len = buffer.len();
+        let mut n_step_returns = vec![0.0; len];
+        for k in (0..len).rev() {
+            let next = if k + 1 < len {
+                n_step_returns[k + 1]
+            } else {
+                0.0
+            };
+            n_step_returns[k] = buffer[k].reward + gamma * next;
+        }
+
         for (k, transition) in buffer.iter().enumerate() {
-            let remaining_rewards: Vec<f64> = buffer[k..].iter().map(|t| t.reward).collect();
-            let n_step_reward = compute_n_step_reward(gamma, &remaining_rewards);
+            let n_step_reward = n_step_returns[k];
 
             // gamma_power unused for terminal (V(s')=0), passed for API consistency
-            let remaining_steps = buffer.len() - k;
+            let remaining_steps = len - k;
             let gamma_power = gamma.powi(remaining_steps as i32);
 
             let state_vec = self.backend.vec_to_vec(&transition.state);
