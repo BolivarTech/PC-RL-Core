@@ -1217,20 +1217,75 @@ impl<L: LinAlg> PcActorCritic<L> {
                 .take()
                 .unwrap_or_else(|| (0..self.config.actor.output_size).collect());
 
-            self.learn_continuous(
-                &prev_state_vec,
-                &prev_infer,
-                prev_action,
-                &learn_mask,
-                reward,
-                state,
-                &current_infer,
-                terminal,
-            );
+            if self.config.td_steps == 0 {
+                // === TD(0): existing behavior, unchanged ===
+                self.learn_continuous(
+                    &prev_state_vec,
+                    &prev_infer,
+                    prev_action,
+                    &learn_mask,
+                    reward,
+                    state,
+                    &current_infer,
+                    terminal,
+                );
 
-            // Update hysteresis state machines after learning
-            if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
-                self.process_hysteresis(surprise_score, self.last_td_error.abs());
+                if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
+                    self.process_hysteresis(surprise_score, self.last_td_error.abs());
+                }
+            } else if terminal {
+                // === TD(n) terminal: push + flush ===
+                if reward.is_finite() {
+                    self.td_buffer.push_back(TdTransition {
+                        state: prev_state,
+                        infer: prev_infer,
+                        action: prev_action,
+                        valid_actions: learn_mask,
+                        reward,
+                    });
+                }
+                self.flush_td_buffer(state, &current_infer);
+            } else {
+                // === TD(n) non-terminal: buffer transition ===
+                if reward.is_finite() {
+                    self.td_buffer.push_back(TdTransition {
+                        state: prev_state,
+                        infer: prev_infer,
+                        action: prev_action,
+                        valid_actions: learn_mask,
+                        reward,
+                    });
+                }
+
+                if self.td_buffer.len() >= self.config.td_steps {
+                    let gamma = self.config.gamma;
+                    let n = self.td_buffer.len();
+                    let gamma_power = gamma.powi(n as i32);
+
+                    let rewards: Vec<f64> = self.td_buffer.iter().map(|t| t.reward).collect();
+                    let n_step_reward = compute_n_step_reward(gamma, &rewards);
+
+                    let oldest = self.td_buffer.pop_front().unwrap();
+                    let oldest_state_vec = self.backend.vec_to_vec(&oldest.state);
+                    let oldest_surprise = oldest.infer.surprise_score;
+
+                    self.learn_continuous_inner(
+                        &oldest_state_vec,
+                        &oldest.infer,
+                        oldest.action,
+                        &oldest.valid_actions,
+                        n_step_reward,
+                        state,
+                        &current_infer,
+                        false,
+                        gamma_power,
+                        None,
+                    );
+
+                    if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
+                        self.process_hysteresis(oldest_surprise, self.last_td_error.abs());
+                    }
+                }
             }
         }
 
@@ -1257,6 +1312,14 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
 
         action
+    }
+
+    /// Flushes all buffered TD(n) transitions at episode end.
+    ///
+    /// Called when a terminal state is reached with `td_steps > 0`.
+    /// Processes remaining transitions with progressively shorter n-step returns.
+    fn flush_td_buffer(&mut self, _terminal_state: &[f64], _terminal_infer: &InferResult<L>) {
+        todo!("flush_td_buffer — implemented in Task 5")
     }
 
     /// Clears step-level internal state without affecting weights or learning state.
@@ -5717,5 +5780,42 @@ mod tests {
     fn test_td_n_return_empty() {
         let result = compute_n_step_reward(0.95, &[]);
         assert!((result).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_td_n_buffer_fills_at_n() {
+        let mut cfg = default_config();
+        cfg.td_steps = 3;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let s3 = vec![0.0, 1.0, -1.0, 0.5, 0.0, -0.5, 1.0, -1.0, 0.5];
+        let s4 = vec![-0.5, 0.5, 0.0, -1.0, 1.0, 0.0, -0.5, 0.5, -1.0];
+
+        // Step 1: stores state_prev, no learning (first call)
+        agent.step(&s1, 0.0, false);
+
+        // Step 2: pushes transition into buffer. Buffer = 1.
+        let w_before = agent.actor.layers[0].weights.data.clone();
+        agent.step(&s2, 1.0, false);
+        let w_after_step2 = agent.actor.layers[0].weights.data.clone();
+        assert_eq!(w_before, w_after_step2, "Buffer not full — no learning yet");
+
+        // Step 3: pushes. Buffer = 2. Still not full.
+        agent.step(&s3, 0.5, false);
+        let w_after_step3 = agent.actor.layers[0].weights.data.clone();
+        assert_eq!(
+            w_before, w_after_step3,
+            "Buffer still not full — no learning"
+        );
+
+        // Step 4: pushes. Buffer = 3 = td_steps. NOW learning fires.
+        agent.step(&s4, -1.0, false);
+        let w_after_step4 = agent.actor.layers[0].weights.data.clone();
+        assert_ne!(
+            w_before, w_after_step4,
+            "Buffer full (3 = td_steps) — learning must fire"
+        );
     }
 }
