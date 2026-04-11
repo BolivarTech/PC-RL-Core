@@ -6314,4 +6314,40 @@ mod tests {
             "No cascade: actor should stay PLASTIC"
         );
     }
+
+    #[test]
+    fn critic_wakes_actor_serialization_roundtrip() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::serializer::{load_agent, save_agent};
+
+        let mut cfg = default_config();
+        cfg.critic_wakes_actor = true;
+        cfg.critic_wakes_actor_threshold = 500;
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.adaptive_surprise = true;
+        cfg.surprise_buffer_size = 100;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Accumulate some frozen steps
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        for _ in 0..50 {
+            agent.process_hysteresis(0.0, 0.0);
+        }
+        assert_eq!(agent.actor_frozen_steps, 50);
+
+        let path = format!(
+            "{}/test_critic_wakes_actor_serde_{}.json",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        save_agent(&agent, &path, 100, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        assert!(loaded.config.critic_wakes_actor);
+        assert_eq!(loaded.config.critic_wakes_actor_threshold, 500);
+        assert_eq!(loaded.actor_frozen_steps, 50);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
