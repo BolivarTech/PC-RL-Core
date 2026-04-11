@@ -595,7 +595,7 @@ impl<L: LinAlg> PcActor<L> {
     }
 
     /// Returns the rezero_alpha/skip_projections index for hidden layer `i`.
-    fn skip_alpha_index(&self, i: usize) -> Option<usize> {
+    pub(crate) fn skip_alpha_index(&self, i: usize) -> Option<usize> {
         if !self.is_skip_layer(i) {
             return None;
         }
@@ -817,6 +817,7 @@ impl<L: LinAlg> PcActor<L> {
         infer_result: &InferResult<L>,
         input: &[f64],
         surprise_scale: f64,
+        decay_factors: &[f64],
     ) {
         assert_eq!(
             input.len(),
@@ -832,6 +833,7 @@ impl<L: LinAlg> PcActor<L> {
             input,
             surprise_scale,
             self.config.local_lambda,
+            decay_factors,
         );
     }
 
@@ -845,6 +847,10 @@ impl<L: LinAlg> PcActor<L> {
     /// * `0 < lambda < 1` → hybrid blend.
     ///
     /// The output layer always uses standard backprop from `output_delta`.
+    ///
+    /// Per-layer consolidation decay is applied via `decay_factors[i]`:
+    /// `layer_surprise = surprise_scale * decay_factors[i]`.
+    /// Empty `decay_factors` means no per-layer decay (all layers get `surprise_scale`).
     fn update_weights_hybrid(
         &mut self,
         output_delta: &[f64],
@@ -852,13 +858,14 @@ impl<L: LinAlg> PcActor<L> {
         input: &[f64],
         surprise_scale: f64,
         lambda: f64,
+        decay_factors: &[f64],
     ) {
         let input_vec = self.backend.vec_from_slice(input);
         let output_delta_vec = self.backend.vec_from_slice(output_delta);
         let n_hidden = self.config.hidden_layers.len();
         let n_layers = self.layers.len();
 
-        // Output layer: always standard backward
+        // Output layer: always raw surprise_scale (no decay)
         let output_input = if n_hidden > 0 {
             &infer_result.hidden_states[n_hidden - 1]
         } else {
@@ -881,6 +888,13 @@ impl<L: LinAlg> PcActor<L> {
                 &input_vec
             };
 
+            // Per-layer surprise with consolidation decay
+            let layer_surprise = if decay_factors.is_empty() {
+                surprise_scale
+            } else {
+                surprise_scale * decay_factors[i]
+            };
+
             // Blend backprop delta with local PC error
             let effective_delta = if (lambda - 1.0).abs() < f64::EPSILON {
                 bp_delta.clone()
@@ -899,11 +913,12 @@ impl<L: LinAlg> PcActor<L> {
                 // Skip-eligible layer: use tanh_out for derivative, scale by alpha,
                 // add identity path to propagated gradient, update alpha.
                 let tanh_out = infer_result.tanh_components[i].as_ref().unwrap();
-                let alpha = self.rezero_alpha[alpha_idx];
-                let effective_lr = self.config.lr_weights * surprise_scale;
+                let effective_lr = self.config.lr_weights * layer_surprise;
 
                 // Scale delta by rezero_alpha for the nonlinear path
-                let scaled_delta = self.backend.vec_scale(&effective_delta, alpha);
+                let scaled_delta = self
+                    .backend
+                    .vec_scale(&effective_delta, self.rezero_alpha[alpha_idx]);
 
                 // Backward through the layer using tanh_out (not hidden_states[i])
                 let propagated = self.layers[i].backward(
@@ -911,7 +926,7 @@ impl<L: LinAlg> PcActor<L> {
                     tanh_out,
                     &scaled_delta,
                     self.config.lr_weights,
-                    surprise_scale,
+                    layer_surprise,
                 );
 
                 // Update rezero_alpha: dL/d(alpha) = delta · tanh_out
@@ -939,7 +954,7 @@ impl<L: LinAlg> PcActor<L> {
                     layer_output,
                     &effective_delta,
                     self.config.lr_weights,
-                    surprise_scale,
+                    layer_surprise,
                 );
             }
         }
@@ -1659,7 +1674,7 @@ mod tests {
         let infer_result = actor.infer(&input);
         let weights_before = actor.layers[0].weights.data.clone();
         let delta = vec![0.1; 9];
-        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        actor.update_weights(&delta, &infer_result, &input, 1.0, &[]);
         assert_ne!(actor.layers[0].weights.data, weights_before);
     }
 
@@ -1671,7 +1686,7 @@ mod tests {
         let input = vec![1.0; 9];
         let infer_result = actor.infer(&input);
         let delta = vec![1e6; 9];
-        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        actor.update_weights(&delta, &infer_result, &input, 1.0, &[]);
         for layer in &actor.layers {
             for &w in &layer.weights.data {
                 assert!(
@@ -1692,7 +1707,7 @@ mod tests {
         let w0_before = actor.layers[0].weights.data.clone();
         let w1_before = actor.layers[1].weights.data.clone();
         let delta = vec![0.1; 9];
-        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        actor.update_weights(&delta, &infer_result, &input, 1.0, &[]);
         assert_ne!(
             actor.layers[0].weights.data, w0_before,
             "Layer 0 should change"
@@ -1712,7 +1727,7 @@ mod tests {
         let input = vec![0.0; 9];
         let infer_result = actor.infer(&input);
         let delta = vec![0.1; 9];
-        actor.update_weights(&delta, &infer_result, &[0.0; 5], 1.0);
+        actor.update_weights(&delta, &infer_result, &[0.0; 5], 1.0, &[]);
     }
 
     // ── Zero Hidden Layers Test ─────────────────────────────────
@@ -2222,7 +2237,7 @@ mod tests {
         let mut actor1: PcActor =
             PcActor::new(CpuLinAlg::new(), two_hidden_config(), &mut rng1).unwrap();
         let infer1 = actor1.infer(&input);
-        actor1.update_weights(&delta, &infer1, &input, 1.0);
+        actor1.update_weights(&delta, &infer1, &input, 1.0, &[]);
 
         let mut rng2 = make_rng();
         let config2 = PcActorConfig {
@@ -2231,7 +2246,7 @@ mod tests {
         };
         let mut actor2: PcActor = PcActor::new(CpuLinAlg::new(), config2, &mut rng2).unwrap();
         let infer2 = actor2.infer(&input);
-        actor2.update_weights(&delta, &infer2, &input, 1.0);
+        actor2.update_weights(&delta, &infer2, &input, 1.0, &[]);
 
         for i in 0..actor1.layers.len() {
             assert_eq!(actor1.layers[i].weights.data, actor2.layers[i].weights.data);
@@ -2248,7 +2263,7 @@ mod tests {
         let w0 = actor.layers[0].weights.data.clone();
         let w1 = actor.layers[1].weights.data.clone();
         let w2 = actor.layers[2].weights.data.clone();
-        actor.update_weights(&[0.1; 9], &infer_result, &input, 1.0);
+        actor.update_weights(&[0.1; 9], &infer_result, &input, 1.0, &[]);
         assert_ne!(actor.layers[0].weights.data, w0, "Layer 0 should change");
         assert_ne!(actor.layers[1].weights.data, w1, "Layer 1 should change");
         assert_ne!(
@@ -2265,7 +2280,7 @@ mod tests {
         let input = vec![0.5; 9];
         let infer_result = actor.infer(&input);
         let alpha_before = actor.rezero_alpha.clone();
-        actor.update_weights(&[0.1; 9], &infer_result, &input, 1.0);
+        actor.update_weights(&[0.1; 9], &infer_result, &input, 1.0, &[]);
         assert_ne!(
             actor.rezero_alpha, alpha_before,
             "rezero_alpha should be updated by backprop"
@@ -2279,7 +2294,7 @@ mod tests {
             PcActor::new(CpuLinAlg::new(), residual_two_hidden_config(), &mut rng).unwrap();
         let input = vec![1.0; 9];
         let infer_result = actor.infer(&input);
-        actor.update_weights(&[1e6; 9], &infer_result, &input, 1.0);
+        actor.update_weights(&[1e6; 9], &infer_result, &input, 1.0, &[]);
         for layer in &actor.layers {
             for &w in &layer.weights.data {
                 assert!(
@@ -2313,7 +2328,7 @@ mod tests {
         let mut actor1: PcActor = PcActor::new(CpuLinAlg::new(), config1, &mut rng1).unwrap();
         let w0_before1 = actor1.layers[0].weights.data.clone();
         let infer1 = actor1.infer(&input);
-        actor1.update_weights(&delta, &infer1, &input, 1.0);
+        actor1.update_weights(&delta, &infer1, &input, 1.0, &[]);
         let change1: f64 = actor1.layers[0]
             .weights
             .data
@@ -2331,7 +2346,7 @@ mod tests {
         let mut actor2: PcActor = PcActor::new(CpuLinAlg::new(), config2, &mut rng2).unwrap();
         let w0_before2 = actor2.layers[0].weights.data.clone();
         let infer2 = actor2.infer(&input);
-        actor2.update_weights(&delta, &infer2, &input, 1.0);
+        actor2.update_weights(&delta, &infer2, &input, 1.0, &[]);
         let change2: f64 = actor2.layers[0]
             .weights
             .data
@@ -2357,7 +2372,7 @@ mod tests {
         let input = vec![0.5; 9];
         let infer_result = actor.infer(&input);
         let w0_before = actor.layers[0].weights.data.clone();
-        actor.update_weights(&[0.1; 9], &infer_result, &input, 1.0);
+        actor.update_weights(&[0.1; 9], &infer_result, &input, 1.0, &[]);
         assert_ne!(actor.layers[0].weights.data, w0_before);
     }
 
@@ -2435,7 +2450,7 @@ mod tests {
         let infer_result = actor.infer(&input);
         let weights_before = actor.layers[0].weights.data.clone();
         let delta = vec![0.1; 9];
-        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        actor.update_weights(&delta, &infer_result, &input, 1.0, &[]);
         assert_ne!(actor.layers[0].weights.data, weights_before);
     }
 
@@ -2447,7 +2462,7 @@ mod tests {
         let input = vec![1.0; 9];
         let infer_result = actor.infer(&input);
         let delta = vec![1e6; 9];
-        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        actor.update_weights(&delta, &infer_result, &input, 1.0, &[]);
         for layer in &actor.layers {
             for &w in &layer.weights.data {
                 assert!(
@@ -2471,7 +2486,7 @@ mod tests {
         let w0_before = actor.layers[0].weights.data.clone();
         let w1_before = actor.layers[1].weights.data.clone();
         let delta = vec![0.1; 9];
-        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        actor.update_weights(&delta, &infer_result, &input, 1.0, &[]);
         assert_ne!(
             actor.layers[0].weights.data, w0_before,
             "Layer 0 should change"
@@ -2492,14 +2507,14 @@ mod tests {
         let mut bp_actor: PcActor =
             PcActor::new(CpuLinAlg::new(), default_config(), &mut rng1).unwrap();
         let bp_infer = bp_actor.infer(&input);
-        bp_actor.update_weights(&delta, &bp_infer, &input, 1.0);
+        bp_actor.update_weights(&delta, &bp_infer, &input, 1.0, &[]);
 
         // Local learning actor (same initial weights)
         let mut rng2 = make_rng();
         let mut ll_actor: PcActor =
             PcActor::new(CpuLinAlg::new(), local_learning_config(), &mut rng2).unwrap();
         let ll_infer = ll_actor.infer(&input);
-        ll_actor.update_weights(&delta, &ll_infer, &input, 1.0);
+        ll_actor.update_weights(&delta, &ll_infer, &input, 1.0, &[]);
 
         // Hidden layer weights should differ between the two approaches
         assert_ne!(
@@ -2527,14 +2542,14 @@ mod tests {
         let mut bp_actor: PcActor =
             PcActor::new(CpuLinAlg::new(), default_config(), &mut rng1).unwrap();
         let bp_infer = bp_actor.infer(&input);
-        bp_actor.update_weights(&delta, &bp_infer, &input, 1.0);
+        bp_actor.update_weights(&delta, &bp_infer, &input, 1.0, &[]);
 
         // lambda=1.0 should be identical to backprop
         let mut rng2 = make_rng();
         let mut lam_actor: PcActor =
             PcActor::new(CpuLinAlg::new(), hybrid_config(1.0), &mut rng2).unwrap();
         let lam_infer = lam_actor.infer(&input);
-        lam_actor.update_weights(&delta, &lam_infer, &input, 1.0);
+        lam_actor.update_weights(&delta, &lam_infer, &input, 1.0, &[]);
 
         assert_eq!(
             bp_actor.layers[0].weights.data, lam_actor.layers[0].weights.data,
@@ -2552,14 +2567,14 @@ mod tests {
         let mut ll_actor: PcActor =
             PcActor::new(CpuLinAlg::new(), local_learning_config(), &mut rng1).unwrap();
         let ll_infer = ll_actor.infer(&input);
-        ll_actor.update_weights(&delta, &ll_infer, &input, 1.0);
+        ll_actor.update_weights(&delta, &ll_infer, &input, 1.0, &[]);
 
         // lambda=0.0 should be identical to pure local
         let mut rng2 = make_rng();
         let mut lam_actor: PcActor =
             PcActor::new(CpuLinAlg::new(), hybrid_config(0.0), &mut rng2).unwrap();
         let lam_infer = lam_actor.infer(&input);
-        lam_actor.update_weights(&delta, &lam_infer, &input, 1.0);
+        lam_actor.update_weights(&delta, &lam_infer, &input, 1.0, &[]);
 
         assert_eq!(
             ll_actor.layers[0].weights.data, lam_actor.layers[0].weights.data,
@@ -2577,21 +2592,21 @@ mod tests {
         let mut bp_actor: PcActor =
             PcActor::new(CpuLinAlg::new(), default_config(), &mut rng1).unwrap();
         let bp_infer = bp_actor.infer(&input);
-        bp_actor.update_weights(&delta, &bp_infer, &input, 1.0);
+        bp_actor.update_weights(&delta, &bp_infer, &input, 1.0, &[]);
 
         // Pure local
         let mut rng2 = make_rng();
         let mut ll_actor: PcActor =
             PcActor::new(CpuLinAlg::new(), local_learning_config(), &mut rng2).unwrap();
         let ll_infer = ll_actor.infer(&input);
-        ll_actor.update_weights(&delta, &ll_infer, &input, 1.0);
+        ll_actor.update_weights(&delta, &ll_infer, &input, 1.0, &[]);
 
         // Hybrid lambda=0.5
         let mut rng3 = make_rng();
         let mut hy_actor: PcActor =
             PcActor::new(CpuLinAlg::new(), hybrid_config(0.5), &mut rng3).unwrap();
         let hy_infer = hy_actor.infer(&input);
-        hy_actor.update_weights(&delta, &hy_infer, &input, 1.0);
+        hy_actor.update_weights(&delta, &hy_infer, &input, 1.0, &[]);
 
         assert_ne!(
             hy_actor.layers[0].weights.data, bp_actor.layers[0].weights.data,
@@ -2612,7 +2627,7 @@ mod tests {
         let infer_result = actor.infer(&input);
         let weights_before = actor.layers[0].weights.data.clone();
         let delta = vec![0.1; 9];
-        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        actor.update_weights(&delta, &infer_result, &input, 1.0, &[]);
         assert_ne!(actor.layers[0].weights.data, weights_before);
     }
 
@@ -2624,7 +2639,7 @@ mod tests {
         let input = vec![1.0; 9];
         let infer_result = actor.infer(&input);
         let delta = vec![1e6; 9];
-        actor.update_weights(&delta, &infer_result, &input, 1.0);
+        actor.update_weights(&delta, &infer_result, &input, 1.0, &[]);
         for layer in &actor.layers {
             for &w in &layer.weights.data {
                 assert!(

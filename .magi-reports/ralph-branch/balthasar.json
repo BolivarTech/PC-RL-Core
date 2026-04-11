@@ -1,0 +1,45 @@
+{
+  "agent": "balthasar",
+  "verdict": "conditional",
+  "confidence": 0.78,
+  "summary": "Ships and is backward-compatible, but the monolith and config sprawl are already biting \u2014 schedule a refactor before the next CL feature lands.",
+  "reasoning": "Pragmatically, this work lands in good shape for a v2.1.0: backward compatibility is taken seriously (every new field has a serde default, `cl_state: Option<ClState>` with `#[serde(default)]` lets v2.0.0 JSON load cleanly, `scale_floor=0.1/scale_ceil=2.0` reproduces old behavior, `ewc_lambda=0.0` genuinely short-circuits \u2014 Fisher vectors aren't even allocated). The new `step()` / `step_masked()` / `reset_step()` surface is ergonomic and the shared `step_inner` avoids the obvious DRY trap. Test coverage is substantial and meaningful: 137 tests inside `pc_actor_critic.rs` and 494 total (up from 392, the +102 matches the PR claim). Crossover correctly resets all transient CL state on the child \u2014 the spec's intent, and it avoids Caspar's 'child inherits parent hysteresis' concern.\n\nThat said, `pc_actor_critic.rs` is now 5894 lines (\u22482296 production + \u22483600 test). Only ~40% is production code, which softens the monolith concern, but the file is still the single point where config, types (EwmaTracker, HysteresisState, FisherState, PlasticityState, ActivationCache, TrajectoryStep), the agent struct, and all algorithms live. The config struct alone now has ~30 serde fields, with 20 `default_*` helper functions above it \u2014 the TOML surface area is uncomfortable and discoverability is poor. A new contributor opening this file is going to get lost, and `to_cl_state`'s `has_cl` detection is a 10-clause OR chain that will silently forget a new field the next time someone adds one.\n\nSmaller items: `step_masked` uses `assert!(!valid_actions.is_empty())` \u2014 documented with `# Panics` but inconsistent with the project's stated preference for `Result<T, PcError>` in public APIs (and W2 in the prior MAGI review already flagged this style for v2.0 cleanup). Decay-factor precomputation is duplicated across `new`, `crossover`, and `from_parts` \u2014 a trivial `compute_decay_factors(&config)` helper would remove ~30 repeated lines. None of these block shipping, but together they signal that one more CL phase without refactoring will make the file genuinely unmaintainable.",
+  "findings": [
+    {
+      "severity": "warning",
+      "title": "pc_actor_critic.rs is becoming the junk drawer",
+      "detail": "5894 lines, with config types, EWMA/hysteresis/Fisher types, trajectory types, activation cache, and the full agent impl all colocated. Production code is ~2296 lines, which is bearable today, but every CL phase has added to this single file. Plan a split into a `continuous_learning/` submodule (hysteresis.rs, fisher.rs, config.rs, types.rs) BEFORE Phase 8/next CL feature, not after. Left alone, this is a textbook 10k-line-file story in 6 months."
+    },
+    {
+      "severity": "warning",
+      "title": "Config surface has exploded to ~30 flat fields",
+      "detail": "PcActorCriticConfig now has 20 `default_*` helpers and a long list of `actor_hysteresis` / `critic_hysteresis` / `consolidation_*` / `fisher_*` / `ewc_*` knobs. Flat layout is TOML-friendly but hurts discoverability and validation. Consider grouping: `hysteresis: Option<HysteresisConfig>`, `consolidation: ConsolidationConfig`, `ewc: Option<EwcConfig>`. Nested options also let `None` replace several bool+param combos, shrinking both the struct and the validation branches in `new()`."
+    },
+    {
+      "severity": "warning",
+      "title": "`to_cl_state` fragility \u2014 10-clause `has_cl` OR chain",
+      "detail": "Around line 1132, `has_cl` tests 10 separate fields to decide whether to serialize. The next CL field added will silently NOT trigger serialization if the author forgets to extend this chain. Either (a) always serialize when any CL feature flag is set in config, or (b) derive `is_empty()` from a `ClState::default()` comparison. Also add a unit test that proves each CL-enabling flag round-trips."
+    },
+    {
+      "severity": "warning",
+      "title": "Decay-factor precomputation duplicated 3x",
+      "detail": "The same `powi` loop for `actor_decay_factors` / `critic_decay_factors` / `layer_error_ema` appears in `new()`, `crossover()`, and `from_parts()` (~10 lines each, ~30 lines total). Extract `fn compute_decay_factors(config: &PcActorCriticConfig) -> (Vec<f64>, Vec<f64>, Vec<f64>)` \u2014 single source of truth, single place to fix bugs."
+    },
+    {
+      "severity": "warning",
+      "title": "`step_masked` panics instead of returning Result",
+      "detail": "`assert!(!valid_actions.is_empty(), ...)` at line 1666 violates the project's stated preference for `Result<T, PcError>` in public APIs, and is inconsistent with the W2 finding from the prior MAGI review (panic-based error handling was accepted as deferred to v2.0 but this is v2.1.0 code). Since `step_masked` is new, it should be born clean: return `Result<usize, PcError>` with `PcError::ConfigValidation` or a new `PcError::InvalidInput`."
+    },
+    {
+      "severity": "info",
+      "title": "Backward compatibility and EWC no-op are solid",
+      "detail": "Verified: `SaveFile.cl_state: Option<ClState>` with `#[serde(default)]` means v2.0.0 JSON files load without error, `restore_cl_state` is only called on `Some`. `ewc_lambda=0.0` genuinely skips Fisher allocation (`actor_fisher`/`critic_fisher` remain empty `Vec`), and the guard `if ewc_lambda > 0.0 && !actor_fisher.is_empty()` at line 1525 prevents any EWC compute. Crossover correctly resets all transient CL state on the child (hysteresis=None, fisher=empty, counters=0) \u2014 no parent leakage."
+    },
+    {
+      "severity": "info",
+      "title": "Test coverage is meaningful, not boilerplate",
+      "detail": "137 `#[test]` in `pc_actor_critic.rs` alone, 494 total (+102 net matches the PR description). Spot checks on serializer tests confirm they exercise JSON round-trips for cl_state presence/absence and backward-compat scenarios. This is real coverage, not test padding."
+    }
+  ],
+  "recommendation": "Ship v2.1.0 after addressing the two highest-leverage items: (1) make `step_masked` return `Result` (small, public-API-shaping, do it now before users build on the panic contract), and (2) fix `to_cl_state`'s fragile `has_cl` chain (small, prevents a future silent-data-loss bug). Defer the big file split and config nesting into a dedicated `chore: restructure continuous_learning` PR scheduled BEFORE the next CL phase \u2014 but do not skip it. Add a CI line-count guard (`pc_actor_critic.rs` <= 3000 production lines) so the monolith can't grow silently. Also extract the decay-factor helper to pay off the 3x duplication. None of this blocks release."
+}

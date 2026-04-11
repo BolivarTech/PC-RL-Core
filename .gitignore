@@ -25,5 +25,8 @@ BLOCKED.md
 # Development files
 sbtdd/
 planning/
+plans/
 Makefile
 run-tests.py
+prd.json
+scripts/ralph/runs/

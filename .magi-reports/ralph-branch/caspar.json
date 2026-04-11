@@ -1,0 +1,45 @@
+{
+  "agent": "caspar",
+  "verdict": "conditional",
+  "confidence": 0.55,
+  "summary": "Cannot validate a 4316-line CL subsystem without reading the diff; several high-risk areas demand concrete verification before merge.",
+  "reasoning": "I was given only the review brief \u2014 not the actual diff, spec, or source files. I cannot certify a +5850-line continuous-learning subsystem sight-unseen, and the brief itself flags exactly the classes of defect I would hunt for. My verdict is therefore conditional: the work may well be sound, but the risk surface described is large enough that a merge without concrete verification of the items below would be reckless. I am calibrating confidence at 0.55 because I have no direct evidence either way \u2014 only structural red flags inferred from the change shape.\n\nThe structural red flags are real. A single file growing to 4316 lines is a maintainability hazard and, more importantly for my lens, an *auditability* hazard: reviewers cannot hold that much state in their heads, and bugs hide in the seams between step(), reset_step(), EWC, Fisher lifecycle, hysteresis, and crossover reset. Continuous-learning systems are notorious for silent corruption \u2014 EWMA warmup off-by-one, Fisher accumulator drift, consolidation decay that clamps to zero and kills plasticity permanently, or EWC penalty leaking NaN through gradient clipping. None of these fail loudly; they degrade learning curves in ways only statistical validation catches. The brief notes only 102 new tests for 7 phases of novel math \u2014 that is thin for this surface area.\n\nBackward compatibility is the single highest-risk item. Legacy v2.0.0 JSON must deserialize into a well-defined disabled state, not a half-initialized ClState that silently mutates weights on first step(). `#[serde(default)]` on a bool field defaults to `false`, which is the safe direction, but the decay/EWC/Fisher sub-structs need explicit `Default` impls that produce *inert* state (lambda=0, decay=1.0, no Fisher snapshot). A single missing default can turn a loaded v2.0.0 checkpoint into a silently-drifting agent.\n\nGA crossover + CL state is the second-highest risk. If a child inherits a parent's EWMA buffer, hysteresis phase, or Fisher snapshot across a topology change, dimensions will mismatch and either panic in a hot path or \u2014 worse \u2014 be silently reshaped. The spec apparently mandates a reset; I need to see it enforced unconditionally at the crossover entry point, not conditionally inside each subsystem.\n\nEWC with lambda=0 must be a true no-op: no Fisher computation, no penalty term allocation, no per-step matrix traversal. If the code always computes the penalty and multiplies by zero, the 1-layer fast path regresses. This is cheap to verify and cheap to get wrong.",
+  "findings": [
+    {
+      "severity": "warning",
+      "title": "Monolithic pc_actor_critic.rs (4316+ lines) is an auditability risk",
+      "detail": "A single file carrying step API, EWMA, hysteresis, layer decay, EWC, Fisher, crossover reset, and serialization cannot be reviewed with confidence. Seams between these subsystems are exactly where silent CL bugs live. Recommend splitting into pc_actor_critic/{mod.rs, step.rs, plasticity.rs, ewc.rs, serde.rs} before merge, or at minimum providing a module map in the file header."
+    },
+    {
+      "severity": "warning",
+      "title": "Legacy v2.0.0 JSON deserialization must produce inert CL state",
+      "detail": "Must verify: loading a pre-CL checkpoint produces passes=false, lambda=0, decay=1.0, no Fisher snapshot, and step() on the loaded agent is bit-identical to learn() from v2.0.0. Any sub-struct missing #[serde(default)] with an *inert* Default impl can silently corrupt loaded agents. Add a round-trip test: load v2.0.0 JSON \u2192 step() \u2192 compare trajectory against v2.0.0 baseline."
+    },
+    {
+      "severity": "warning",
+      "title": "GA crossover with CL state across topology mismatches",
+      "detail": "If EWMA buffers, Fisher diagonals, or hysteresis phase survive a crossover between parents with different hidden sizes, the next step() will either panic on a dimension check or silently reshape. Reset must be unconditional and happen at the crossover entry point before any subsystem is touched. Verify with a test: crossover([27,27,18] \u00d7 [36,18]) \u2192 step() does not panic and Fisher is None."
+    },
+    {
+      "severity": "warning",
+      "title": "EWC lambda=0 fast path",
+      "detail": "Verify that lambda=0 short-circuits Fisher computation, penalty accumulation, and any per-parameter traversal. A naive `penalty = lambda * sum(fisher * (w - w_star)^2)` still walks every weight. For the 1-layer 27h config this is negligible; for [27,27,18] it is a measurable regression. Benchmark step() with ewc.lambda=0 vs v2.0.0 learn() \u2014 should be within 5%."
+    },
+    {
+      "severity": "warning",
+      "title": "Consolidation decay boundary conditions",
+      "detail": "Sigmoid-gated layer decay can clamp effective plasticity to ~0 if the surprise signal saturates low, permanently freezing a layer. Verify: (a) decay has a floor > 0, (b) the floor is configurable, (c) a test injects a long low-surprise run and asserts the layer still responds to a subsequent high-surprise event. Without this, CL can irrecoverably kill a layer."
+    },
+    {
+      "severity": "warning",
+      "title": "NaN propagation through EWMA / Fisher / gradient clip interaction",
+      "detail": "EWMA warmup with a zero-variance initial window, Fisher with a zero-gradient step, and WEIGHT_CLIP=5.0 interacting with an EWC penalty that pushes weights toward w_star can all produce 0/0 or inf*0. Need explicit tests: step() with all-zero reward, step() with NaN-injected state (should error via PcError, not propagate), and a clippy run with -W clippy::float_cmp -W clippy::float_arithmetic."
+    },
+    {
+      "severity": "info",
+      "title": "Test count (102 new) is thin for the surface area",
+      "detail": "Seven phases of novel math averaging ~14 tests each is light given the interaction matrix (EWMA \u00d7 hysteresis \u00d7 decay \u00d7 EWC \u00d7 crossover \u00d7 serde). Recommend adding: (1) a property test that step() is equivalent to learn() when all CL features are disabled, (2) a serde round-trip fuzz test, (3) a long-horizon regression test that a CL-disabled agent matches the v2.0.0 tic-tac-toe depth-8 baseline with seed=42."
+    }
+  ],
+  "recommendation": "HOLD pending concrete verification of: (1) v2.0.0 JSON round-trip producing inert CL state, (2) unconditional CL reset on GA crossover across topology mismatches, (3) EWC lambda=0 fast path (no Fisher walk), (4) decay floor preventing permanent layer freezing, (5) a CL-disabled step() matching v2.0.0 learn() bit-for-bit on the tic-tac-toe seed=42 baseline. If all five pass, downgrade to conditional-approve and merge. Also strongly recommend splitting pc_actor_critic.rs before the next feature lands \u2014 at 4316 lines it is no longer reviewable."
+}
