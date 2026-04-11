@@ -1769,6 +1769,7 @@ mod tests {
             fisher_decay: 0.9,
             fisher_ema_beta: 0.99,
             logits_reversal: false,
+            td_steps: 0,
         }
     }
 
@@ -2233,6 +2234,7 @@ mod tests {
             fisher_decay: 0.9,
             fisher_ema_beta: 0.99,
             logits_reversal: false,
+            td_steps: 0,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -3424,6 +3426,7 @@ mod tests {
             fisher_decay: 0.9,
             fisher_ema_beta: 0.99,
             logits_reversal: false,
+            td_steps: 0,
         }
     }
 
@@ -5574,5 +5577,36 @@ mod tests {
                 "td_error_buffer[{i}] became non-finite after NaN reward: {t}"
             );
         }
+    }
+
+    #[test]
+    fn test_td0_unchanged_with_td_steps_zero() {
+        // td_steps=0 must produce identical weights to current TD(0)
+        // Both agents use default_config() to ensure identical config (MAGI F1)
+        let mut cfg_a = default_config();
+        cfg_a.td_steps = 0;
+        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg_a, 42).unwrap();
+
+        let cfg_b = default_config(); // td_steps=0 by default
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg_b, 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+
+        for _ in 0..5 {
+            agent_a.step(&s1, 1.0, false);
+            agent_a.step(&s2, -1.0, true);
+            agent_b.step(&s1, 1.0, false);
+            agent_b.step(&s2, -1.0, true);
+        }
+
+        assert_eq!(
+            agent_a.actor.layers[0].weights.data, agent_b.actor.layers[0].weights.data,
+            "td_steps=0 must produce identical actor weights to default"
+        );
+        assert_eq!(
+            agent_a.critic.layers[0].weights.data, agent_b.critic.layers[0].weights.data,
+            "td_steps=0 must produce identical critic weights to default"
+        );
     }
 }
