@@ -42,7 +42,7 @@ pub enum PlasticityState {
 pub struct EwmaTracker {
     /// Current EWMA value.
     pub value: f64,
-    /// Step counter (monotonic, never resets).
+    /// Step counter. Reset to 0 on coupling-forced wake to re-enable warmup guard.
     pub k: u64,
     /// Window size `N`: determines warmup length and steady-state alpha.
     pub window: usize,
