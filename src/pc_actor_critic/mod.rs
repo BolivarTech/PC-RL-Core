@@ -1314,12 +1314,62 @@ impl<L: LinAlg> PcActorCritic<L> {
         action
     }
 
-    /// Flushes all buffered TD(n) transitions at episode end.
-    ///
-    /// Called when a terminal state is reached with `td_steps > 0`.
-    /// Processes remaining transitions with progressively shorter n-step returns.
-    fn flush_td_buffer(&mut self, _terminal_state: &[f64], _terminal_infer: &InferResult<L>) {
-        todo!("flush_td_buffer — implemented in Task 5")
+    /// Flushes the TD(n) buffer at episode end.
+    /// Pre-computes V(s) before weight updates and injects via pre_v_s
+    /// to avoid stale-estimate bias (MAGI C2).
+    /// Calls process_hysteresis after each learning step (MAGI W1).
+    fn flush_td_buffer(&mut self, terminal_state: &[f64], terminal_infer: &InferResult<L>) {
+        let buffer: Vec<TdTransition<L>> = self.td_buffer.drain(..).collect();
+        if buffer.is_empty() {
+            return;
+        }
+
+        // Pre-compute all V(s) BEFORE any weight update (MAGI C2).
+        // These values are passed to learn_continuous_inner via pre_v_s
+        // so the internal critic.forward() is bypassed.
+        let v_s_values: Vec<f64> = buffer
+            .iter()
+            .map(|t| {
+                let state_vec = self.backend.vec_to_vec(&t.state);
+                let latent_vec = self.backend.vec_to_vec(&t.infer.latent_concat);
+                let mut critic_input = state_vec;
+                critic_input.extend_from_slice(&latent_vec);
+                self.critic.forward(&critic_input)
+            })
+            .collect();
+
+        let gamma = self.config.gamma;
+
+        for (k, transition) in buffer.iter().enumerate() {
+            let remaining_rewards: Vec<f64> = buffer[k..].iter().map(|t| t.reward).collect();
+            let n_step_reward = compute_n_step_reward(gamma, &remaining_rewards);
+
+            // gamma_power unused for terminal (V(s')=0), passed for API consistency
+            let remaining_steps = buffer.len() - k;
+            let gamma_power = gamma.powi(remaining_steps as i32);
+
+            let state_vec = self.backend.vec_to_vec(&transition.state);
+            let surprise_score = transition.infer.surprise_score;
+
+            // Pass pre-computed V(s) via Some() — MAGI C2 enforcement
+            self.learn_continuous_inner(
+                &state_vec,
+                &transition.infer,
+                transition.action,
+                &transition.valid_actions,
+                n_step_reward,
+                terminal_state,
+                terminal_infer,
+                true,
+                gamma_power,
+                Some(v_s_values[k]),
+            );
+
+            // Process hysteresis after each flush step (MAGI W1)
+            if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
+                self.process_hysteresis(surprise_score, self.last_td_error.abs());
+            }
+        }
     }
 
     /// Clears step-level internal state without affecting weights or learning state.
@@ -5816,6 +5866,36 @@ mod tests {
         assert_ne!(
             w_before, w_after_step4,
             "Buffer full (3 = td_steps) — learning must fire"
+        );
+    }
+
+    #[test]
+    fn test_td_n_terminal_flush() {
+        // td_steps=5 but episode is only 3 steps → flush all at terminal
+        let mut cfg = default_config();
+        cfg.td_steps = 5;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let s3 = vec![0.0, 1.0, -1.0, 0.5, 0.0, -0.5, 1.0, -1.0, 0.5];
+
+        let w_before = agent.actor.layers[0].weights.data.clone();
+
+        agent.step(&s1, 0.0, false); // first call, no learning
+        agent.step(&s2, 1.0, false); // buffer: 1 transition
+        agent.step(&s3, -1.0, true); // terminal: flush 2 transitions
+
+        let w_after = agent.actor.layers[0].weights.data.clone();
+        assert_ne!(
+            w_before, w_after,
+            "Terminal flush must update weights even if buffer < td_steps"
+        );
+
+        // Buffer must be empty after terminal
+        assert!(
+            agent.td_buffer.is_empty(),
+            "td_buffer must be empty after terminal flush"
         );
     }
 }
