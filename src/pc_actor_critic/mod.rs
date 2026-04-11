@@ -5956,4 +5956,60 @@ mod tests {
             assert!(w.is_finite(), "Weight must be finite after NaN reward");
         }
     }
+
+    #[test]
+    fn test_td_n_serialization_config() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::serializer::{load_agent, save_agent};
+
+        let mut cfg = default_config();
+        cfg.td_steps = 4;
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let path = format!(
+            "{}/test_td_n_serde_{}.json",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        save_agent(&agent, &path, 100, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        assert_eq!(
+            loaded.config.td_steps, 4,
+            "td_steps must survive save/load round-trip"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_td_n_gamma_power_bootstrap() {
+        // TD(2) must produce different weights than TD(0)
+        let mut cfg_tdn = default_config();
+        cfg_tdn.td_steps = 2;
+        let mut agent_tdn: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_tdn, 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let s3 = vec![0.0, 1.0, -1.0, 0.5, 0.0, -0.5, 1.0, -1.0, 0.5];
+
+        agent_tdn.step(&s1, 0.0, false);
+        agent_tdn.step(&s2, 1.0, false);
+        agent_tdn.step(&s3, 2.0, false);
+
+        let mut cfg_td0 = default_config();
+        cfg_td0.td_steps = 0;
+        let mut agent_td0: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_td0, 42).unwrap();
+
+        agent_td0.step(&s1, 0.0, false);
+        agent_td0.step(&s2, 1.0, false);
+        agent_td0.step(&s3, 2.0, false);
+
+        assert_ne!(
+            agent_tdn.actor.layers[0].weights.data, agent_td0.actor.layers[0].weights.data,
+            "TD(2) must produce different weights than TD(0)"
+        );
+    }
 }
