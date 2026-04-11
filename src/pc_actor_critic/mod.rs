@@ -103,6 +103,42 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     actor_last_phase_reliable: bool,
     /// Whether the last critic PLASTIC phase was reliable (>= min_fisher_phase steps).
     critic_last_phase_reliable: bool,
+    /// Buffer for TD(n) transitions. Empty when td_steps=0.
+    #[allow(dead_code)]
+    td_buffer: VecDeque<TdTransition<L>>,
+}
+
+/// A single buffered transition for TD(n) computation.
+/// Transient — not serialized. Cleared on reset_step(), terminal, and crossover.
+#[derive(Debug, Clone)]
+struct TdTransition<L: LinAlg> {
+    /// State observation at this step.
+    #[allow(dead_code)]
+    state: L::Vector,
+    /// Inference result at this state.
+    #[allow(dead_code)]
+    infer: InferResult<L>,
+    /// Action taken.
+    #[allow(dead_code)]
+    action: usize,
+    /// Valid actions mask at this state.
+    #[allow(dead_code)]
+    valid_actions: Vec<usize>,
+    /// Reward received after taking this action.
+    #[allow(dead_code)]
+    reward: f64,
+}
+
+/// Computes the n-step discounted return from a slice of rewards.
+/// Pure function — no &self needed, avoids borrow conflicts during flush.
+fn compute_n_step_reward(gamma: f64, rewards: &[f64]) -> f64 {
+    let mut g = 0.0;
+    let mut gamma_power = 1.0;
+    for &r in rewards {
+        g += gamma_power * r;
+        gamma_power *= gamma;
+    }
+    g
 }
 
 impl<L: LinAlg> PcActorCritic<L> {
@@ -367,6 +403,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             critic_fisher,
             actor_last_phase_reliable: false,
             critic_last_phase_reliable: false,
+            td_buffer: VecDeque::new(),
         })
     }
 
@@ -477,6 +514,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             critic_fisher: Vec::new(),
             actor_last_phase_reliable: false,
             critic_last_phase_reliable: false,
+            td_buffer: VecDeque::new(),
         })
     }
 
@@ -522,6 +560,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             critic_fisher: Vec::new(),
             actor_last_phase_reliable: false,
             critic_last_phase_reliable: false,
+            td_buffer: VecDeque::new(),
         }
     }
 
@@ -5608,5 +5647,29 @@ mod tests {
             agent_a.critic.layers[0].weights.data, agent_b.critic.layers[0].weights.data,
             "td_steps=0 must produce identical critic weights to default"
         );
+    }
+
+    #[test]
+    fn test_td_n_return_computation() {
+        let gamma = 0.95;
+        let rewards = [1.0, 2.0, 3.0];
+        let expected = 1.0 + 0.95 * 2.0 + 0.95 * 0.95 * 3.0;
+        let result = compute_n_step_reward(gamma, &rewards);
+        assert!(
+            (result - expected).abs() < 1e-12,
+            "n-step return: expected {expected}, got {result}"
+        );
+    }
+
+    #[test]
+    fn test_td_n_return_single_step() {
+        let result = compute_n_step_reward(0.95, &[5.0]);
+        assert!((result - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_td_n_return_empty() {
+        let result = compute_n_step_reward(0.95, &[]);
+        assert!((result).abs() < f64::EPSILON);
     }
 }
