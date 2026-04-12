@@ -6659,4 +6659,83 @@ mod tests {
             "GAE(0.0) must be identical to TD(0) when entropy=0"
         );
     }
+
+    #[test]
+    fn test_gae_nan_reward_safe() {
+        // NaN reward triggers td_error guard BEFORE GAE trace code.
+        // Verify: weights unchanged, trace unchanged (MAGI W5: snapshot).
+        let cfg = default_config();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let s1 = vec![1.0; 9];
+        let s2 = vec![0.5; 9];
+        agent.step(&s1, 0.0, false);
+
+        let trace_before = agent.actor_trace.clone();
+        let weights_before = agent.actor.layers[0].weights.data.clone();
+
+        agent.step(&s2, f64::NAN, false);
+
+        assert_eq!(
+            agent.actor_trace, trace_before,
+            "Trace must be unchanged after NaN reward"
+        );
+        assert_eq!(
+            agent.actor.layers[0].weights.data, weights_before,
+            "Weights must be unchanged after NaN reward"
+        );
+    }
+
+    #[test]
+    fn test_gae_serialization_config() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::serializer::{load_agent, save_agent};
+
+        let cfg = default_config(); // gae_lambda = Some(0.95)
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let path = format!(
+            "{}/test_gae_serde_{}.json",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        save_agent(&agent, &path, 100, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        assert_eq!(loaded.config.gae_lambda, Some(0.95));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_gae_trace_not_serialized() {
+        // Trace is transient — should not persist across save/load
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::serializer::{load_agent, save_agent};
+
+        let cfg = default_config();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Accumulate some trace
+        let s1 = vec![1.0; 9];
+        let s2 = vec![0.5; 9];
+        agent.step(&s1, 0.0, false);
+        agent.step(&s2, 1.0, false);
+
+        let path = format!(
+            "{}/test_gae_trace_transient_{}.json",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        save_agent(&agent, &path, 100, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        // Loaded agent should have fresh zero trace
+        assert!(
+            loaded.actor_trace.iter().all(|&v| v == 0.0),
+            "Trace must be zero after load (transient)"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
