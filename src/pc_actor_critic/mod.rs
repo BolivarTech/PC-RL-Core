@@ -7480,4 +7480,216 @@ mod tests {
             "Expected mutual exclusion error, got: {err_msg}"
         );
     }
+
+    // ── apply_config: integration ─────────────────────────────────────
+
+    #[test]
+    fn test_apply_config_then_step_works() {
+        let mut agent = make_agent();
+        let state = vec![0.5; 9];
+        let _ = agent.step(&state, 0.0, false);
+        let _ = agent.step(&state, 1.0, false);
+
+        let mut new_config = default_config();
+        new_config.gamma = 0.99;
+        new_config.entropy_coeff = 0.0;
+        agent.apply_config(new_config).unwrap();
+
+        let action = agent.step(&state, 0.0, false);
+        assert!(action < 9);
+        let action2 = agent.step(&state, 1.0, false);
+        assert!(action2 < 9);
+        let _ = agent.step(&state, 0.0, true);
+    }
+
+    #[test]
+    fn test_apply_config_then_step_masked_works() {
+        let mut agent = make_agent();
+        let state = vec![0.5; 9];
+        let valid = vec![0, 3, 6];
+        let _ = agent.step_masked(&state, &valid, 0.0, false).unwrap();
+
+        let mut new_config = default_config();
+        new_config.surprise_low = 0.01;
+        new_config.surprise_high = 0.2;
+        agent.apply_config(new_config).unwrap();
+
+        let action = agent.step_masked(&state, &valid, 0.0, false).unwrap();
+        assert!(valid.contains(&action));
+        let _ = agent.step_masked(&state, &valid, 1.0, true).unwrap();
+    }
+
+    #[test]
+    fn test_apply_config_mid_td_n_episode_clears_buffer() {
+        let mut config = default_config();
+        config.td_steps = 4;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        let state = vec![0.5; 9];
+        let _ = agent.step(&state, 0.0, false);
+        let _ = agent.step(&state, 1.0, false);
+        assert!(
+            !agent.td_buffer.is_empty(),
+            "TD buffer should have transitions"
+        );
+
+        let mut new_config = default_config();
+        new_config.td_steps = 0;
+        agent.apply_config(new_config).unwrap();
+        assert!(agent.td_buffer.is_empty());
+
+        let action = agent.step(&state, 0.0, false);
+        assert!(action < 9);
+        let _ = agent.step(&state, 0.5, true);
+    }
+
+    #[test]
+    fn test_apply_config_new_gamma_takes_effect() {
+        let mut agent = make_agent();
+        let state = vec![0.5; 9];
+        let _ = agent.step(&state, 0.0, false);
+        let _ = agent.step(&state, 1.0, true);
+        let w_after_first = agent.actor.layers[0].weights.data.clone();
+
+        let mut new_config = default_config();
+        new_config.gamma = 0.5;
+        agent.apply_config(new_config).unwrap();
+
+        let _ = agent.step(&state, 0.0, false);
+        let _ = agent.step(&state, 1.0, true);
+
+        assert_ne!(
+            agent.actor.layers[0].weights.data, w_after_first,
+            "Weights should change after step() with new config"
+        );
+        assert!((agent.config.gamma - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_apply_config_preserves_weights_across_multiple_calls() {
+        let mut agent = make_agent();
+        let w_orig = agent.actor.layers[0].weights.data.clone();
+
+        let mut c1 = default_config();
+        c1.gamma = 0.9;
+        agent.apply_config(c1).unwrap();
+        assert_eq!(agent.actor.layers[0].weights.data, w_orig);
+
+        let mut c2 = default_config();
+        c2.gamma = 0.99;
+        c2.entropy_coeff = 0.0;
+        agent.apply_config(c2).unwrap();
+        assert_eq!(agent.actor.layers[0].weights.data, w_orig);
+
+        let mut c3 = default_config();
+        c3.actor_hysteresis = true;
+        c3.ewc_lambda = 0.5;
+        agent.apply_config(c3).unwrap();
+        assert_eq!(agent.actor.layers[0].weights.data, w_orig);
+    }
+
+    // ── MAGI W3: serialization round-trip after apply_config ─────────
+
+    #[test]
+    fn test_apply_config_serialization_round_trip() {
+        use crate::serializer;
+
+        let mut agent = make_agent();
+        let state = vec![0.5; 9];
+        let _ = agent.step(&state, 0.0, false);
+        let _ = agent.step(&state, 1.0, true);
+
+        let mut new_config = default_config();
+        new_config.gamma = 0.99;
+        new_config.entropy_coeff = 0.0;
+        agent.apply_config(new_config).unwrap();
+
+        let _ = agent.step(&state, 0.0, false);
+        let _ = agent.step(&state, 0.5, true);
+
+        let (action_before, _) = agent.act(&state, &[0, 1, 2, 3], SelectionMode::Play);
+        let w_before = agent.actor.layers[0].weights.data.clone();
+
+        let path = "test_apply_config_roundtrip.json";
+        serializer::save_agent(&agent, path, 0, None).expect("serialize failed");
+        let (mut loaded, _meta) =
+            serializer::load_agent(path, CpuLinAlg::new()).expect("deserialize failed");
+        std::fs::remove_file(path).ok();
+
+        // JSON serialization preserves f64 to ~15 significant digits; use
+        // a tight relative tolerance rather than exact bit-for-bit equality.
+        let max_weight_err = loaded.actor.layers[0]
+            .weights
+            .data
+            .iter()
+            .zip(w_before.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_weight_err < 1e-12,
+            "Weight round-trip error too large: {max_weight_err}"
+        );
+        assert!((loaded.config.gamma - 0.99).abs() < 1e-12);
+        assert!((loaded.config.entropy_coeff).abs() < 1e-12);
+
+        // MAGI v2: sub-config coherence
+        assert_eq!(
+            loaded.config.actor.lr_weights, loaded.actor.config.lr_weights,
+            "actor lr_weights diverged after round-trip"
+        );
+        assert_eq!(
+            loaded.config.actor.temperature, loaded.actor.config.temperature,
+            "actor temperature diverged after round-trip"
+        );
+        assert_eq!(
+            loaded.config.actor.local_lambda, loaded.actor.config.local_lambda,
+            "actor local_lambda diverged after round-trip"
+        );
+        assert_eq!(
+            loaded.config.critic.lr, loaded.critic.config.lr,
+            "critic lr diverged after round-trip"
+        );
+
+        let (action_after, _) = loaded.act(&state, &[0, 1, 2, 3], SelectionMode::Play);
+        assert_eq!(
+            action_before, action_after,
+            "Behavioral equivalence after round-trip"
+        );
+    }
+
+    // ── MAGI I2: GAE → TD(n) mode switch via apply_config ────────────
+
+    #[test]
+    fn test_apply_config_gae_to_td_switch() {
+        let mut config = default_config();
+        config.gae_lambda = Some(0.95);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        assert_eq!(agent.actor_trace.len(), 9);
+
+        let mut new_config = default_config();
+        new_config.td_steps = 4;
+        new_config.gae_lambda = None;
+        agent.apply_config(new_config).unwrap();
+
+        assert!(agent.actor_trace.is_empty());
+        assert_eq!(agent.config.td_steps, 4);
+        assert!(agent.config.gae_lambda.is_none());
+
+        let state = vec![0.5; 9];
+        let action = agent.step(&state, 0.0, false);
+        assert!(action < 9);
+        let _ = agent.step(&state, 1.0, true);
+    }
+
+    #[test]
+    fn test_apply_config_enables_adaptive_consolidation() {
+        let mut agent = make_agent();
+        assert!(agent.layer_error_ema.is_empty());
+
+        let mut new_config = default_config();
+        new_config.adaptive_consolidation = true;
+        agent.apply_config(new_config).unwrap();
+
+        assert_eq!(agent.layer_error_ema.len(), 1);
+        assert!((agent.layer_error_ema[0]).abs() < 1e-12);
+    }
 }
