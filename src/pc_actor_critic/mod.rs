@@ -178,6 +178,67 @@ impl<L: LinAlg> PcActorCritic<L> {
         (actor_decay_factors, critic_decay_factors, layer_error_ema)
     }
 
+    /// Builds an optional `HysteresisState` from config parameters.
+    ///
+    /// Returns `Some(fresh Plastic state)` when enabled, `None` when disabled.
+    /// Shared by `new()` and `apply_config()` to avoid construction duplication.
+    fn build_hysteresis(
+        enabled: bool,
+        fast_window: usize,
+        slow_window: usize,
+        wake_fraction: f64,
+        sleep_fraction: f64,
+    ) -> Option<HysteresisState> {
+        if enabled {
+            Some(HysteresisState {
+                fast: EwmaTracker::new(fast_window),
+                slow: EwmaTracker::new(slow_window),
+                state: PlasticityState::Plastic,
+                wake_fraction,
+                sleep_fraction,
+                min_initial_plastic: slow_window as u64,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Allocates Fisher state for a set of layers when EWC is enabled.
+    ///
+    /// Returns one `FisherState` per layer when `ewc_lambda > 0`, or an empty
+    /// `Vec` when EWC is disabled (zero overhead).
+    /// Shared by `new()` and `apply_config()`.
+    fn build_fisher_for_layers(
+        backend: &L,
+        layers: &[crate::layer::Layer<L>],
+        ewc_lambda: f64,
+    ) -> Vec<FisherState<L>> {
+        if ewc_lambda > 0.0 {
+            layers
+                .iter()
+                .map(|layer| {
+                    let rows = backend.mat_rows(&layer.weights);
+                    let cols = backend.mat_cols(&layer.weights);
+                    let bias_size = backend.vec_len(&layer.bias);
+                    FisherState::new(backend, rows, cols, bias_size)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Computes the minimum Fisher phase length from `fisher_ema_beta`.
+    ///
+    /// Returns `ceil(1 / (1 - beta))` when EWC is enabled, 0 otherwise.
+    fn min_fisher_phase(config: &PcActorCriticConfig) -> u64 {
+        if config.ewc_lambda > 0.0 {
+            (1.0 / (1.0 - config.fisher_ema_beta)).ceil() as u64
+        } else {
+            0
+        }
+    }
+
     /// Validates a [`PcActorCriticConfig`] for internal consistency.
     ///
     /// Checks gamma range, surprise buffer size, scale floor/ceil ordering,
@@ -193,6 +254,63 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// Returns [`PcError::ConfigValidation`] with a descriptive message on
     /// the first failing check.
     fn validate_config(config: &PcActorCriticConfig) -> Result<(), PcError> {
+        // Per-network f64 fields: reject NaN/Inf early to prevent confusing
+        // topology-mismatch errors downstream (NaN != NaN is always true).
+        if !config.actor.lr_weights.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor lr_weights must be finite, got {}",
+                config.actor.lr_weights
+            )));
+        }
+        if !config.actor.alpha.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor alpha must be finite, got {}",
+                config.actor.alpha
+            )));
+        }
+        if !config.actor.tol.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor tol must be finite, got {}",
+                config.actor.tol
+            )));
+        }
+        if !config.actor.temperature.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor temperature must be finite, got {}",
+                config.actor.temperature
+            )));
+        }
+        if !config.actor.local_lambda.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor local_lambda must be finite, got {}",
+                config.actor.local_lambda
+            )));
+        }
+        if !config.actor.rezero_init.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor rezero_init must be finite, got {}",
+                config.actor.rezero_init
+            )));
+        }
+        if !config.critic.lr.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "critic lr must be finite, got {}",
+                config.critic.lr
+            )));
+        }
+        if !config.scale_floor.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "scale_floor must be finite, got {}",
+                config.scale_floor
+            )));
+        }
+        if !config.scale_ceil.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "scale_ceil must be finite, got {}",
+                config.scale_ceil
+            )));
+        }
+
         if !(0.0..=1.0).contains(&config.gamma) {
             return Err(PcError::ConfigValidation(format!(
                 "gamma must be in [0.0, 1.0], got {}",
@@ -350,6 +468,10 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// Returns [`PcError::ConfigValidation`] identifying which field mismatches.
     fn validate_topology_match(&self, config: &PcActorCriticConfig) -> Result<(), PcError> {
+        // MAINTENANCE: This function checks ALL 14 PcActorConfig fields and
+        // ALL 4 MlpCriticConfig fields (20 total). When adding a new field to
+        // either config struct, add a corresponding check here.
+
         // Actor topology checks
         if self.config.actor.input_size != config.actor.input_size {
             return Err(PcError::ConfigValidation(format!(
@@ -496,8 +618,9 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// Reconfigures **agent-level** learning parameters (gamma, surprise, CL,
     /// TD/GAE mode). Per-network parameters (actor lr, temperature, alpha;
     /// critic lr) cannot be changed here — they require dedicated setter
-    /// methods to maintain internal consistency between `self.config.actor`
-    /// and `self.actor.config`.
+    /// methods (planned) to maintain internal consistency between
+    /// `self.config.actor` and `self.actor.config`. Pass the same actor/critic
+    /// sub-config the agent was constructed with; mismatches are rejected.
     ///
     /// All continuous learning state is reset to provide a clean baseline.
     ///
@@ -519,13 +642,22 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// Returns `PcError::ConfigValidation` if the new config fails validation
     /// or if its topology does not match the current agent.
     pub fn apply_config(&mut self, config: PcActorCriticConfig) -> Result<(), PcError> {
-        // 0. Defense-in-depth: verify config coherence invariant (MAGI v2 Caspar W1)
+        // 0. Defense-in-depth: verify config coherence invariant.
+        // All per-network fields in self.config.actor/critic must match
+        // self.actor.config / self.critic.config. If not, a prior mutation
+        // bypassed the API contract. Do not make these fields pub without
+        // adding a runtime check.
         debug_assert!(
             self.config.actor.lr_weights == self.actor.config.lr_weights
                 && self.config.actor.temperature == self.actor.config.temperature
                 && self.config.actor.alpha == self.actor.config.alpha
+                && self.config.actor.tol == self.actor.config.tol
+                && self.config.actor.min_steps == self.actor.config.min_steps
+                && self.config.actor.max_steps == self.actor.config.max_steps
                 && self.config.actor.local_lambda == self.actor.config.local_lambda
-                && self.config.critic.lr == self.critic.config.lr,
+                && self.config.actor.synchronous == self.actor.config.synchronous
+                && self.config.critic.lr == self.critic.config.lr
+                && self.config.critic.output_activation == self.critic.config.output_activation,
             "BUG: self.config and self.actor/critic.config are out of sync"
         );
 
@@ -540,76 +672,36 @@ impl<L: LinAlg> PcActorCritic<L> {
             Self::compute_decay_factors(&config);
         let trace_len = Self::gae_trace_len(&config);
 
-        // 4. Rebuild hysteresis state machines
-        let actor_hysteresis = if config.actor_hysteresis {
-            Some(HysteresisState {
-                fast: EwmaTracker::new(config.actor_fast_window),
-                slow: EwmaTracker::new(config.actor_slow_window),
-                state: PlasticityState::Plastic,
-                wake_fraction: config.actor_wake_fraction,
-                sleep_fraction: config.actor_sleep_fraction,
-                min_initial_plastic: config.actor_slow_window as u64,
-            })
-        } else {
-            None
-        };
-        let critic_hysteresis = if config.critic_hysteresis {
-            Some(HysteresisState {
-                fast: EwmaTracker::new(config.critic_fast_window),
-                slow: EwmaTracker::new(config.critic_slow_window),
-                state: PlasticityState::Plastic,
-                wake_fraction: config.critic_wake_fraction,
-                sleep_fraction: config.critic_sleep_fraction,
-                min_initial_plastic: config.critic_slow_window as u64,
-            })
-        } else {
-            None
-        };
+        // 4. Rebuild hysteresis state machines (DRY via build_hysteresis helper)
+        let mut actor_hysteresis = Self::build_hysteresis(
+            config.actor_hysteresis,
+            config.actor_fast_window,
+            config.actor_slow_window,
+            config.actor_wake_fraction,
+            config.actor_sleep_fraction,
+        );
+        let mut critic_hysteresis = Self::build_hysteresis(
+            config.critic_hysteresis,
+            config.critic_fast_window,
+            config.critic_slow_window,
+            config.critic_wake_fraction,
+            config.critic_sleep_fraction,
+        );
 
         // 5. Update min_initial_plastic for Fisher warmup
-        let min_fisher_phase = if config.ewc_lambda > 0.0 {
-            (1.0 / (1.0 - config.fisher_ema_beta)).ceil() as u64
-        } else {
-            0
-        };
-        let mut actor_hysteresis = actor_hysteresis;
+        let mfp = Self::min_fisher_phase(&config);
         if let Some(ref mut hyst) = actor_hysteresis {
-            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, min_fisher_phase);
+            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, mfp);
         }
-        let mut critic_hysteresis = critic_hysteresis;
         if let Some(ref mut hyst) = critic_hysteresis {
-            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, min_fisher_phase);
+            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, mfp);
         }
 
-        // 6. Reallocate Fisher state (split borrows: read from self.actor.layers, write to self.actor_fisher)
-        let actor_fisher = if config.ewc_lambda > 0.0 {
-            self.actor
-                .layers
-                .iter()
-                .map(|layer| {
-                    let rows = self.backend.mat_rows(&layer.weights);
-                    let cols = self.backend.mat_cols(&layer.weights);
-                    let bias_size = self.backend.vec_len(&layer.bias);
-                    FisherState::new(&self.backend, rows, cols, bias_size)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let critic_fisher = if config.ewc_lambda > 0.0 {
-            self.critic
-                .layers
-                .iter()
-                .map(|layer| {
-                    let rows = self.backend.mat_rows(&layer.weights);
-                    let cols = self.backend.mat_cols(&layer.weights);
-                    let bias_size = self.backend.vec_len(&layer.bias);
-                    FisherState::new(&self.backend, rows, cols, bias_size)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // 6. Reallocate Fisher state (DRY via build_fisher_for_layers helper)
+        let actor_fisher =
+            Self::build_fisher_for_layers(&self.backend, &self.actor.layers, config.ewc_lambda);
+        let critic_fisher =
+            Self::build_fisher_for_layers(&self.backend, &self.critic.layers, config.ewc_lambda);
 
         // 7. Apply all fields atomically
         self.config = config;
@@ -657,84 +749,41 @@ impl<L: LinAlg> PcActorCritic<L> {
         let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
             Self::compute_decay_factors(&config);
 
-        // Build hysteresis state machines when enabled
-        let actor_hysteresis = if config.actor_hysteresis {
-            Some(HysteresisState {
-                fast: EwmaTracker::new(config.actor_fast_window),
-                slow: EwmaTracker::new(config.actor_slow_window),
-                state: PlasticityState::Plastic,
-                wake_fraction: config.actor_wake_fraction,
-                sleep_fraction: config.actor_sleep_fraction,
-                min_initial_plastic: config.actor_slow_window as u64,
-            })
-        } else {
-            None
-        };
+        // Build hysteresis state machines (DRY via build_hysteresis helper)
+        let mut actor_hysteresis = Self::build_hysteresis(
+            config.actor_hysteresis,
+            config.actor_fast_window,
+            config.actor_slow_window,
+            config.actor_wake_fraction,
+            config.actor_sleep_fraction,
+        );
+        let mut critic_hysteresis = Self::build_hysteresis(
+            config.critic_hysteresis,
+            config.critic_fast_window,
+            config.critic_slow_window,
+            config.critic_wake_fraction,
+            config.critic_sleep_fraction,
+        );
 
-        let critic_hysteresis = if config.critic_hysteresis {
-            Some(HysteresisState {
-                fast: EwmaTracker::new(config.critic_fast_window),
-                slow: EwmaTracker::new(config.critic_slow_window),
-                state: PlasticityState::Plastic,
-                wake_fraction: config.critic_wake_fraction,
-                sleep_fraction: config.critic_sleep_fraction,
-                min_initial_plastic: config.critic_slow_window as u64,
-            })
-        } else {
-            None
-        };
-
-        // Compute min_fisher_phase and update hysteresis warmup guard
-        let min_fisher_phase = if config.ewc_lambda > 0.0 {
-            (1.0 / (1.0 - config.fisher_ema_beta)).ceil() as u64
-        } else {
-            0
-        };
+        // Update min_initial_plastic for Fisher warmup
+        let mfp = Self::min_fisher_phase(&config);
+        if let Some(ref mut hyst) = actor_hysteresis {
+            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, mfp);
+        }
+        if let Some(ref mut hyst) = critic_hysteresis {
+            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, mfp);
+        }
 
         use rand::SeedableRng;
         let mut rng = StdRng::seed_from_u64(seed);
         let actor = PcActor::<L>::new(backend.clone(), config.actor.clone(), &mut rng)?;
         let critic = MlpCritic::<L>::new(backend.clone(), config.critic.clone(), &mut rng)?;
 
-        // Allocate Fisher state when EWC is enabled
-        let actor_fisher = if config.ewc_lambda > 0.0 {
-            actor
-                .layers
-                .iter()
-                .map(|layer| {
-                    let rows = backend.mat_rows(&layer.weights);
-                    let cols = backend.mat_cols(&layer.weights);
-                    let bias_size = backend.vec_len(&layer.bias);
-                    FisherState::new(&backend, rows, cols, bias_size)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let critic_fisher = if config.ewc_lambda > 0.0 {
-            critic
-                .layers
-                .iter()
-                .map(|layer| {
-                    let rows = backend.mat_rows(&layer.weights);
-                    let cols = backend.mat_cols(&layer.weights);
-                    let bias_size = backend.vec_len(&layer.bias);
-                    FisherState::new(&backend, rows, cols, bias_size)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // Update hysteresis min_initial_plastic to max(slow_window, min_fisher_phase)
-        let mut actor_hysteresis = actor_hysteresis;
-        if let Some(ref mut hyst) = actor_hysteresis {
-            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, min_fisher_phase);
-        }
-        let mut critic_hysteresis = critic_hysteresis;
-        if let Some(ref mut hyst) = critic_hysteresis {
-            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, min_fisher_phase);
-        }
+        // Allocate Fisher state (DRY via build_fisher_for_layers helper)
+        let actor_fisher =
+            Self::build_fisher_for_layers(&backend, &actor.layers, config.ewc_lambda);
+        let critic_fisher =
+            Self::build_fisher_for_layers(&backend, &critic.layers, config.ewc_lambda);
         let new_trace_len = Self::gae_trace_len(&config);
 
         Ok(Self {
@@ -7544,24 +7593,49 @@ mod tests {
 
     #[test]
     fn test_apply_config_new_gamma_takes_effect() {
-        let mut agent = make_agent();
+        // Create two agents from the same seed, train identically for 1 episode,
+        // then diverge only on gamma via apply_config. The weight deltas after
+        // the second episode must differ, proving gamma causality.
+        // Key: the second episode must include a NON-TERMINAL step where
+        // td_target = reward + gamma * V(next), so gamma actually matters.
+        // Terminal steps use td_target = reward (gamma irrelevant).
+        let mut agent_a = make_agent();
+        let mut agent_b = make_agent();
         let state = vec![0.5; 9];
-        let _ = agent.step(&state, 0.0, false);
-        let _ = agent.step(&state, 1.0, true);
-        let w_after_first = agent.actor.layers[0].weights.data.clone();
 
+        // Identical warmup episode (3 steps: init, non-terminal learn, terminal)
+        let _ = agent_a.step(&state, 0.0, false);
+        let _ = agent_a.step(&state, 1.0, false); // non-terminal: gamma matters
+        let _ = agent_a.step(&state, 0.5, true);
+        let _ = agent_b.step(&state, 0.0, false);
+        let _ = agent_b.step(&state, 1.0, false);
+        let _ = agent_b.step(&state, 0.5, true);
+
+        // Both should have identical weights after identical training
+        assert_eq!(
+            agent_a.actor.layers[0].weights.data,
+            agent_b.actor.layers[0].weights.data
+        );
+
+        // Diverge: agent_a keeps gamma=0.95, agent_b gets gamma=0.5
         let mut new_config = default_config();
         new_config.gamma = 0.5;
-        agent.apply_config(new_config).unwrap();
+        agent_b.apply_config(new_config).unwrap();
 
-        let _ = agent.step(&state, 0.0, false);
-        let _ = agent.step(&state, 1.0, true);
+        // Second episode with non-terminal steps where gamma matters
+        let _ = agent_a.step(&state, 0.0, false);
+        let _ = agent_a.step(&state, 1.0, false); // td_target = 1.0 + 0.95*V(s)
+        let _ = agent_a.step(&state, 0.5, true);
+        let _ = agent_b.step(&state, 0.0, false);
+        let _ = agent_b.step(&state, 1.0, false); // td_target = 1.0 + 0.50*V(s)
+        let _ = agent_b.step(&state, 0.5, true);
 
+        // Weights must now differ — different gamma produces different TD targets
         assert_ne!(
-            agent.actor.layers[0].weights.data, w_after_first,
-            "Weights should change after step() with new config"
+            agent_a.actor.layers[0].weights.data, agent_b.actor.layers[0].weights.data,
+            "Different gamma should produce different weight updates"
         );
-        assert!((agent.config.gamma - 0.5).abs() < 1e-12);
+        assert!((agent_b.config.gamma - 0.5).abs() < 1e-12);
     }
 
     #[test]
@@ -7609,11 +7683,15 @@ mod tests {
         let (action_before, _) = agent.act(&state, &[0, 1, 2, 3], SelectionMode::Play);
         let w_before = agent.actor.layers[0].weights.data.clone();
 
-        let path = "test_apply_config_roundtrip.json";
-        serializer::save_agent(&agent, path, 0, None).expect("serialize failed");
+        let path = format!(
+            "{}/test_apply_config_roundtrip_{}.json",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        serializer::save_agent(&agent, &path, 0, None).expect("serialize failed");
         let (mut loaded, _meta) =
-            serializer::load_agent(path, CpuLinAlg::new()).expect("deserialize failed");
-        std::fs::remove_file(path).ok();
+            serializer::load_agent(&path, CpuLinAlg::new()).expect("deserialize failed");
+        std::fs::remove_file(&path).ok();
 
         // JSON serialization preserves f64 to ~15 significant digits; use
         // a tight relative tolerance rather than exact bit-for-bit equality.
