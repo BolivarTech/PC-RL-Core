@@ -1034,6 +1034,53 @@ impl<L: LinAlg> PcActorCritic<L> {
         let pi_l = self.backend.softmax_masked(&scaled_l, valid_actions);
         let pi = self.backend.vec_to_vec(&pi_l);
 
+        // --- GAE(λ) eligibility trace path ---
+        if let Some(lambda) = self.config.gae_lambda {
+            // Gradient direction WITHOUT td_error scaling
+            let mut grad_direction = vec![0.0; pi.len()];
+            for &i in valid_actions {
+                grad_direction[i] = pi[i];
+            }
+            grad_direction[action] -= 1.0;
+
+            // Decay trace: trace = γλ * trace
+            let gamma_lambda = self.config.gamma * lambda;
+            for v in &mut self.actor_trace {
+                *v *= gamma_lambda;
+            }
+            // Accumulate: trace += gradient_direction
+            for (i, &g) in grad_direction.iter().enumerate() {
+                self.actor_trace[i] += g;
+            }
+
+            // Clip trace to prevent overflow (MAGI C2)
+            for v in &mut self.actor_trace {
+                *v = v.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
+            }
+
+            // Effective delta = td_error * trace
+            let mut delta: Vec<f64> = self.actor_trace.iter().map(|&t| td_error * t).collect();
+
+            // Entropy regularization per-step (not accumulated in trace)
+            for &i in valid_actions {
+                let log_pi = (pi[i].max(1e-10)).ln();
+                delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
+            }
+
+            // Use shared bookkeeping
+            return self.apply_actor_update_and_bookkeeping(
+                &delta,
+                infer,
+                input,
+                &y_conv_vec,
+                valid_actions,
+                action,
+                td_error,
+                loss,
+            );
+        }
+
+        // --- Standard TD(0)/TD(n) path continues below ---
         let mut delta = vec![0.0; pi.len()];
         for &i in valid_actions {
             delta[i] = pi[i];
@@ -1050,6 +1097,50 @@ impl<L: LinAlg> PcActorCritic<L> {
             delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
         }
 
+        self.apply_actor_update_and_bookkeeping(
+            &delta,
+            infer,
+            input,
+            &y_conv_vec,
+            valid_actions,
+            action,
+            td_error,
+            loss,
+        )
+    }
+
+    /// Shared post-delta bookkeeping: scale/decay, EWC/Fisher, weight update,
+    /// M3b layer error EMA, surprise push, td_error push.
+    ///
+    /// Called by both GAE and standard learning paths after computing their
+    /// respective deltas.
+    ///
+    /// # Arguments
+    ///
+    /// * `delta` - Policy gradient delta (already scaled by td_error or trace).
+    /// * `infer` - Inference result from `act` at current state.
+    /// * `input` - Current state.
+    /// * `y_conv_vec` - Converged output logits as host Vec.
+    /// * `valid_actions` - Valid actions at current state.
+    /// * `action` - Action taken.
+    /// * `td_error` - Temporal difference error.
+    /// * `loss` - Critic loss to return.
+    ///
+    /// # Returns
+    ///
+    /// Critic loss (pass-through).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_actor_update_and_bookkeeping(
+        &mut self,
+        delta: &[f64],
+        infer: &InferResult<L>,
+        input: &[f64],
+        y_conv_vec: &[f64],
+        valid_actions: &[usize],
+        action: usize,
+        td_error: f64,
+        loss: f64,
+    ) -> f64 {
         let s_scale = self.effective_actor_scale(infer.surprise_score);
         let actor_decay = self.effective_actor_decay();
 
@@ -1069,7 +1160,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                 fd[action] -= 1.0;
                 fd
             } else {
-                delta.clone()
+                delta.to_vec()
             };
             self.accumulate_actor_fisher_ema(&fisher_delta, infer, input, s_scale, &actor_decay);
 
@@ -1084,13 +1175,13 @@ impl<L: LinAlg> PcActorCritic<L> {
                 self.actor.layers.iter().map(|l| l.bias.clone()).collect();
 
             self.actor
-                .update_weights(&delta, infer, input, s_scale, &actor_decay);
+                .update_weights(delta, infer, input, s_scale, &actor_decay);
 
             // Apply EWC post-correction per layer
             self.apply_actor_ewc_correction(&pre_weights, &pre_biases, s_scale, &actor_decay);
         } else {
             self.actor
-                .update_weights(&delta, infer, input, s_scale, &actor_decay);
+                .update_weights(delta, infer, input, s_scale, &actor_decay);
         }
 
         // Update per-layer prediction error EMA for adaptive consolidation (M3b)
@@ -6473,6 +6564,99 @@ mod tests {
         assert!(
             agent.actor_trace.is_empty(),
             "Trace must be empty when gae_lambda=None"
+        );
+    }
+
+    #[test]
+    fn test_gae_trace_accumulates_across_steps() {
+        let cfg = default_config();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        assert!(agent.actor_trace.iter().all(|&v| v == 0.0));
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        agent.step(&s1, 0.0, false);
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        agent.step(&s2, 1.0, false);
+        assert!(
+            agent.actor_trace.iter().any(|&v| v.abs() > 1e-10),
+            "Trace must accumulate after learning step"
+        );
+    }
+
+    #[test]
+    fn test_gae_trace_resets_on_terminal() {
+        let cfg = default_config();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let s1 = vec![1.0; 9];
+        let s2 = vec![0.5; 9];
+        agent.step(&s1, 0.0, false);
+        agent.step(&s2, 1.0, true);
+        assert!(
+            agent.actor_trace.iter().all(|&v| v == 0.0),
+            "Trace must reset on terminal"
+        );
+    }
+
+    #[test]
+    fn test_gae_trace_resets_on_reset_step() {
+        let cfg = default_config();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let s1 = vec![1.0; 9];
+        let s2 = vec![0.5; 9];
+        agent.step(&s1, 0.0, false);
+        agent.step(&s2, 1.0, false);
+        agent.reset_step();
+        assert!(
+            agent.actor_trace.iter().all(|&v| v == 0.0),
+            "Trace must reset on reset_step"
+        );
+    }
+
+    #[test]
+    fn test_gae_produces_different_weights_than_td0() {
+        let mut cfg_gae = default_config();
+        cfg_gae.gae_lambda = Some(0.95);
+        let mut agent_gae: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_gae, 42).unwrap();
+        let mut cfg_td0 = default_config();
+        cfg_td0.gae_lambda = None;
+        let mut agent_td0: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_td0, 42).unwrap();
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let s3 = vec![0.0, 1.0, -1.0, 0.5, 0.0, -0.5, 1.0, -1.0, 0.5];
+        for agent in [&mut agent_gae, &mut agent_td0] {
+            agent.step(&s1, 0.0, false);
+            agent.step(&s2, 1.0, false);
+            agent.step(&s3, -1.0, true);
+        }
+        assert_ne!(
+            agent_gae.actor.layers[0].weights.data, agent_td0.actor.layers[0].weights.data,
+            "GAE(0.95) must produce different weights than TD(0)"
+        );
+    }
+
+    #[test]
+    fn test_gae_lambda_zero_matches_td0() {
+        // NOTE (MAGI C1): Equivalence holds ONLY when entropy_coeff=0.0.
+        let mut cfg_gae0 = default_config();
+        cfg_gae0.entropy_coeff = 0.0;
+        cfg_gae0.gae_lambda = Some(0.0);
+        let mut agent_gae0: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_gae0, 42).unwrap();
+        let mut cfg_td0 = default_config();
+        cfg_td0.entropy_coeff = 0.0;
+        cfg_td0.gae_lambda = None;
+        let mut agent_td0: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_td0, 42).unwrap();
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for agent in [&mut agent_gae0, &mut agent_td0] {
+            agent.step(&s1, 0.0, false);
+            agent.step(&s2, 1.0, true);
+        }
+        assert_eq!(
+            agent_gae0.actor.layers[0].weights.data, agent_td0.actor.layers[0].weights.data,
+            "GAE(0.0) must be identical to TD(0) when entropy=0"
         );
     }
 }
