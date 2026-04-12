@@ -6672,7 +6672,6 @@ mod tests {
         // Verify: weights unchanged, trace unchanged (MAGI W5: snapshot).
         let mut cfg = default_config();
         cfg.gae_lambda = Some(0.95);
-        cfg.gae_lambda = Some(0.95);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
         let s1 = vec![1.0; 9];
