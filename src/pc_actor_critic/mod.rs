@@ -18,12 +18,8 @@ use rand::rngs::StdRng;
 use crate::error::PcError;
 use crate::linalg::cpu::CpuLinAlg;
 use crate::linalg::LinAlg;
-use crate::mlp_critic::MlpCritic;
-#[cfg(test)]
-use crate::mlp_critic::MlpCriticConfig;
-#[cfg(test)]
-use crate::pc_actor::PcActorConfig;
-use crate::pc_actor::{InferResult, PcActor, SelectionMode};
+use crate::mlp_critic::{MlpCritic, MlpCriticConfig};
+use crate::pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
 use crate::pc_actor_critic::trajectory::cache_to_matrices;
 
 pub mod config;
@@ -245,7 +241,7 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// hysteresis fractions, consolidation decay bounds, EWC parameter bounds,
     /// td_steps validity, and gae_lambda/td_steps mutual exclusion.
     ///
-    /// Shared by [`new()`](Self::new) and future `apply_config()` to ensure
+    /// Shared by [`new()`](Self::new) and [`apply_config()`](Self::apply_config) to ensure
     /// identical validation rules. Does NOT validate topology match (that
     /// requires an existing agent).
     ///
@@ -448,165 +444,233 @@ impl<L: LinAlg> PcActorCritic<L> {
         Ok(())
     }
 
+    /// Relative-epsilon comparison for `f64` config fields.
+    ///
+    /// Tolerates small round-trip drift (JSON serialize/parse, repeated
+    /// arithmetic) while still catching any semantically meaningful change.
+    /// Returns true when `a == b` exactly, or when
+    /// `|a - b| <= 4 * eps * max(|a|, |b|, 1.0)`.
+    fn f64_approx_eq(a: f64, b: f64) -> bool {
+        if a == b {
+            return true;
+        }
+        if !a.is_finite() || !b.is_finite() {
+            return false;
+        }
+        let scale = a.abs().max(b.abs()).max(1.0);
+        (a - b).abs() <= 4.0 * f64::EPSILON * scale
+    }
+
     /// Validates that a new config's network topology, structural parameters,
     /// and per-network parameters match the current agent.
     ///
-    /// **Topology:** actor input/hidden/output sizes, critic input/hidden sizes.
-    /// **Structural:** output_activation, residual, rezero_init — these affect
-    /// how existing weights are interpreted during forward pass.
-    /// **Per-network:** actor lr_weights/alpha/tol/min_steps/max_steps/temperature/
-    /// local_lambda/synchronous, critic lr — these live in `self.actor.config`
-    /// and `self.critic.config` separately; mismatches would create divergence
-    /// with `self.config.actor`/`self.config.critic`. Use dedicated setter
-    /// methods (planned) to update these atomically.
+    /// **Topology:** actor input/hidden/output sizes, critic input/hidden
+    /// sizes, and hidden-layer activation functions (empirically these
+    /// change network dynamics drastically — see CLAUDE.md training results
+    /// for the tanh→relu depth collapse).
+    /// **Structural:** output_activation, residual, rezero_init — these
+    /// affect how existing weights are interpreted during forward pass.
+    /// **Per-network:** actor lr_weights/alpha/tol/min_steps/max_steps/
+    /// temperature/local_lambda/synchronous, critic lr — these live in
+    /// `self.actor.config` and `self.critic.config` separately; mismatches
+    /// would create divergence with `self.config.actor`/`self.config.critic`.
+    /// Per-network params are immutable across [`apply_config`](Self::apply_config);
+    /// reconstruct the agent with [`new`](Self::new) if they need to change.
     ///
-    /// Hidden layer activation functions are NOT checked — they are element-wise
-    /// and do not affect weight dimensions. Changing them at runtime is valid
-    /// but may degrade learned behavior.
+    /// `f64` fields are compared with a relative epsilon
+    /// ([`f64_approx_eq`](Self::f64_approx_eq)) to tolerate JSON round-trip
+    /// drift; all other fields use exact equality.
     ///
     /// # Errors
     ///
     /// Returns [`PcError::ConfigValidation`] identifying which field mismatches.
     fn validate_topology_match(&self, config: &PcActorCriticConfig) -> Result<(), PcError> {
-        // MAINTENANCE: This function checks ALL 14 PcActorConfig fields and
-        // ALL 4 MlpCriticConfig fields (20 total). When adding a new field to
-        // either config struct, add a corresponding check here.
+        // Exhaustive destructuring forces a compile error when a new field is
+        // added to PcActorConfig or MlpCriticConfig, preventing silent drift
+        // of this check. Do NOT replace these with `..` — the compile error is
+        // the point.
+        let PcActorConfig {
+            input_size: cur_a_input,
+            hidden_layers: cur_a_hidden,
+            output_size: cur_a_output,
+            output_activation: cur_a_out_act,
+            alpha: cur_a_alpha,
+            tol: cur_a_tol,
+            min_steps: cur_a_min_steps,
+            max_steps: cur_a_max_steps,
+            lr_weights: cur_a_lr,
+            synchronous: cur_a_sync,
+            temperature: cur_a_temp,
+            local_lambda: cur_a_lambda,
+            residual: cur_a_residual,
+            rezero_init: cur_a_rezero,
+        } = &self.config.actor;
+        let PcActorConfig {
+            input_size: new_a_input,
+            hidden_layers: new_a_hidden,
+            output_size: new_a_output,
+            output_activation: new_a_out_act,
+            alpha: new_a_alpha,
+            tol: new_a_tol,
+            min_steps: new_a_min_steps,
+            max_steps: new_a_max_steps,
+            lr_weights: new_a_lr,
+            synchronous: new_a_sync,
+            temperature: new_a_temp,
+            local_lambda: new_a_lambda,
+            residual: new_a_residual,
+            rezero_init: new_a_rezero,
+        } = &config.actor;
+        let MlpCriticConfig {
+            input_size: cur_c_input,
+            hidden_layers: cur_c_hidden,
+            output_activation: cur_c_out_act,
+            lr: cur_c_lr,
+        } = &self.config.critic;
+        let MlpCriticConfig {
+            input_size: new_c_input,
+            hidden_layers: new_c_hidden,
+            output_activation: new_c_out_act,
+            lr: new_c_lr,
+        } = &config.critic;
 
-        // Actor topology checks
-        if self.config.actor.input_size != config.actor.input_size {
+        // Actor topology
+        if cur_a_input != new_a_input {
             return Err(PcError::ConfigValidation(format!(
-                "actor input_size mismatch: current {} vs new {}",
-                self.config.actor.input_size, config.actor.input_size
+                "actor input_size mismatch: current {cur_a_input} vs new {new_a_input}"
             )));
         }
-        let cur_ah = &self.config.actor.hidden_layers;
-        let new_ah = &config.actor.hidden_layers;
-        if cur_ah.len() != new_ah.len() {
+        if cur_a_hidden.len() != new_a_hidden.len() {
             return Err(PcError::ConfigValidation(format!(
                 "actor hidden layer count mismatch: current {} vs new {}",
-                cur_ah.len(),
-                new_ah.len()
+                cur_a_hidden.len(),
+                new_a_hidden.len()
             )));
         }
-        for (i, (cur, new)) in cur_ah.iter().zip(new_ah.iter()).enumerate() {
+        for (i, (cur, new)) in cur_a_hidden.iter().zip(new_a_hidden.iter()).enumerate() {
             if cur.size != new.size {
                 return Err(PcError::ConfigValidation(format!(
                     "actor hidden layer {} size mismatch: current {} vs new {}",
                     i, cur.size, new.size
                 )));
             }
+            if cur.activation != new.activation {
+                return Err(PcError::ConfigValidation(format!(
+                    "actor hidden layer {} activation mismatch: current {:?} vs new {:?} — \
+                     empirically, changing activation mid-training can collapse learned \
+                     behavior; reconstruct agent instead",
+                    i, cur.activation, new.activation
+                )));
+            }
         }
-        if self.config.actor.output_size != config.actor.output_size {
+        if cur_a_output != new_a_output {
             return Err(PcError::ConfigValidation(format!(
-                "actor output_size mismatch: current {} vs new {}",
-                self.config.actor.output_size, config.actor.output_size
+                "actor output_size mismatch: current {cur_a_output} vs new {new_a_output}"
             )));
         }
 
-        // Critic topology checks
-        if self.config.critic.input_size != config.critic.input_size {
+        // Critic topology
+        if cur_c_input != new_c_input {
             return Err(PcError::ConfigValidation(format!(
-                "critic input_size mismatch: current {} vs new {}",
-                self.config.critic.input_size, config.critic.input_size
+                "critic input_size mismatch: current {cur_c_input} vs new {new_c_input}"
             )));
         }
-        let cur_ch = &self.config.critic.hidden_layers;
-        let new_ch = &config.critic.hidden_layers;
-        if cur_ch.len() != new_ch.len() {
+        if cur_c_hidden.len() != new_c_hidden.len() {
             return Err(PcError::ConfigValidation(format!(
                 "critic hidden layer count mismatch: current {} vs new {}",
-                cur_ch.len(),
-                new_ch.len()
+                cur_c_hidden.len(),
+                new_c_hidden.len()
             )));
         }
-        for (i, (cur, new)) in cur_ch.iter().zip(new_ch.iter()).enumerate() {
+        for (i, (cur, new)) in cur_c_hidden.iter().zip(new_c_hidden.iter()).enumerate() {
             if cur.size != new.size {
                 return Err(PcError::ConfigValidation(format!(
                     "critic hidden layer {} size mismatch: current {} vs new {}",
                     i, cur.size, new.size
                 )));
             }
+            if cur.activation != new.activation {
+                return Err(PcError::ConfigValidation(format!(
+                    "critic hidden layer {} activation mismatch: current {:?} vs new {:?} — \
+                     reconstruct agent instead",
+                    i, cur.activation, new.activation
+                )));
+            }
         }
 
-        // Actor structural checks (MAGI W1: affect weight interpretation)
-        if self.config.actor.output_activation != config.actor.output_activation {
+        // Actor structural (affect weight interpretation)
+        if cur_a_out_act != new_a_out_act {
             return Err(PcError::ConfigValidation(format!(
-                "actor output_activation mismatch: current {:?} vs new {:?}",
-                self.config.actor.output_activation, config.actor.output_activation
+                "actor output_activation mismatch: current {cur_a_out_act:?} vs new {new_a_out_act:?}"
             )));
         }
-        if self.config.actor.residual != config.actor.residual {
+        if cur_a_residual != new_a_residual {
             return Err(PcError::ConfigValidation(format!(
-                "actor residual mismatch: current {} vs new {}",
-                self.config.actor.residual, config.actor.residual
+                "actor residual mismatch: current {cur_a_residual} vs new {new_a_residual}"
             )));
         }
-        if self.config.actor.rezero_init != config.actor.rezero_init {
+        if !Self::f64_approx_eq(*cur_a_rezero, *new_a_rezero) {
             return Err(PcError::ConfigValidation(format!(
-                "actor rezero_init mismatch: current {} vs new {}",
-                self.config.actor.rezero_init, config.actor.rezero_init
+                "actor rezero_init mismatch: current {cur_a_rezero} vs new {new_a_rezero}"
             )));
         }
 
-        // Per-network param checks (MAGI C1: prevent self.config / self.actor.config divergence)
-        if self.config.actor.lr_weights != config.actor.lr_weights {
+        // Actor per-network params (must match self.actor.config exactly;
+        // apply_config cannot mutate fields that live in the inner network).
+        if !Self::f64_approx_eq(*cur_a_lr, *new_a_lr) {
             return Err(PcError::ConfigValidation(format!(
-                "actor lr_weights mismatch: current {} vs new {} — use set_actor_lr() (planned)",
-                self.config.actor.lr_weights, config.actor.lr_weights
+                "actor lr_weights mismatch: current {cur_a_lr} vs new {new_a_lr} — \
+                 per-network params are immutable across apply_config(); reconstruct agent instead"
             )));
         }
-        if self.config.actor.alpha != config.actor.alpha {
+        if !Self::f64_approx_eq(*cur_a_alpha, *new_a_alpha) {
             return Err(PcError::ConfigValidation(format!(
-                "actor alpha mismatch: current {} vs new {} — use set_actor_alpha() (planned)",
-                self.config.actor.alpha, config.actor.alpha
+                "actor alpha mismatch: current {cur_a_alpha} vs new {new_a_alpha} — \
+                 per-network params are immutable across apply_config()"
             )));
         }
-        if self.config.actor.tol != config.actor.tol {
+        if !Self::f64_approx_eq(*cur_a_tol, *new_a_tol) {
             return Err(PcError::ConfigValidation(format!(
-                "actor tol mismatch: current {} vs new {}",
-                self.config.actor.tol, config.actor.tol
+                "actor tol mismatch: current {cur_a_tol} vs new {new_a_tol}"
             )));
         }
-        if self.config.actor.min_steps != config.actor.min_steps {
+        if cur_a_min_steps != new_a_min_steps {
             return Err(PcError::ConfigValidation(format!(
-                "actor min_steps mismatch: current {} vs new {}",
-                self.config.actor.min_steps, config.actor.min_steps
+                "actor min_steps mismatch: current {cur_a_min_steps} vs new {new_a_min_steps}"
             )));
         }
-        if self.config.actor.max_steps != config.actor.max_steps {
+        if cur_a_max_steps != new_a_max_steps {
             return Err(PcError::ConfigValidation(format!(
-                "actor max_steps mismatch: current {} vs new {}",
-                self.config.actor.max_steps, config.actor.max_steps
+                "actor max_steps mismatch: current {cur_a_max_steps} vs new {new_a_max_steps}"
             )));
         }
-        if self.config.actor.temperature != config.actor.temperature {
+        if !Self::f64_approx_eq(*cur_a_temp, *new_a_temp) {
             return Err(PcError::ConfigValidation(format!(
-                "actor temperature mismatch: current {} vs new {} — use set_temperature() (planned)",
-                self.config.actor.temperature, config.actor.temperature
+                "actor temperature mismatch: current {cur_a_temp} vs new {new_a_temp} — \
+                 per-network params are immutable across apply_config()"
             )));
         }
-        if self.config.actor.local_lambda != config.actor.local_lambda {
+        if !Self::f64_approx_eq(*cur_a_lambda, *new_a_lambda) {
             return Err(PcError::ConfigValidation(format!(
-                "actor local_lambda mismatch: current {} vs new {}",
-                self.config.actor.local_lambda, config.actor.local_lambda
+                "actor local_lambda mismatch: current {cur_a_lambda} vs new {new_a_lambda}"
             )));
         }
-        if self.config.actor.synchronous != config.actor.synchronous {
+        if cur_a_sync != new_a_sync {
             return Err(PcError::ConfigValidation(format!(
-                "actor synchronous mismatch: current {} vs new {}",
-                self.config.actor.synchronous, config.actor.synchronous
+                "actor synchronous mismatch: current {cur_a_sync} vs new {new_a_sync}"
             )));
         }
-        if self.config.critic.lr != config.critic.lr {
+
+        // Critic per-network params
+        if !Self::f64_approx_eq(*cur_c_lr, *new_c_lr) {
             return Err(PcError::ConfigValidation(format!(
-                "critic lr mismatch: current {} vs new {} — use set_critic_lr() (planned)",
-                self.config.critic.lr, config.critic.lr
+                "critic lr mismatch: current {cur_c_lr} vs new {new_c_lr} — \
+                 per-network params are immutable across apply_config(); reconstruct agent instead"
             )));
         }
-        if self.config.critic.output_activation != config.critic.output_activation {
+        if cur_c_out_act != new_c_out_act {
             return Err(PcError::ConfigValidation(format!(
-                "critic output_activation mismatch: current {:?} vs new {:?}",
-                self.config.critic.output_activation, config.critic.output_activation
+                "critic output_activation mismatch: current {cur_c_out_act:?} vs new {new_c_out_act:?}"
             )));
         }
 
@@ -617,10 +681,14 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// Reconfigures **agent-level** learning parameters (gamma, surprise, CL,
     /// TD/GAE mode). Per-network parameters (actor lr, temperature, alpha;
-    /// critic lr) cannot be changed here — they require dedicated setter
-    /// methods (planned) to maintain internal consistency between
-    /// `self.config.actor` and `self.actor.config`. Pass the same actor/critic
-    /// sub-config the agent was constructed with; mismatches are rejected.
+    /// critic lr) cannot be changed here — they live in `self.actor.config` /
+    /// `self.critic.config` and are immutable across this call. Pass the same
+    /// actor/critic sub-config the agent was constructed with; mismatches are
+    /// rejected. If per-network params need to change, reconstruct the agent
+    /// with [`new`](Self::new) and transfer weights via the serializer.
+    ///
+    /// `f64` fields are compared with a relative epsilon to tolerate JSON
+    /// round-trip drift; see [`f64_approx_eq`](Self::f64_approx_eq).
     ///
     /// All continuous learning state is reset to provide a clean baseline.
     ///
@@ -7229,10 +7297,42 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_topology_match_allows_different_hidden_activation() {
+    fn test_validate_topology_match_rejects_different_hidden_activation() {
         let agent = make_agent();
         let mut config = default_config();
         config.actor.hidden_layers[0].activation = Activation::Softsign;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor hidden layer 0 activation mismatch"),
+            "Expected actor hidden activation mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_rejects_different_critic_hidden_activation() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.critic.hidden_layers[0].activation = Activation::Softsign;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("critic hidden layer 0 activation mismatch"),
+            "Expected critic hidden activation mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_tolerates_f64_round_trip_drift() {
+        // 1 ULP perturbation on every f64 field must not reject.
+        let agent = make_agent();
+        let mut config = default_config();
+        let base_lr = config.actor.lr_weights;
+        config.actor.lr_weights = f64::from_bits(base_lr.to_bits() + 1);
+        let base_temp = config.actor.temperature;
+        config.actor.temperature = f64::from_bits(base_temp.to_bits() + 1);
+        let base_alpha = config.actor.alpha;
+        config.actor.alpha = f64::from_bits(base_alpha.to_bits() + 1);
+        let base_clr = config.critic.lr;
+        config.critic.lr = f64::from_bits(base_clr.to_bits() + 1);
         assert!(agent.validate_topology_match(&config).is_ok());
     }
 
