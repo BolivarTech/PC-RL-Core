@@ -113,6 +113,7 @@ let (action, _) = agent.act(&state, &valid_actions, SelectionMode::Play);
 - *M2 Dual-EWMA Hysteresis*: Automatic FROZEN/PLASTIC transitions via fast/slow surprise EWMAs
 - *M3 Consolidation Decay*: Per-layer exponential decay (fixed M3a) or adaptive sigmoid (M3b)
 - *M4 EWC Regularization*: Fisher diagonal with 3-step lifecycle (decay/accumulate/merge)
+- *Bidirectional Coupling*: `actor_wakes_critic` + `critic_wakes_actor` (both default true) with EWMA k reset to prevent re-freeze
 - *NaN Safety*: Guards in EwmaTracker, learn_continuous, push_surprise, push_td_error
 
 **TD(n) N-Step Returns (v2.1.0)**: Configurable n-step temporal difference learning via `td_steps`. Buffers n transitions before bootstrapping with V(s_{t+n}). Terminal flush uses pre-computed V(s) to avoid stale-estimate bias. `td_steps=0` (default) preserves exact TD(0) behavior with zero overhead. See [docs/td_n_spec.md](docs/td_n_spec.md).
@@ -183,7 +184,7 @@ No PyTorch, TensorFlow, or any ML framework. Pure Rust from scratch.
 
 ## Testing
 
-516 unit tests + 21 doctests:
+524 unit tests + 21 doctests:
 
 ```bash
 cargo nextest run
