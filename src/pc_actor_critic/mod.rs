@@ -107,6 +107,9 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     critic_last_phase_reliable: bool,
     /// Buffer for TD(n) transitions. Empty when td_steps=0.
     td_buffer: VecDeque<TdTransition<L>>,
+    /// Output-level eligibility trace for GAE(λ). Empty when gae_lambda=None.
+    /// Not serialized — transient mid-episode state.
+    actor_trace: Vec<f64>,
 }
 
 /// A single buffered transition for TD(n) computation.
@@ -138,6 +141,15 @@ fn compute_n_step_reward(gamma: f64, rewards: &[f64]) -> f64 {
 }
 
 impl<L: LinAlg> PcActorCritic<L> {
+    /// Returns the eligibility trace length: output_size when GAE enabled, 0 otherwise.
+    fn gae_trace_len(config: &PcActorCriticConfig) -> usize {
+        if config.gae_lambda.is_some() {
+            config.actor.output_size
+        } else {
+            0
+        }
+    }
+
     /// Precomputes per-hidden-layer decay factors for actor and critic (M3a),
     /// plus per-layer error EMA initialization for adaptive consolidation (M3b).
     ///
@@ -298,6 +310,19 @@ impl<L: LinAlg> PcActorCritic<L> {
             ));
         }
 
+        if let Some(lambda) = config.gae_lambda {
+            if !(0.0..=1.0).contains(&lambda) {
+                return Err(PcError::ConfigValidation(format!(
+                    "gae_lambda must be in [0.0, 1.0], got {lambda}"
+                )));
+            }
+            if config.td_steps > 0 {
+                return Err(PcError::ConfigValidation(
+                    "gae_lambda and td_steps > 0 are mutually exclusive".to_string(),
+                ));
+            }
+        }
+
         let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
             Self::compute_decay_factors(&config);
 
@@ -379,6 +404,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         if let Some(ref mut hyst) = critic_hysteresis {
             hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, min_fisher_phase);
         }
+        let new_trace_len = Self::gae_trace_len(&config);
 
         Ok(Self {
             actor,
@@ -407,6 +433,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_last_phase_reliable: false,
             critic_last_phase_reliable: false,
             td_buffer: VecDeque::new(),
+            actor_trace: vec![0.0; new_trace_len],
         })
     }
 
@@ -491,6 +518,7 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         let (child_actor_decay, child_critic_decay, child_layer_error_ema) =
             Self::compute_decay_factors(&child_config);
+        let child_trace_len = Self::gae_trace_len(&child_config);
 
         Ok(Self {
             actor,
@@ -519,6 +547,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_last_phase_reliable: false,
             critic_last_phase_reliable: false,
             td_buffer: VecDeque::new(),
+            actor_trace: vec![0.0; child_trace_len],
         })
     }
 
@@ -539,6 +568,7 @@ impl<L: LinAlg> PcActorCritic<L> {
     ) -> Self {
         let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
             Self::compute_decay_factors(&config);
+        let parts_trace_len = Self::gae_trace_len(&config);
         Self {
             actor,
             critic,
@@ -566,6 +596,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_last_phase_reliable: false,
             critic_last_phase_reliable: false,
             td_buffer: VecDeque::new(),
+            actor_trace: vec![0.0; parts_trace_len],
         }
     }
 
@@ -1000,6 +1031,58 @@ impl<L: LinAlg> PcActorCritic<L> {
         let pi_l = self.backend.softmax_masked(&scaled_l, valid_actions);
         let pi = self.backend.vec_to_vec(&pi_l);
 
+        // --- GAE(λ) eligibility trace path ---
+        if let Some(lambda) = self.config.gae_lambda {
+            // GAE and td_steps are mutually exclusive (validated at construction).
+            debug_assert!(
+                self.td_buffer.is_empty(),
+                "GAE and td_steps are mutually exclusive"
+            );
+            // Gradient direction WITHOUT td_error scaling
+            let mut grad_direction = vec![0.0; pi.len()];
+            for &i in valid_actions {
+                grad_direction[i] = pi[i];
+            }
+            grad_direction[action] -= 1.0;
+
+            // Decay trace: trace = γλ * trace
+            let gamma_lambda = self.config.gamma * lambda;
+            for v in &mut self.actor_trace {
+                *v *= gamma_lambda;
+            }
+            // Accumulate: trace += gradient_direction
+            for (i, &g) in grad_direction.iter().enumerate() {
+                self.actor_trace[i] += g;
+            }
+
+            // Clip trace to prevent overflow (MAGI C2)
+            for v in &mut self.actor_trace {
+                *v = v.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
+            }
+
+            // Effective delta = td_error * trace
+            let mut delta: Vec<f64> = self.actor_trace.iter().map(|&t| td_error * t).collect();
+
+            // Entropy regularization per-step (not accumulated in trace)
+            for &i in valid_actions {
+                let log_pi = (pi[i].max(1e-10)).ln();
+                delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
+            }
+
+            // Use shared bookkeeping
+            return self.apply_actor_update_and_bookkeeping(
+                &delta,
+                infer,
+                input,
+                &y_conv_vec,
+                valid_actions,
+                action,
+                td_error,
+                loss,
+            );
+        }
+
+        // --- Standard TD(0)/TD(n) path continues below ---
         let mut delta = vec![0.0; pi.len()];
         for &i in valid_actions {
             delta[i] = pi[i];
@@ -1016,6 +1099,50 @@ impl<L: LinAlg> PcActorCritic<L> {
             delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
         }
 
+        self.apply_actor_update_and_bookkeeping(
+            &delta,
+            infer,
+            input,
+            &y_conv_vec,
+            valid_actions,
+            action,
+            td_error,
+            loss,
+        )
+    }
+
+    /// Shared post-delta bookkeeping: scale/decay, EWC/Fisher, weight update,
+    /// M3b layer error EMA, surprise push, td_error push.
+    ///
+    /// Called by both GAE and standard learning paths after computing their
+    /// respective deltas.
+    ///
+    /// # Arguments
+    ///
+    /// * `delta` - Policy gradient delta (already scaled by td_error or trace).
+    /// * `infer` - Inference result from `act` at current state.
+    /// * `input` - Current state.
+    /// * `y_conv_vec` - Converged output logits as host Vec.
+    /// * `valid_actions` - Valid actions at current state.
+    /// * `action` - Action taken.
+    /// * `td_error` - Temporal difference error.
+    /// * `loss` - Critic loss to return.
+    ///
+    /// # Returns
+    ///
+    /// Critic loss (pass-through).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_actor_update_and_bookkeeping(
+        &mut self,
+        delta: &[f64],
+        infer: &InferResult<L>,
+        input: &[f64],
+        y_conv_vec: &[f64],
+        valid_actions: &[usize],
+        action: usize,
+        td_error: f64,
+        loss: f64,
+    ) -> f64 {
         let s_scale = self.effective_actor_scale(infer.surprise_score);
         let actor_decay = self.effective_actor_decay();
 
@@ -1035,7 +1162,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                 fd[action] -= 1.0;
                 fd
             } else {
-                delta.clone()
+                delta.to_vec()
             };
             self.accumulate_actor_fisher_ema(&fisher_delta, infer, input, s_scale, &actor_decay);
 
@@ -1050,13 +1177,13 @@ impl<L: LinAlg> PcActorCritic<L> {
                 self.actor.layers.iter().map(|l| l.bias.clone()).collect();
 
             self.actor
-                .update_weights(&delta, infer, input, s_scale, &actor_decay);
+                .update_weights(delta, infer, input, s_scale, &actor_decay);
 
             // Apply EWC post-correction per layer
             self.apply_actor_ewc_correction(&pre_weights, &pre_biases, s_scale, &actor_decay);
         } else {
             self.actor
-                .update_weights(&delta, infer, input, s_scale, &actor_decay);
+                .update_weights(delta, infer, input, s_scale, &actor_decay);
         }
 
         // Update per-layer prediction error EMA for adaptive consolidation (M3b)
@@ -1316,6 +1443,9 @@ impl<L: LinAlg> PcActorCritic<L> {
             self.action_prev = None;
             self.infer_prev = None;
             self.valid_actions_prev = None;
+            for v in &mut self.actor_trace {
+                *v = 0.0;
+            }
         }
 
         action
@@ -1403,6 +1533,9 @@ impl<L: LinAlg> PcActorCritic<L> {
         self.infer_prev = None;
         self.valid_actions_prev = None;
         self.td_buffer.clear();
+        for v in &mut self.actor_trace {
+            *v = 0.0;
+        }
     }
 
     /// Pushes a surprise score into the adaptive buffer (circular).
@@ -2027,6 +2160,7 @@ mod tests {
             fisher_ema_beta: 0.99,
             logits_reversal: false,
             td_steps: 0,
+            gae_lambda: None,
         }
     }
 
@@ -2494,6 +2628,7 @@ mod tests {
             fisher_ema_beta: 0.99,
             logits_reversal: false,
             td_steps: 0,
+            gae_lambda: None,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -3688,6 +3823,7 @@ mod tests {
             fisher_ema_beta: 0.99,
             logits_reversal: false,
             td_steps: 0,
+            gae_lambda: None,
         }
     }
 
@@ -5846,10 +5982,12 @@ mod tests {
         // td_steps=0 must produce identical weights to current TD(0)
         // Both agents use default_config() to ensure identical config (MAGI F1)
         let mut cfg_a = default_config();
+        cfg_a.gae_lambda = None;
         cfg_a.td_steps = 0;
         let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg_a, 42).unwrap();
 
-        let cfg_b = default_config(); // td_steps=0 by default
+        let mut cfg_b = default_config(); // td_steps=0 by default
+        cfg_b.gae_lambda = None;
         let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg_b, 42).unwrap();
 
         let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
@@ -5899,6 +6037,7 @@ mod tests {
     #[test]
     fn test_td_n_buffer_fills_at_n() {
         let mut cfg = default_config();
+        cfg.gae_lambda = None;
         cfg.td_steps = 3;
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
@@ -5937,6 +6076,7 @@ mod tests {
     fn test_td_n_terminal_flush() {
         // td_steps=5 but episode is only 3 steps → flush all at terminal
         let mut cfg = default_config();
+        cfg.gae_lambda = None;
         cfg.td_steps = 5;
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
@@ -5966,6 +6106,7 @@ mod tests {
     #[test]
     fn test_td_n_reset_clears_buffer() {
         let mut cfg = default_config();
+        cfg.gae_lambda = None;
         cfg.td_steps = 5;
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
@@ -5985,6 +6126,7 @@ mod tests {
     fn test_td_n_short_episode_monte_carlo() {
         // td_steps=10 but episode is 2 steps → full Monte Carlo
         let mut cfg = default_config();
+        cfg.gae_lambda = None;
         cfg.td_steps = 10;
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
@@ -6005,6 +6147,7 @@ mod tests {
     #[test]
     fn test_td_n_nan_reward_rejected_at_buffer() {
         let mut cfg = default_config();
+        cfg.gae_lambda = None;
         cfg.td_steps = 3;
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
@@ -6026,6 +6169,7 @@ mod tests {
         use crate::serializer::{load_agent, save_agent};
 
         let mut cfg = default_config();
+        cfg.gae_lambda = None;
         cfg.td_steps = 4;
         let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
@@ -6049,6 +6193,7 @@ mod tests {
     fn test_td_n_gamma_power_bootstrap() {
         // TD(2) must produce different weights than TD(0)
         let mut cfg_tdn = default_config();
+        cfg_tdn.gae_lambda = None;
         cfg_tdn.td_steps = 2;
         let mut agent_tdn: PcActorCritic =
             PcActorCritic::new(CpuLinAlg::new(), cfg_tdn, 42).unwrap();
@@ -6062,6 +6207,7 @@ mod tests {
         agent_tdn.step(&s3, 2.0, false);
 
         let mut cfg_td0 = default_config();
+        cfg_td0.gae_lambda = None;
         cfg_td0.td_steps = 0;
         let mut agent_td0: PcActorCritic =
             PcActorCritic::new(CpuLinAlg::new(), cfg_td0, 42).unwrap();
@@ -6355,6 +6501,250 @@ mod tests {
         assert!(loaded.config.critic_wakes_actor);
         assert_eq!(loaded.config.critic_wakes_actor_threshold, 500);
         assert_eq!(loaded.actor_frozen_steps, 50);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ============ GAE lambda config tests ============
+
+    #[test]
+    fn test_gae_lambda_default_is_none() {
+        let cfg = default_config();
+        assert_eq!(cfg.gae_lambda, None);
+    }
+
+    #[test]
+    fn test_gae_lambda_and_td_steps_mutually_exclusive() {
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
+        cfg.td_steps = 4;
+        let result = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_err(), "gae_lambda + td_steps should be rejected");
+    }
+
+    #[test]
+    fn test_gae_lambda_none_allows_td_steps() {
+        let mut cfg = default_config();
+        cfg.gae_lambda = None;
+        cfg.td_steps = 4;
+        let result = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_ok(), "gae_lambda=None + td_steps should work");
+    }
+
+    #[test]
+    fn test_gae_lambda_out_of_range_rejected() {
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(1.5);
+        assert!(PcActorCritic::new(CpuLinAlg::new(), cfg.clone(), 42).is_err());
+
+        cfg.gae_lambda = Some(-0.1);
+        assert!(PcActorCritic::new(CpuLinAlg::new(), cfg, 42).is_err());
+    }
+
+    #[test]
+    fn test_gae_trace_field_exists_and_correct_size() {
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95); // gae_lambda = Some(0.95)
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        assert_eq!(
+            agent.actor_trace.len(),
+            9,
+            "Trace size must equal output_size"
+        );
+        assert!(
+            agent.actor_trace.iter().all(|&v| v == 0.0),
+            "Trace must start at zero"
+        );
+    }
+
+    #[test]
+    fn test_gae_trace_empty_when_disabled() {
+        let mut cfg = default_config();
+        cfg.gae_lambda = None;
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        assert!(
+            agent.actor_trace.is_empty(),
+            "Trace must be empty when gae_lambda=None"
+        );
+    }
+
+    #[test]
+    fn test_gae_trace_accumulates_across_steps() {
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        assert!(agent.actor_trace.iter().all(|&v| v == 0.0));
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        agent.step(&s1, 0.0, false);
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        agent.step(&s2, 1.0, false);
+        assert!(
+            agent.actor_trace.iter().any(|&v| v.abs() > 1e-10),
+            "Trace must accumulate after learning step"
+        );
+    }
+
+    #[test]
+    fn test_gae_trace_resets_on_terminal() {
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let s1 = vec![1.0; 9];
+        let s2 = vec![0.5; 9];
+        agent.step(&s1, 0.0, false);
+        agent.step(&s2, 1.0, true);
+        assert!(
+            agent.actor_trace.iter().all(|&v| v == 0.0),
+            "Trace must reset on terminal"
+        );
+    }
+
+    #[test]
+    fn test_gae_trace_resets_on_reset_step() {
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let s1 = vec![1.0; 9];
+        let s2 = vec![0.5; 9];
+        agent.step(&s1, 0.0, false);
+        agent.step(&s2, 1.0, false);
+        agent.reset_step();
+        assert!(
+            agent.actor_trace.iter().all(|&v| v == 0.0),
+            "Trace must reset on reset_step"
+        );
+    }
+
+    #[test]
+    fn test_gae_produces_different_weights_than_td0() {
+        let mut cfg_gae = default_config();
+        cfg_gae.gae_lambda = Some(0.95);
+        let mut agent_gae: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_gae, 42).unwrap();
+        let mut cfg_td0 = default_config();
+        cfg_td0.gae_lambda = None;
+        let mut agent_td0: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_td0, 42).unwrap();
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let s3 = vec![0.0, 1.0, -1.0, 0.5, 0.0, -0.5, 1.0, -1.0, 0.5];
+        for agent in [&mut agent_gae, &mut agent_td0] {
+            agent.step(&s1, 0.0, false);
+            agent.step(&s2, 1.0, false);
+            agent.step(&s3, -1.0, true);
+        }
+        assert_ne!(
+            agent_gae.actor.layers[0].weights.data, agent_td0.actor.layers[0].weights.data,
+            "GAE(0.95) must produce different weights than TD(0)"
+        );
+    }
+
+    #[test]
+    fn test_gae_lambda_zero_matches_td0() {
+        // NOTE (MAGI C1): Equivalence holds ONLY when entropy_coeff=0.0.
+        let mut cfg_gae0 = default_config();
+        cfg_gae0.entropy_coeff = 0.0;
+        cfg_gae0.gae_lambda = Some(0.0);
+        let mut agent_gae0: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_gae0, 42).unwrap();
+        let mut cfg_td0 = default_config();
+        cfg_td0.entropy_coeff = 0.0;
+        cfg_td0.gae_lambda = None;
+        let mut agent_td0: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_td0, 42).unwrap();
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for agent in [&mut agent_gae0, &mut agent_td0] {
+            agent.step(&s1, 0.0, false);
+            agent.step(&s2, 1.0, true);
+        }
+        assert_eq!(
+            agent_gae0.actor.layers[0].weights.data, agent_td0.actor.layers[0].weights.data,
+            "GAE(0.0) must be identical to TD(0) when entropy=0"
+        );
+    }
+
+    #[test]
+    fn test_gae_nan_reward_safe() {
+        // NaN reward triggers td_error guard BEFORE GAE trace code.
+        // Verify: weights unchanged, trace unchanged (MAGI W5: snapshot).
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
+        cfg.gae_lambda = Some(0.95);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let s1 = vec![1.0; 9];
+        let s2 = vec![0.5; 9];
+        agent.step(&s1, 0.0, false);
+
+        let trace_before = agent.actor_trace.clone();
+        let weights_before = agent.actor.layers[0].weights.data.clone();
+
+        agent.step(&s2, f64::NAN, false);
+
+        assert_eq!(
+            agent.actor_trace, trace_before,
+            "Trace must be unchanged after NaN reward"
+        );
+        assert_eq!(
+            agent.actor.layers[0].weights.data, weights_before,
+            "Weights must be unchanged after NaN reward"
+        );
+    }
+
+    #[test]
+    fn test_gae_serialization_config() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::serializer::{load_agent, save_agent};
+
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95); // gae_lambda = Some(0.95)
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let path = format!(
+            "{}/test_gae_serde_{}.json",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        save_agent(&agent, &path, 100, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        assert_eq!(loaded.config.gae_lambda, Some(0.95));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_gae_trace_not_serialized() {
+        // Trace is transient — should not persist across save/load
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::serializer::{load_agent, save_agent};
+
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Accumulate some trace
+        let s1 = vec![1.0; 9];
+        let s2 = vec![0.5; 9];
+        agent.step(&s1, 0.0, false);
+        agent.step(&s2, 1.0, false);
+
+        let path = format!(
+            "{}/test_gae_trace_transient_{}.json",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        save_agent(&agent, &path, 100, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        // Loaded agent should have fresh zero trace
+        assert!(
+            loaded.actor_trace.iter().all(|&v| v == 0.0),
+            "Trace must be zero after load (transient)"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

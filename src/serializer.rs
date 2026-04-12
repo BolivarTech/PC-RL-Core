@@ -422,6 +422,7 @@ mod tests {
             fisher_ema_beta: 0.99,
             logits_reversal: false,
             td_steps: 0,
+            gae_lambda: None,
         }
     }
 
