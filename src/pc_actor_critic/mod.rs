@@ -141,6 +141,15 @@ fn compute_n_step_reward(gamma: f64, rewards: &[f64]) -> f64 {
 }
 
 impl<L: LinAlg> PcActorCritic<L> {
+    /// Returns the eligibility trace length: output_size when GAE enabled, 0 otherwise.
+    fn gae_trace_len(config: &PcActorCriticConfig) -> usize {
+        if config.gae_lambda.is_some() {
+            config.actor.output_size
+        } else {
+            0
+        }
+    }
+
     /// Precomputes per-hidden-layer decay factors for actor and critic (M3a),
     /// plus per-layer error EMA initialization for adaptive consolidation (M3b).
     ///
@@ -395,11 +404,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         if let Some(ref mut hyst) = critic_hysteresis {
             hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, min_fisher_phase);
         }
-        let new_trace_len = if config.gae_lambda.is_some() {
-            config.actor.output_size
-        } else {
-            0
-        };
+        let new_trace_len = Self::gae_trace_len(&config);
 
         Ok(Self {
             actor,
@@ -513,11 +518,7 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         let (child_actor_decay, child_critic_decay, child_layer_error_ema) =
             Self::compute_decay_factors(&child_config);
-        let child_trace_len = if child_config.gae_lambda.is_some() {
-            child_config.actor.output_size
-        } else {
-            0
-        };
+        let child_trace_len = Self::gae_trace_len(&child_config);
 
         Ok(Self {
             actor,
@@ -567,11 +568,7 @@ impl<L: LinAlg> PcActorCritic<L> {
     ) -> Self {
         let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
             Self::compute_decay_factors(&config);
-        let parts_trace_len = if config.gae_lambda.is_some() {
-            config.actor.output_size
-        } else {
-            0
-        };
+        let parts_trace_len = Self::gae_trace_len(&config);
         Self {
             actor,
             critic,
@@ -1036,6 +1033,11 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         // --- GAE(λ) eligibility trace path ---
         if let Some(lambda) = self.config.gae_lambda {
+            // GAE and td_steps are mutually exclusive (validated at construction).
+            debug_assert!(
+                self.td_buffer.is_empty(),
+                "GAE and td_steps are mutually exclusive"
+            );
             // Gradient direction WITHOUT td_error scaling
             let mut grad_direction = vec![0.0; pi.len()];
             for &i in valid_actions {
@@ -2158,7 +2160,7 @@ mod tests {
             fisher_ema_beta: 0.99,
             logits_reversal: false,
             td_steps: 0,
-            gae_lambda: Some(0.95),
+            gae_lambda: None,
         }
     }
 
@@ -2626,7 +2628,7 @@ mod tests {
             fisher_ema_beta: 0.99,
             logits_reversal: false,
             td_steps: 0,
-            gae_lambda: Some(0.95),
+            gae_lambda: None,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -3821,7 +3823,7 @@ mod tests {
             fisher_ema_beta: 0.99,
             logits_reversal: false,
             td_steps: 0,
-            gae_lambda: Some(0.95),
+            gae_lambda: None,
         }
     }
 
@@ -6506,9 +6508,9 @@ mod tests {
     // ============ GAE lambda config tests ============
 
     #[test]
-    fn test_gae_lambda_default_is_095() {
+    fn test_gae_lambda_default_is_none() {
         let cfg = default_config();
-        assert_eq!(cfg.gae_lambda, Some(0.95));
+        assert_eq!(cfg.gae_lambda, None);
     }
 
     #[test]
@@ -6541,7 +6543,8 @@ mod tests {
 
     #[test]
     fn test_gae_trace_field_exists_and_correct_size() {
-        let cfg = default_config(); // gae_lambda = Some(0.95)
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95); // gae_lambda = Some(0.95)
         let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
         assert_eq!(
@@ -6569,7 +6572,8 @@ mod tests {
 
     #[test]
     fn test_gae_trace_accumulates_across_steps() {
-        let cfg = default_config();
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
         assert!(agent.actor_trace.iter().all(|&v| v == 0.0));
         let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
@@ -6584,7 +6588,8 @@ mod tests {
 
     #[test]
     fn test_gae_trace_resets_on_terminal() {
-        let cfg = default_config();
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
         let s1 = vec![1.0; 9];
         let s2 = vec![0.5; 9];
@@ -6598,7 +6603,8 @@ mod tests {
 
     #[test]
     fn test_gae_trace_resets_on_reset_step() {
-        let cfg = default_config();
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
         let s1 = vec![1.0; 9];
         let s2 = vec![0.5; 9];
@@ -6664,7 +6670,9 @@ mod tests {
     fn test_gae_nan_reward_safe() {
         // NaN reward triggers td_error guard BEFORE GAE trace code.
         // Verify: weights unchanged, trace unchanged (MAGI W5: snapshot).
-        let cfg = default_config();
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
+        cfg.gae_lambda = Some(0.95);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
         let s1 = vec![1.0; 9];
@@ -6691,7 +6699,8 @@ mod tests {
         use crate::linalg::cpu::CpuLinAlg;
         use crate::serializer::{load_agent, save_agent};
 
-        let cfg = default_config(); // gae_lambda = Some(0.95)
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95); // gae_lambda = Some(0.95)
         let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
         let path = format!(
@@ -6713,7 +6722,8 @@ mod tests {
         use crate::linalg::cpu::CpuLinAlg;
         use crate::serializer::{load_agent, save_agent};
 
-        let cfg = default_config();
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
         // Accumulate some trace

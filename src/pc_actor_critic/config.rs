@@ -177,9 +177,10 @@ fn default_td_steps() -> usize {
     0
 }
 
-/// Default GAE lambda (0.95 — recommended for short episodes).
+/// Default GAE lambda (None — disabled, backward compatible).
+/// Recommended: Some(0.95) for short episodes.
 fn default_gae_lambda() -> Option<f64> {
-    Some(0.95)
+    None
 }
 
 /// Configuration for the integrated PC Actor-Critic agent.
@@ -244,7 +245,7 @@ fn default_gae_lambda() -> Option<f64> {
 ///     fisher_ema_beta: 0.99,
 ///     logits_reversal: false,
 ///     td_steps: 0,
-///     gae_lambda: Some(0.95),
+///     gae_lambda: None,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -395,9 +396,9 @@ pub struct PcActorCriticConfig {
     pub td_steps: usize,
     /// GAE lambda for eligibility traces. Mutually exclusive with `td_steps > 0`.
     /// - `Some(λ)`: GAE(λ) with output-level eligibility traces. λ=0.0 ≈ TD(0), λ=1.0 ≈ MC.
-    /// - `None`: Disabled — use `td_steps` for return estimation.
+    /// - `None`: Disabled — standard TD(0) or TD(n) via `td_steps`.
     ///
-    /// Default: `Some(0.95)` (recommended for short episodes).
+    /// Default: `None` (backward compatible). Recommended: `Some(0.95)` for short episodes.
     #[serde(default = "default_gae_lambda")]
     pub gae_lambda: Option<f64>,
 }
