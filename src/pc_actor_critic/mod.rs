@@ -178,17 +178,21 @@ impl<L: LinAlg> PcActorCritic<L> {
         (actor_decay_factors, critic_decay_factors, layer_error_ema)
     }
 
-    /// Creates a new PC Actor-Critic agent.
+    /// Validates a [`PcActorCriticConfig`] for internal consistency.
     ///
-    /// # Arguments
+    /// Checks gamma range, surprise buffer size, scale floor/ceil ordering,
+    /// hysteresis fractions, consolidation decay bounds, EWC parameter bounds,
+    /// td_steps validity, and gae_lambda/td_steps mutual exclusion.
     ///
-    /// * `config` - Agent configuration with actor, critic, and learning parameters.
-    /// * `seed` - Random seed for reproducibility.
+    /// Shared by [`new()`](Self::new) and future `apply_config()` to ensure
+    /// identical validation rules. Does NOT validate topology match (that
+    /// requires an existing agent).
+    ///
     /// # Errors
     ///
-    /// Returns `PcError::ConfigValidation` if gamma is out of `[0.0, 1.0]`,
-    /// or if actor/critic config is invalid.
-    pub fn new(backend: L, config: PcActorCriticConfig, seed: u64) -> Result<Self, PcError> {
+    /// Returns [`PcError::ConfigValidation`] with a descriptive message on
+    /// the first failing check.
+    fn validate_config(config: &PcActorCriticConfig) -> Result<(), PcError> {
         if !(0.0..=1.0).contains(&config.gamma) {
             return Err(PcError::ConfigValidation(format!(
                 "gamma must be in [0.0, 1.0], got {}",
@@ -322,6 +326,24 @@ impl<L: LinAlg> PcActorCritic<L> {
                 ));
             }
         }
+
+        Ok(())
+    }
+
+    /// Creates a new PC Actor-Critic agent.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Agent configuration with actor, critic, and learning parameters.
+    /// * `seed` - Random seed for reproducibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::ConfigValidation` if any configuration field is invalid
+    /// (gamma range, surprise buffer size, scale floor/ceil ordering, hysteresis
+    /// fractions, consolidation decay bounds, EWC params, td_steps, gae_lambda).
+    pub fn new(backend: L, config: PcActorCriticConfig, seed: u64) -> Result<Self, PcError> {
+        Self::validate_config(&config)?;
 
         let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
             Self::compute_decay_factors(&config);
