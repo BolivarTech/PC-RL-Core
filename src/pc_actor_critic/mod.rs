@@ -330,6 +330,167 @@ impl<L: LinAlg> PcActorCritic<L> {
         Ok(())
     }
 
+    /// Validates that a new config's network topology, structural parameters,
+    /// and per-network parameters match the current agent.
+    ///
+    /// **Topology:** actor input/hidden/output sizes, critic input/hidden sizes.
+    /// **Structural:** output_activation, residual, rezero_init — these affect
+    /// how existing weights are interpreted during forward pass.
+    /// **Per-network:** actor lr_weights/alpha/tol/min_steps/max_steps/temperature/
+    /// local_lambda/synchronous, critic lr — these live in `self.actor.config`
+    /// and `self.critic.config` separately; mismatches would create divergence
+    /// with `self.config.actor`/`self.config.critic`. Use dedicated setter
+    /// methods (planned) to update these atomically.
+    ///
+    /// Hidden layer activation functions are NOT checked — they are element-wise
+    /// and do not affect weight dimensions. Changing them at runtime is valid
+    /// but may degrade learned behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcError::ConfigValidation`] identifying which field mismatches.
+    fn validate_topology_match(&self, config: &PcActorCriticConfig) -> Result<(), PcError> {
+        // Actor topology checks
+        if self.config.actor.input_size != config.actor.input_size {
+            return Err(PcError::ConfigValidation(format!(
+                "actor input_size mismatch: current {} vs new {}",
+                self.config.actor.input_size, config.actor.input_size
+            )));
+        }
+        let cur_ah = &self.config.actor.hidden_layers;
+        let new_ah = &config.actor.hidden_layers;
+        if cur_ah.len() != new_ah.len() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor hidden layer count mismatch: current {} vs new {}",
+                cur_ah.len(),
+                new_ah.len()
+            )));
+        }
+        for (i, (cur, new)) in cur_ah.iter().zip(new_ah.iter()).enumerate() {
+            if cur.size != new.size {
+                return Err(PcError::ConfigValidation(format!(
+                    "actor hidden layer {} size mismatch: current {} vs new {}",
+                    i, cur.size, new.size
+                )));
+            }
+        }
+        if self.config.actor.output_size != config.actor.output_size {
+            return Err(PcError::ConfigValidation(format!(
+                "actor output_size mismatch: current {} vs new {}",
+                self.config.actor.output_size, config.actor.output_size
+            )));
+        }
+
+        // Critic topology checks
+        if self.config.critic.input_size != config.critic.input_size {
+            return Err(PcError::ConfigValidation(format!(
+                "critic input_size mismatch: current {} vs new {}",
+                self.config.critic.input_size, config.critic.input_size
+            )));
+        }
+        let cur_ch = &self.config.critic.hidden_layers;
+        let new_ch = &config.critic.hidden_layers;
+        if cur_ch.len() != new_ch.len() {
+            return Err(PcError::ConfigValidation(format!(
+                "critic hidden layer count mismatch: current {} vs new {}",
+                cur_ch.len(),
+                new_ch.len()
+            )));
+        }
+        for (i, (cur, new)) in cur_ch.iter().zip(new_ch.iter()).enumerate() {
+            if cur.size != new.size {
+                return Err(PcError::ConfigValidation(format!(
+                    "critic hidden layer {} size mismatch: current {} vs new {}",
+                    i, cur.size, new.size
+                )));
+            }
+        }
+
+        // Actor structural checks (MAGI W1: affect weight interpretation)
+        if self.config.actor.output_activation != config.actor.output_activation {
+            return Err(PcError::ConfigValidation(format!(
+                "actor output_activation mismatch: current {:?} vs new {:?}",
+                self.config.actor.output_activation, config.actor.output_activation
+            )));
+        }
+        if self.config.actor.residual != config.actor.residual {
+            return Err(PcError::ConfigValidation(format!(
+                "actor residual mismatch: current {} vs new {}",
+                self.config.actor.residual, config.actor.residual
+            )));
+        }
+        if self.config.actor.rezero_init != config.actor.rezero_init {
+            return Err(PcError::ConfigValidation(format!(
+                "actor rezero_init mismatch: current {} vs new {}",
+                self.config.actor.rezero_init, config.actor.rezero_init
+            )));
+        }
+
+        // Per-network param checks (MAGI C1: prevent self.config / self.actor.config divergence)
+        if self.config.actor.lr_weights != config.actor.lr_weights {
+            return Err(PcError::ConfigValidation(format!(
+                "actor lr_weights mismatch: current {} vs new {} — use set_actor_lr() (planned)",
+                self.config.actor.lr_weights, config.actor.lr_weights
+            )));
+        }
+        if self.config.actor.alpha != config.actor.alpha {
+            return Err(PcError::ConfigValidation(format!(
+                "actor alpha mismatch: current {} vs new {} — use set_actor_alpha() (planned)",
+                self.config.actor.alpha, config.actor.alpha
+            )));
+        }
+        if self.config.actor.tol != config.actor.tol {
+            return Err(PcError::ConfigValidation(format!(
+                "actor tol mismatch: current {} vs new {}",
+                self.config.actor.tol, config.actor.tol
+            )));
+        }
+        if self.config.actor.min_steps != config.actor.min_steps {
+            return Err(PcError::ConfigValidation(format!(
+                "actor min_steps mismatch: current {} vs new {}",
+                self.config.actor.min_steps, config.actor.min_steps
+            )));
+        }
+        if self.config.actor.max_steps != config.actor.max_steps {
+            return Err(PcError::ConfigValidation(format!(
+                "actor max_steps mismatch: current {} vs new {}",
+                self.config.actor.max_steps, config.actor.max_steps
+            )));
+        }
+        if self.config.actor.temperature != config.actor.temperature {
+            return Err(PcError::ConfigValidation(format!(
+                "actor temperature mismatch: current {} vs new {} — use set_temperature() (planned)",
+                self.config.actor.temperature, config.actor.temperature
+            )));
+        }
+        if self.config.actor.local_lambda != config.actor.local_lambda {
+            return Err(PcError::ConfigValidation(format!(
+                "actor local_lambda mismatch: current {} vs new {}",
+                self.config.actor.local_lambda, config.actor.local_lambda
+            )));
+        }
+        if self.config.actor.synchronous != config.actor.synchronous {
+            return Err(PcError::ConfigValidation(format!(
+                "actor synchronous mismatch: current {} vs new {}",
+                self.config.actor.synchronous, config.actor.synchronous
+            )));
+        }
+        if self.config.critic.lr != config.critic.lr {
+            return Err(PcError::ConfigValidation(format!(
+                "critic lr mismatch: current {} vs new {} — use set_critic_lr() (planned)",
+                self.config.critic.lr, config.critic.lr
+            )));
+        }
+        if self.config.critic.output_activation != config.critic.output_activation {
+            return Err(PcError::ConfigValidation(format!(
+                "critic output_activation mismatch: current {:?} vs new {:?}",
+                self.config.critic.output_activation, config.critic.output_activation
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Creates a new PC Actor-Critic agent.
     ///
     /// # Arguments
@@ -6769,5 +6930,188 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── apply_config: topology validation ─────────────────────────────
+
+    #[test]
+    fn test_validate_topology_match_identical_config_ok() {
+        let agent = make_agent();
+        let config = default_config();
+        assert!(agent.validate_topology_match(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_actor_input_size() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.input_size = 4;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor input_size mismatch"),
+            "Expected actor input_size mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_actor_hidden_count() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.hidden_layers.push(LayerDef {
+            size: 12,
+            activation: Activation::Tanh,
+        });
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor hidden layer count mismatch"),
+            "Expected actor hidden layer count error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_actor_hidden_size() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.hidden_layers[0].size = 27;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor hidden layer 0 size mismatch"),
+            "Expected actor hidden layer size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_actor_output_size() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.output_size = 4;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor output_size mismatch"),
+            "Expected actor output_size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_critic_input_size() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.critic.input_size = 18;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("critic input_size mismatch"),
+            "Expected critic input_size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_critic_hidden_count() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.critic.hidden_layers.push(LayerDef {
+            size: 24,
+            activation: Activation::Tanh,
+        });
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("critic hidden layer count mismatch"),
+            "Expected critic hidden layer count error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_critic_hidden_size() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.critic.hidden_layers[0].size = 24;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("critic hidden layer 0 size mismatch"),
+            "Expected critic hidden layer size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_allows_different_hidden_activation() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.hidden_layers[0].activation = Activation::Softsign;
+        assert!(agent.validate_topology_match(&config).is_ok());
+    }
+
+    // ── MAGI W1: structural parameter validation ──────────────────────
+
+    #[test]
+    fn test_validate_topology_match_different_output_activation() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.output_activation = Activation::Linear;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor output_activation mismatch"),
+            "Expected output_activation mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_residual() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.residual = true;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor residual mismatch"),
+            "Expected residual mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_rezero_init() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.rezero_init = 0.5;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor rezero_init mismatch"),
+            "Expected rezero_init mismatch, got: {err}"
+        );
+    }
+
+    // ── MAGI C1: per-network param divergence prevention ──────────────
+
+    #[test]
+    fn test_validate_topology_match_different_actor_lr() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.lr_weights = 0.1;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor lr_weights mismatch"),
+            "Expected actor lr_weights mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_actor_temperature() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.temperature = 2.0;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor temperature mismatch"),
+            "Expected actor temperature mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_critic_lr() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.critic.lr = 0.05;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("critic lr mismatch"),
+            "Expected critic lr mismatch, got: {err}"
+        );
     }
 }
