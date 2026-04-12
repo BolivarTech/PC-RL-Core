@@ -298,6 +298,19 @@ impl<L: LinAlg> PcActorCritic<L> {
             ));
         }
 
+        if let Some(lambda) = config.gae_lambda {
+            if !(0.0..=1.0).contains(&lambda) {
+                return Err(PcError::ConfigValidation(format!(
+                    "gae_lambda must be in [0.0, 1.0], got {lambda}"
+                )));
+            }
+            if config.td_steps > 0 {
+                return Err(PcError::ConfigValidation(
+                    "gae_lambda and td_steps > 0 are mutually exclusive".to_string(),
+                ));
+            }
+        }
+
         let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
             Self::compute_decay_factors(&config);
 
@@ -2027,6 +2040,7 @@ mod tests {
             fisher_ema_beta: 0.99,
             logits_reversal: false,
             td_steps: 0,
+            gae_lambda: Some(0.95),
         }
     }
 
@@ -2494,6 +2508,7 @@ mod tests {
             fisher_ema_beta: 0.99,
             logits_reversal: false,
             td_steps: 0,
+            gae_lambda: Some(0.95),
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -3688,6 +3703,7 @@ mod tests {
             fisher_ema_beta: 0.99,
             logits_reversal: false,
             td_steps: 0,
+            gae_lambda: Some(0.95),
         }
     }
 
@@ -5846,10 +5862,12 @@ mod tests {
         // td_steps=0 must produce identical weights to current TD(0)
         // Both agents use default_config() to ensure identical config (MAGI F1)
         let mut cfg_a = default_config();
+        cfg_a.gae_lambda = None;
         cfg_a.td_steps = 0;
         let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg_a, 42).unwrap();
 
-        let cfg_b = default_config(); // td_steps=0 by default
+        let mut cfg_b = default_config(); // td_steps=0 by default
+        cfg_b.gae_lambda = None;
         let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg_b, 42).unwrap();
 
         let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
@@ -5899,6 +5917,7 @@ mod tests {
     #[test]
     fn test_td_n_buffer_fills_at_n() {
         let mut cfg = default_config();
+        cfg.gae_lambda = None;
         cfg.td_steps = 3;
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
@@ -5937,6 +5956,7 @@ mod tests {
     fn test_td_n_terminal_flush() {
         // td_steps=5 but episode is only 3 steps → flush all at terminal
         let mut cfg = default_config();
+        cfg.gae_lambda = None;
         cfg.td_steps = 5;
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
@@ -5966,6 +5986,7 @@ mod tests {
     #[test]
     fn test_td_n_reset_clears_buffer() {
         let mut cfg = default_config();
+        cfg.gae_lambda = None;
         cfg.td_steps = 5;
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
@@ -5985,6 +6006,7 @@ mod tests {
     fn test_td_n_short_episode_monte_carlo() {
         // td_steps=10 but episode is 2 steps → full Monte Carlo
         let mut cfg = default_config();
+        cfg.gae_lambda = None;
         cfg.td_steps = 10;
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
@@ -6005,6 +6027,7 @@ mod tests {
     #[test]
     fn test_td_n_nan_reward_rejected_at_buffer() {
         let mut cfg = default_config();
+        cfg.gae_lambda = None;
         cfg.td_steps = 3;
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
@@ -6026,6 +6049,7 @@ mod tests {
         use crate::serializer::{load_agent, save_agent};
 
         let mut cfg = default_config();
+        cfg.gae_lambda = None;
         cfg.td_steps = 4;
         let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
@@ -6049,6 +6073,7 @@ mod tests {
     fn test_td_n_gamma_power_bootstrap() {
         // TD(2) must produce different weights than TD(0)
         let mut cfg_tdn = default_config();
+        cfg_tdn.gae_lambda = None;
         cfg_tdn.td_steps = 2;
         let mut agent_tdn: PcActorCritic =
             PcActorCritic::new(CpuLinAlg::new(), cfg_tdn, 42).unwrap();
@@ -6062,6 +6087,7 @@ mod tests {
         agent_tdn.step(&s3, 2.0, false);
 
         let mut cfg_td0 = default_config();
+        cfg_td0.gae_lambda = None;
         cfg_td0.td_steps = 0;
         let mut agent_td0: PcActorCritic =
             PcActorCritic::new(CpuLinAlg::new(), cfg_td0, 42).unwrap();
@@ -6357,5 +6383,41 @@ mod tests {
         assert_eq!(loaded.actor_frozen_steps, 50);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ============ GAE lambda config tests ============
+
+    #[test]
+    fn test_gae_lambda_default_is_095() {
+        let cfg = default_config();
+        assert_eq!(cfg.gae_lambda, Some(0.95));
+    }
+
+    #[test]
+    fn test_gae_lambda_and_td_steps_mutually_exclusive() {
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
+        cfg.td_steps = 4;
+        let result = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_err(), "gae_lambda + td_steps should be rejected");
+    }
+
+    #[test]
+    fn test_gae_lambda_none_allows_td_steps() {
+        let mut cfg = default_config();
+        cfg.gae_lambda = None;
+        cfg.td_steps = 4;
+        let result = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_ok(), "gae_lambda=None + td_steps should work");
+    }
+
+    #[test]
+    fn test_gae_lambda_out_of_range_rejected() {
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(1.5);
+        assert!(PcActorCritic::new(CpuLinAlg::new(), cfg.clone(), 42).is_err());
+
+        cfg.gae_lambda = Some(-0.1);
+        assert!(PcActorCritic::new(CpuLinAlg::new(), cfg, 42).is_err());
     }
 }
