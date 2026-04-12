@@ -61,7 +61,8 @@ let config = PcActorCriticConfig {
     adaptive_surprise: true,
     surprise_buffer_size: 400,
     entropy_coeff: 0.0,
-    td_steps: 4,   // TD(4) n-step returns (0 = TD(0) default)
+    td_steps: 0,       // TD(n) n-step returns (0 = default, >=2 for multi-step)
+    gae_lambda: Some(0.95), // GAE(λ) eligibility traces (None = disabled, recommended 0.95)
     ..Default::default()  // CL features default to disabled
 };
 
@@ -117,6 +118,8 @@ let (action, _) = agent.act(&state, &valid_actions, SelectionMode::Play);
 - *NaN Safety*: Guards in EwmaTracker, learn_continuous, push_surprise, push_td_error
 
 **TD(n) N-Step Returns (v2.1.0)**: Configurable n-step temporal difference learning via `td_steps`. Buffers n transitions before bootstrapping with V(s_{t+n}). Terminal flush uses pre-computed V(s) to avoid stale-estimate bias. `td_steps=0` (default) preserves exact TD(0) behavior with zero overhead. See [docs/td_n_spec.md](docs/td_n_spec.md).
+
+**GAE(λ) Eligibility Traces (v2.1.0)**: Output-level eligibility traces via `gae_lambda: Option<f64>`. Accumulates policy gradient direction across steps: `trace = γλ*trace + ∇log π`, then `delta = td_error * trace`. Smoothly interpolates between TD(0) (λ=0) and Monte Carlo (λ=1). Trace clipped at GRAD_CLIP=5.0. Mutually exclusive with `td_steps > 0`. Default `None` (disabled); recommended `Some(0.95)` for short episodes.
 
 ### Type Aliases
 
@@ -184,7 +187,7 @@ No PyTorch, TensorFlow, or any ML framework. Pure Rust from scratch.
 
 ## Testing
 
-524 unit tests + 21 doctests:
+538 unit tests + 21 doctests:
 
 ```bash
 cargo nextest run
