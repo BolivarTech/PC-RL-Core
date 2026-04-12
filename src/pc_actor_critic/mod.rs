@@ -107,6 +107,9 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     critic_last_phase_reliable: bool,
     /// Buffer for TD(n) transitions. Empty when td_steps=0.
     td_buffer: VecDeque<TdTransition<L>>,
+    /// Output-level eligibility trace for GAE(λ). Empty when gae_lambda=None.
+    /// Not serialized — transient mid-episode state.
+    actor_trace: Vec<f64>,
 }
 
 /// A single buffered transition for TD(n) computation.
@@ -392,6 +395,11 @@ impl<L: LinAlg> PcActorCritic<L> {
         if let Some(ref mut hyst) = critic_hysteresis {
             hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, min_fisher_phase);
         }
+        let new_trace_len = if config.gae_lambda.is_some() {
+            config.actor.output_size
+        } else {
+            0
+        };
 
         Ok(Self {
             actor,
@@ -420,6 +428,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_last_phase_reliable: false,
             critic_last_phase_reliable: false,
             td_buffer: VecDeque::new(),
+            actor_trace: vec![0.0; new_trace_len],
         })
     }
 
@@ -504,6 +513,11 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         let (child_actor_decay, child_critic_decay, child_layer_error_ema) =
             Self::compute_decay_factors(&child_config);
+        let child_trace_len = if child_config.gae_lambda.is_some() {
+            child_config.actor.output_size
+        } else {
+            0
+        };
 
         Ok(Self {
             actor,
@@ -532,6 +546,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_last_phase_reliable: false,
             critic_last_phase_reliable: false,
             td_buffer: VecDeque::new(),
+            actor_trace: vec![0.0; child_trace_len],
         })
     }
 
@@ -552,6 +567,11 @@ impl<L: LinAlg> PcActorCritic<L> {
     ) -> Self {
         let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
             Self::compute_decay_factors(&config);
+        let parts_trace_len = if config.gae_lambda.is_some() {
+            config.actor.output_size
+        } else {
+            0
+        };
         Self {
             actor,
             critic,
@@ -579,6 +599,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_last_phase_reliable: false,
             critic_last_phase_reliable: false,
             td_buffer: VecDeque::new(),
+            actor_trace: vec![0.0; parts_trace_len],
         }
     }
 
@@ -1329,6 +1350,9 @@ impl<L: LinAlg> PcActorCritic<L> {
             self.action_prev = None;
             self.infer_prev = None;
             self.valid_actions_prev = None;
+            for v in &mut self.actor_trace {
+                *v = 0.0;
+            }
         }
 
         action
@@ -1416,6 +1440,9 @@ impl<L: LinAlg> PcActorCritic<L> {
         self.infer_prev = None;
         self.valid_actions_prev = None;
         self.td_buffer.clear();
+        for v in &mut self.actor_trace {
+            *v = 0.0;
+        }
     }
 
     /// Pushes a surprise score into the adaptive buffer (circular).
@@ -6419,5 +6446,33 @@ mod tests {
 
         cfg.gae_lambda = Some(-0.1);
         assert!(PcActorCritic::new(CpuLinAlg::new(), cfg, 42).is_err());
+    }
+
+    #[test]
+    fn test_gae_trace_field_exists_and_correct_size() {
+        let cfg = default_config(); // gae_lambda = Some(0.95)
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        assert_eq!(
+            agent.actor_trace.len(),
+            9,
+            "Trace size must equal output_size"
+        );
+        assert!(
+            agent.actor_trace.iter().all(|&v| v == 0.0),
+            "Trace must start at zero"
+        );
+    }
+
+    #[test]
+    fn test_gae_trace_empty_when_disabled() {
+        let mut cfg = default_config();
+        cfg.gae_lambda = None;
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        assert!(
+            agent.actor_trace.is_empty(),
+            "Trace must be empty when gae_lambda=None"
+        );
     }
 }
