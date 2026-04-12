@@ -1619,4 +1619,63 @@ critic_consolidation_decay = 0.5     # default 1.0 (no decay, legacy)
 | M3b (adaptive decay) | Per-layer prediction error EMA | Not applicable (future exploration) |
 | M4 (EWC) | Actor snapshots + Fisher EMA | Critic snapshots + Fisher EMA (independent) |
 
+---
+
+## Post-v2.1.0 Additions
+
+The following features were added after the initial v2.1.0 CL implementation,
+as part of the same development cycle.
+
+### TD(n) N-Step Returns
+
+Configurable n-step TD learning via `td_steps: usize`. Buffers n transitions
+before bootstrapping with V(s_{t+n}). Terminal flush uses pre-computed V(s)
+to avoid stale-estimate bias. `td_steps=0` preserves exact TD(0) behavior.
+
+See [docs/td_n_spec.md](td_n_spec.md) for full specification.
+
+### Bidirectional Hysteresis Coupling
+
+Two independent, symmetric coupling mechanisms allow actor and critic to
+wake each other when their respective signals detect problems:
+
+| Direction | Trigger | Purpose |
+|---|---|---|
+| **actor→critic** (`actor_wakes_critic`) | Actor wakes (surprise spike) | Force critic to re-learn when environment changes |
+| **critic→actor** (`critic_wakes_actor`) | Critic wakes (TD error spike) | Force actor to re-learn when performance degrades |
+
+Both couplings use dual-gate protection:
+1. **EWMA smoothing** on the source signal (no sporadic spikes)
+2. **Frozen-step threshold** on the target (must have been frozen long enough)
+3. **EWMA k reset** on coupling-forced wake (re-enables warmup guard, prevents immediate re-freeze)
+
+Both default to `true` with `threshold=1000`. Only effective when both
+`actor_hysteresis` and `critic_hysteresis` are enabled.
+
+Anti-cascade is guaranteed: the Frozen-state guard on the target prevents
+ping-pong because a coupling-forced wake sets the target to Plastic before
+the reverse coupling can check it.
+
+### NaN Safety
+
+Guards at multiple levels prevent silent corruption from non-finite values:
+
+| Guard | Location | Behavior |
+|---|---|---|
+| `EwmaTracker::update()` | ewma.rs | Drops NaN/Inf, k not incremented |
+| `learn_continuous_inner()` | mod.rs | Returns 0.0 if td_error non-finite |
+| `push_surprise()` | mod.rs | Drops non-finite values |
+| `push_td_error()` | mod.rs | Drops non-finite values |
+| TD(n) buffer push | mod.rs | `reward.is_finite()` guard before insert |
+
+### Implementation Notes
+
+- `pc_actor_critic.rs` was refactored into a 6-file directory submodule
+  (`config.rs`, `ewma.rs`, `hysteresis.rs`, `fisher.rs`, `trajectory.rs`, `mod.rs`)
+- `step_masked()` returns `Result<usize, PcError>` (was panic)
+- `to_cl_state()` uses `ClState::default()` comparison (auto-detects any non-default CL field)
+- `compute_decay_factors()` extracted as single source of truth
+- MAGI review: 4 cycles on CL, unanimous STRONG GO; 2 cycles on TD(n), unanimous STRONG GO;
+  2 cycles on bidirectional coupling, unanimous STRONG GO
+
  

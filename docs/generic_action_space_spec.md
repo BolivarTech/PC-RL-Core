@@ -2,8 +2,18 @@
 
 ## Status
 
-**Draft** -- Future work. Not part of continuous learning (v2.1.0). To be
-implemented after continuous learning is validated.
+**Draft** — Future work (v3.0.0 target). Not part of current release.
+
+> **Warning:** This spec was written against v2.0.0 architecture. The codebase
+> has since been refactored:
+> - `pc_actor_critic.rs` is now a 6-file directory submodule (`pc_actor_critic/`)
+> - Line numbers in the "Where usize is Embedded" table are obsolete
+> - `step()` and `step_masked()` API added (CL v2.1.0) — not reflected here
+> - TD(n) n-step returns added — `learn_continuous_inner` with `gamma_power`
+> - Bidirectional hysteresis coupling added
+>
+> Before implementing, run a brainstorm session to update this spec against
+> the current codebase and resolve the 5 open questions at the end.
 
 ## Motivation
 
