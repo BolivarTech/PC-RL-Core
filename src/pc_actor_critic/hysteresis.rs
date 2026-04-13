@@ -71,6 +71,45 @@ impl HysteresisState {
 }
 
 #[cfg(test)]
+impl HysteresisState {
+    /// Test-only: construct a HysteresisState with explicit EWMA snapshot values.
+    ///
+    /// Used to reproduce equilibrium states without running a warmup sequence.
+    /// **Contract:** this helper is an exhaustive struct literal — every field
+    /// of `HysteresisState` must be passed as an argument. Do NOT use `..Default::default()`
+    /// or partial init. Adding a new field to `HysteresisState` MUST cause a
+    /// compile error here to force a conscious decision about test semantics.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_snapshot(
+        state: PlasticityState,
+        fast_value: f64,
+        fast_k: u64,
+        fast_window: usize,
+        slow_value: f64,
+        slow_k: u64,
+        slow_window: usize,
+        wake_fraction: f64,
+        sleep_fraction: f64,
+        min_initial_plastic: u64,
+    ) -> Self {
+        let mut fast = EwmaTracker::new(fast_window);
+        fast.value = fast_value;
+        fast.k = fast_k;
+        let mut slow = EwmaTracker::new(slow_window);
+        slow.value = slow_value;
+        slow.k = slow_k;
+        HysteresisState {
+            fast,
+            slow,
+            state,
+            wake_fraction,
+            sleep_fraction,
+            min_initial_plastic,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -185,5 +224,66 @@ mod tests {
             assert_eq!(result, None);
         }
         assert_eq!(hyst.state, PlasticityState::Frozen);
+    }
+
+    #[test]
+    fn from_snapshot_matches_organic_warmup() {
+        // Drive the "organic" side through actual update() calls from a fresh
+        // EwmaTracker, so any change to update()'s internal semantics shows up
+        // as a divergence from the snapshot-built equivalent.
+        let signal = 0.5;
+        let n_warmup = 50;
+
+        let mut organic = HysteresisState {
+            fast: EwmaTracker::new(5),
+            slow: EwmaTracker::new(20),
+            state: PlasticityState::Plastic,
+            wake_fraction: 0.5,
+            sleep_fraction: 0.005,
+            min_initial_plastic: 0,
+        };
+        for _ in 0..n_warmup {
+            let _ = organic.update(signal);
+        }
+        assert_eq!(organic.fast.k, n_warmup as u64);
+        assert_eq!(organic.slow.k, n_warmup as u64);
+        // EwmaTracker may or may not be warmup-aware. If this assertion fails with
+        // a residual around 1e-2 or 1e-3, that means EwmaTracker is pure
+        // exponential blend (not warmup-aware). In that case the test is still
+        // valid — loosen this specific sanity assertion to 1e-6 and keep the
+        // equality checks below at f64::EPSILON (they compare two f64 values that
+        // took identical computation paths, so exactness holds regardless).
+        assert!((organic.fast.value - signal).abs() < 1e-6);
+        assert!((organic.slow.value - signal).abs() < 1e-6);
+
+        let mut snapshot = HysteresisState::from_snapshot(
+            PlasticityState::Plastic,
+            organic.fast.value,
+            organic.fast.k,
+            5,
+            organic.slow.value,
+            organic.slow.k,
+            20,
+            0.5,
+            0.005,
+            0,
+        );
+
+        // Structural equivalence.
+        assert_eq!(organic.state, snapshot.state);
+        assert_eq!(organic.fast.k, snapshot.fast.k);
+        assert_eq!(organic.slow.k, snapshot.slow.k);
+        assert_eq!(organic.fast.window, snapshot.fast.window);
+        assert_eq!(organic.slow.window, snapshot.slow.window);
+        assert!((organic.fast.value - snapshot.fast.value).abs() < f64::EPSILON);
+        assert!((organic.slow.value - snapshot.slow.value).abs() < f64::EPSILON);
+
+        // Semantic equivalence via one additional update() call.
+        let organic_transition = organic.update(signal);
+        let snapshot_transition = snapshot.update(signal);
+        assert_eq!(organic_transition, snapshot_transition);
+        assert!((organic.fast.value - snapshot.fast.value).abs() < f64::EPSILON);
+        assert!((organic.slow.value - snapshot.slow.value).abs() < f64::EPSILON);
+        assert_eq!(organic.state, snapshot.state);
     }
 }

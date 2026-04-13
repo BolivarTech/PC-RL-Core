@@ -6952,6 +6952,333 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // ============ Cross-wake deadlock regression tests ============
+
+    #[test]
+    #[ignore = "Red: requires sustained-path cross-wake fix (unignore in Phase 2)"]
+    fn critic_wakes_actor_after_sustained_plastic_state() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.critic_wakes_actor = true;
+        cfg.critic_wakes_actor_threshold = 50;
+        cfg.actor_wakes_critic = false;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        agent.actor_hysteresis = Some(HysteresisState::from_snapshot(
+            PlasticityState::Frozen,
+            0.5430,
+            100,
+            20,
+            0.5436,
+            100,
+            500,
+            0.5,
+            0.005,
+            0,
+        ));
+        agent.actor_frozen_steps = 100;
+        agent.critic_hysteresis = Some(HysteresisState::from_snapshot(
+            PlasticityState::Plastic,
+            0.0170,
+            100,
+            20,
+            0.0168,
+            100,
+            200,
+            0.5,
+            0.3,
+            9999,
+        ));
+        agent.critic_plastic_step_counter = 0;
+
+        let actor_frozen_steps_pre = agent.actor_frozen_steps;
+        let critic_state_pre = agent.critic_hysteresis.as_ref().unwrap().state.clone();
+
+        for _ in 0..50 {
+            agent.process_hysteresis(0.5430, 0.0170);
+        }
+
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic,
+            "Actor should have been woken via sustained-plastic cross-wake"
+        );
+        assert_eq!(
+            agent.actor_frozen_steps, 0,
+            "cross-wake must reset actor_frozen_steps (was {actor_frozen_steps_pre})"
+        );
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            critic_state_pre,
+            "critic must not have transitioned naturally during this test"
+        );
+        // Fisher-consistency witness: under default config (ewc_lambda=0),
+        // handle_fisher_wake early-returns and actor_fisher (Vec<FisherState<L>>
+        // at mod.rs:97) remains empty. Enforces Invariant 5.
+        assert!(
+            agent.actor_fisher.is_empty(),
+            "ewc_lambda=0 must keep actor_fisher empty even after cross-wake fires"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires sustained-path cross-wake fix (unignore in Phase 2)"]
+    fn cross_wake_source_counter_reset_on_sustained_firing() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.critic_wakes_actor = true;
+        cfg.critic_wakes_actor_threshold = 10;
+        cfg.actor_wakes_critic = false;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        agent.actor_hysteresis = Some(HysteresisState::from_snapshot(
+            PlasticityState::Frozen,
+            0.5,
+            100,
+            20,
+            0.5,
+            100,
+            500,
+            0.5,
+            0.005,
+            0,
+        ));
+        agent.actor_frozen_steps = 100;
+        agent.critic_hysteresis = Some(HysteresisState::from_snapshot(
+            PlasticityState::Plastic,
+            0.01,
+            100,
+            20,
+            0.01,
+            100,
+            200,
+            0.5,
+            0.3,
+            9999,
+        ));
+        agent.critic_plastic_step_counter = 0;
+
+        for _ in 0..10 {
+            agent.process_hysteresis(0.5, 0.01);
+        }
+
+        assert_eq!(
+            agent.critic_plastic_step_counter, 0,
+            "sustained-path fire must reset source counter (symmetric cooldown)"
+        );
+        assert_eq!(
+            agent.actor_frozen_steps, 0,
+            "sustained-path fire must reset target counter"
+        );
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic,
+            "actor must be Plastic after cross-wake"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires sustained-path cross-wake fix (unignore in Phase 2)"]
+    fn cross_wake_throttle_prevents_refire_before_threshold() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.critic_wakes_actor = true;
+        cfg.critic_wakes_actor_threshold = 10;
+        cfg.actor_wakes_critic = false;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        agent.actor_hysteresis = Some(HysteresisState::from_snapshot(
+            PlasticityState::Frozen,
+            0.5,
+            100,
+            20,
+            0.5,
+            100,
+            500,
+            0.5,
+            0.005,
+            0,
+        ));
+        agent.actor_frozen_steps = 100;
+        agent.critic_hysteresis = Some(HysteresisState::from_snapshot(
+            PlasticityState::Plastic,
+            0.01,
+            100,
+            20,
+            0.01,
+            100,
+            200,
+            0.5,
+            0.3,
+            9999,
+        ));
+        agent.critic_plastic_step_counter = 0;
+
+        for _ in 0..10 {
+            agent.process_hysteresis(0.5, 0.01);
+        }
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic,
+            "setup: fire #1 must have occurred"
+        );
+
+        // Force actor back to FROZEN manually. This deliberately leaves fast/slow
+        // EWMAs at near-equilibrium post-drift values. Safe because the cross-wake
+        // fire path reads only state + counters, and the natural wake condition
+        // `fast > slow*(1+wake_fraction)` is false at equilibrium (fast≈slow≈0.5,
+        // 0.5 > 0.5*1.5 = 0.75 is false).
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.actor_frozen_steps = 0;
+
+        for _ in 0..9 {
+            agent.process_hysteresis(0.5, 0.01);
+        }
+
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Frozen,
+            "cross-wake must not refire before threshold steps elapse"
+        );
+
+        agent.process_hysteresis(0.5, 0.01);
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic,
+            "cross-wake fires on the 10th sustained step"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires sustained-path cross-wake fix (unignore in Phase 2)"]
+    fn actor_wakes_critic_after_sustained_plastic_state() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.actor_wakes_critic = true;
+        cfg.actor_wakes_critic_threshold = 50;
+        cfg.critic_wakes_actor = false;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        agent.actor_hysteresis = Some(HysteresisState::from_snapshot(
+            PlasticityState::Plastic,
+            0.8,
+            100,
+            20,
+            0.8,
+            100,
+            500,
+            0.5,
+            0.005,
+            9999,
+        ));
+        agent.actor_plastic_step_counter = 0;
+        agent.critic_hysteresis = Some(HysteresisState::from_snapshot(
+            PlasticityState::Frozen,
+            0.1,
+            100,
+            20,
+            0.1,
+            100,
+            200,
+            0.5,
+            0.3,
+            0,
+        ));
+        agent.critic_frozen_steps = 100;
+
+        let critic_frozen_steps_pre = agent.critic_frozen_steps;
+        let actor_state_pre = agent.actor_hysteresis.as_ref().unwrap().state.clone();
+
+        for _ in 0..50 {
+            agent.process_hysteresis(0.8, 0.1);
+        }
+
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic,
+            "Critic should have been woken via sustained-plastic cross-wake"
+        );
+        assert_eq!(
+            agent.critic_frozen_steps, 0,
+            "cross-wake must reset critic_frozen_steps (was {critic_frozen_steps_pre})"
+        );
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            actor_state_pre,
+            "actor must not have transitioned naturally during this test"
+        );
+    }
+
+    #[test]
+    // No #[ignore] — this test verifies a no-op that holds both pre-fix and
+    // post-fix (target guards `state == Frozen` fail for PLASTIC targets, so
+    // neither cross-wake can fire). Grouped with Red siblings as an invariant
+    // lock against future refactors that might relax the target guards.
+    fn both_plastic_sustained_is_noop() {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.actor_wakes_critic = true;
+        cfg.actor_wakes_critic_threshold = 10;
+        cfg.critic_wakes_actor = true;
+        cfg.critic_wakes_actor_threshold = 10;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        agent.actor_hysteresis = Some(HysteresisState::from_snapshot(
+            PlasticityState::Plastic,
+            0.5,
+            100,
+            20,
+            0.5,
+            100,
+            500,
+            0.5,
+            0.005,
+            9999,
+        ));
+        agent.actor_plastic_step_counter = 100;
+        agent.critic_hysteresis = Some(HysteresisState::from_snapshot(
+            PlasticityState::Plastic,
+            0.5,
+            100,
+            20,
+            0.5,
+            100,
+            200,
+            0.5,
+            0.3,
+            9999,
+        ));
+        agent.critic_plastic_step_counter = 100;
+
+        for _ in 0..20 {
+            agent.process_hysteresis(0.5, 0.5);
+        }
+
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic,
+            "actor must remain Plastic (both-sustained no-op)"
+        );
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic,
+            "critic must remain Plastic (both-sustained no-op)"
+        );
+        assert!(
+            agent.actor_plastic_step_counter > 100,
+            "actor counter must keep accumulating (no fire should reset it)"
+        );
+        assert!(
+            agent.critic_plastic_step_counter > 100,
+            "critic counter must keep accumulating (no fire should reset it)"
+        );
+    }
+
     // ============ GAE lambda config tests ============
 
     #[test]
