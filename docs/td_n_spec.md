@@ -167,7 +167,7 @@ stale-estimate bias.
 
 ```rust
 /// Flushes all buffered transitions at episode end.
-/// Pre-computes V(s) before weight updates (MAGI C2).
+/// Pre-computes V(s) before weight updates to avoid stale-estimate bias.
 /// Calls process_hysteresis after each learn step.
 fn flush_td_buffer(&mut self, terminal_state: &[f64], terminal_infer: &InferResult<L>)
 ```
@@ -396,15 +396,3 @@ When `td_steps=0`:
 | td_steps sweep | [0, 2, 3, 4, 5, 8] on TicTacToe | Find optimal n for 5-9 step episodes |
 | Qubic application | TD(5-10) with CL | Longer episodes (10-30 steps) |
 
----
-
-## 11. MAGI Review History
-
-| Cycle | Verdict | Findings |
-|---|---|---|
-| Design v1 | GO WITH CAVEATS (3x conditional) | 3 critical + 7 warnings |
-| Design v2 | **STRONG GO (3x approve)** | All resolved |
-| TDD Plan v1 | GO WITH CAVEATS (2 conditional + 1 approve) | flush pre_v_s decorative, td_steps=1, doctest |
-| TDD Plan v2 | **STRONG GO (3x approve)** | All resolved |
-| Code v1 | GO WITH CAVEATS (2 approve + 1 conditional) | dead_code, td_steps=1, O(k^2) flush |
-| Code v2 | **STRONG GO (3x approve, 93-97%)** | All resolved |

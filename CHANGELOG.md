@@ -70,7 +70,7 @@
 
 ## [1.2.3] - 2026-04-04
 
-- Resolve MAGI findings N1-N4: skip projection validation, SVD doc, NaN sort, buffer size guard
+- Resolve skip projection validation, SVD doc, NaN sort, and buffer size guard
 
 ## [1.2.2] - 2026-04-03
 

@@ -1059,7 +1059,7 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
-    /// MAGI finding #4: v2.0.0 fixture must load with fully inert CL state.
+    /// v2.0.0 fixture must load with fully inert CL state.
     /// Load → verify to_cl_state() is None → step() → save → reload → verify
     /// round-trip preserves weights and CL stays inert.
     #[test]

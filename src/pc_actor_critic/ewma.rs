@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(loaded.window, tracker.window);
     }
 
-    /// MAGI v2 W2: NaN input must not corrupt the EWMA tracker.
+    /// NaN input must not corrupt the EWMA tracker.
     /// NaN/Inf should be silently dropped, preserving the last valid value.
     #[test]
     fn ewma_nan_input_does_not_silently_corrupt() {

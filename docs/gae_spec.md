@@ -370,13 +370,3 @@ amplify its effect proportionally to episode length, which is undesirable.
 The per-step application ensures consistent regularization regardless of
 trace magnitude.
 
----
-
-## 12. MAGI Review History
-
-| Cycle | Verdict | Key Findings |
-|---|---|---|
-| Plan v1 | GO WITH CAVEATS (3× conditional) | DRY duplication, trace clipping, entropy, serde skip, default |
-| Plan v2 | **STRONG GO (3× approve)** | All resolved |
-| Code v1 | GO WITH CAVEATS (2 approve + 1 conditional) | Default Some(0.95) breaking, trace_len DRY |
-| Code v2 (post-fix) | **Verified** | Default→None, helper extracted, debug_assert |

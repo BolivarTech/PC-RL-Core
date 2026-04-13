@@ -478,7 +478,7 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// reconstruct the agent with [`new`](Self::new) if they need to change.
     ///
     /// `f64` fields are compared with a relative epsilon
-    /// ([`f64_approx_eq`](Self::f64_approx_eq)) to tolerate JSON round-trip
+    /// (`f64_approx_eq`) to tolerate JSON round-trip
     /// drift; all other fields use exact equality.
     ///
     /// # Errors
@@ -688,7 +688,7 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// with [`new`](Self::new) and transfer weights via the serializer.
     ///
     /// `f64` fields are compared with a relative epsilon to tolerate JSON
-    /// round-trip drift; see [`f64_approx_eq`](Self::f64_approx_eq).
+    /// round-trip drift.
     ///
     /// All continuous learning state is reset to provide a clean baseline.
     ///
@@ -1503,7 +1503,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                 self.actor_trace[i] += g;
             }
 
-            // Clip trace to prevent overflow (MAGI C2)
+            // Clip trace to prevent overflow
             for v in &mut self.actor_trace {
                 *v = v.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
             }
@@ -1901,15 +1901,15 @@ impl<L: LinAlg> PcActorCritic<L> {
 
     /// Flushes the TD(n) buffer at episode end.
     /// Pre-computes V(s) before weight updates and injects via pre_v_s
-    /// to avoid stale-estimate bias (MAGI C2).
-    /// Calls process_hysteresis after each learning step (MAGI W1).
+    /// to avoid stale-estimate bias.
+    /// Calls process_hysteresis after each learning step.
     fn flush_td_buffer(&mut self, terminal_state: &[f64], terminal_infer: &InferResult<L>) {
         let buffer: Vec<TdTransition<L>> = self.td_buffer.drain(..).collect();
         if buffer.is_empty() {
             return;
         }
 
-        // Pre-compute all V(s) BEFORE any weight update (MAGI C2).
+        // Pre-compute all V(s) BEFORE any weight update.
         // These values are passed to learn_continuous_inner via pre_v_s
         // so the internal critic.forward() is bypassed.
         let v_s_values: Vec<f64> = buffer
@@ -1948,7 +1948,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             let state_vec = self.backend.vec_to_vec(&transition.state);
             let surprise_score = transition.infer.surprise_score;
 
-            // Pass pre-computed V(s) via Some() — MAGI C2 enforcement
+            // Pass pre-computed V(s) via Some() to bypass critic.forward()
             self.learn_continuous_inner(
                 &state_vec,
                 &transition.infer,
@@ -1962,7 +1962,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                 Some(v_s_values[k]),
             );
 
-            // Process hysteresis after each flush step (MAGI W1)
+            // Process hysteresis after each flush step
             if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
                 self.process_hysteresis(surprise_score, self.last_td_error.abs());
             }
@@ -5992,9 +5992,8 @@ mod tests {
         assert!(error_ema.iter().all(|&v| v == 0.0));
     }
 
-    /// MAGI finding #5: Crossover between parents with different hidden
-    /// topologies must reset all CL state and the child must be able to
-    /// step() without panic.
+    /// Crossover between parents with different hidden topologies must reset
+    /// all CL state and the child must be able to step() without panic.
     #[test]
     fn test_crossover_topology_mismatch_resets_cl_and_runs() {
         // Parent A: 3 hidden layers [12,12,8] with EWC
@@ -6072,8 +6071,8 @@ mod tests {
         // If we got here, no panic occurred
     }
 
-    /// MAGI Caspar C1: ewc_lambda=0 must be a true no-op — no Fisher allocation,
-    /// no per-parameter traversal, and step() latency within 5% of baseline.
+    /// ewc_lambda=0 must be a true no-op — no Fisher allocation, no
+    /// per-parameter traversal, and step() latency within 5% of baseline.
     #[test]
     fn test_ewc_lambda_zero_fast_path() {
         use std::time::Instant;
@@ -6149,7 +6148,7 @@ mod tests {
         );
 
         // Latency must be within 50% of baseline (generous for CI noise;
-        // Caspar's 5% target is for dedicated hardware — CI has variance)
+        // the 5% target only holds on dedicated hardware)
         let ratio = explicit_ns as f64 / baseline_ns as f64;
         assert!(
             ratio < 1.5,
@@ -6157,7 +6156,7 @@ mod tests {
         );
     }
 
-    /// MAGI Caspar C2: Layer decay must not permanently freeze a layer.
+    /// Layer decay must not permanently freeze a layer.
     /// After sustained low surprise drives decay toward 0, a sudden high-surprise
     /// event must restore plasticity.
     #[test]
@@ -6235,7 +6234,7 @@ mod tests {
         );
     }
 
-    /// MAGI Caspar C3: NaN must not silently propagate through the CL pipeline.
+    /// NaN must not silently propagate through the CL pipeline.
     /// All-zero rewards and extreme inputs must produce finite outputs.
     #[test]
     fn test_nan_does_not_propagate_through_cl_pipeline() {
@@ -6326,9 +6325,9 @@ mod tests {
         }
     }
 
-    /// MAGI v2 W1: layer_error_ema must be updated during learn_continuous()
-    /// when adaptive_consolidation is enabled. Without the update, the EMA
-    /// stays at 0.0 forever and the sigmoid produces a constant decay factor.
+    /// layer_error_ema must be updated during learn_continuous() when
+    /// adaptive_consolidation is enabled. Without the update, the EMA stays
+    /// at 0.0 forever and the sigmoid produces a constant decay factor.
     #[test]
     fn test_m3b_layer_error_ema_updates_during_learning() {
         let mut cfg = default_config();
@@ -6375,7 +6374,7 @@ mod tests {
         }
     }
 
-    /// MAGI v3 W1 (Caspar): NaN reward must not corrupt weights.
+    /// NaN reward must not corrupt weights.
     /// td_error computed from NaN reward is NaN — learn_continuous must
     /// short-circuit before updating weights, critic, or buffers.
     #[test]
@@ -6428,7 +6427,7 @@ mod tests {
     #[test]
     fn test_td0_unchanged_with_td_steps_zero() {
         // td_steps=0 must produce identical weights to current TD(0)
-        // Both agents use default_config() to ensure identical config (MAGI F1)
+        // Both agents use default_config() to ensure identical config
         let mut cfg_a = default_config();
         cfg_a.gae_lambda = None;
         cfg_a.td_steps = 0;
@@ -7091,7 +7090,7 @@ mod tests {
 
     #[test]
     fn test_gae_lambda_zero_matches_td0() {
-        // NOTE (MAGI C1): Equivalence holds ONLY when entropy_coeff=0.0.
+        // NOTE: Equivalence holds ONLY when entropy_coeff=0.0.
         let mut cfg_gae0 = default_config();
         cfg_gae0.entropy_coeff = 0.0;
         cfg_gae0.gae_lambda = Some(0.0);
@@ -7117,7 +7116,7 @@ mod tests {
     #[test]
     fn test_gae_nan_reward_safe() {
         // NaN reward triggers td_error guard BEFORE GAE trace code.
-        // Verify: weights unchanged, trace unchanged (MAGI W5: snapshot).
+        // Verify: weights unchanged, trace unchanged.
         let mut cfg = default_config();
         cfg.gae_lambda = Some(0.95);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
@@ -7335,7 +7334,7 @@ mod tests {
         assert!(agent.validate_topology_match(&config).is_ok());
     }
 
-    // ── MAGI W1: structural parameter validation ──────────────────────
+    // ── structural parameter validation ───────────────────────────────
 
     #[test]
     fn test_validate_topology_match_different_output_activation() {
@@ -7373,7 +7372,7 @@ mod tests {
         );
     }
 
-    // ── MAGI C1: per-network param divergence prevention ──────────────
+    // ── per-network param divergence prevention ───────────────────────
 
     #[test]
     fn test_validate_topology_match_different_actor_lr() {
@@ -7760,7 +7759,7 @@ mod tests {
         assert_eq!(agent.actor.layers[0].weights.data, w_orig);
     }
 
-    // ── MAGI W3: serialization round-trip after apply_config ─────────
+    // ── serialization round-trip after apply_config ──────────────────
 
     #[test]
     fn test_apply_config_serialization_round_trip() {
@@ -7808,7 +7807,7 @@ mod tests {
         assert!((loaded.config.gamma - 0.99).abs() < 1e-12);
         assert!((loaded.config.entropy_coeff).abs() < 1e-12);
 
-        // MAGI v2: sub-config coherence
+        // sub-config coherence across serialization round-trip
         assert_eq!(
             loaded.config.actor.lr_weights, loaded.actor.config.lr_weights,
             "actor lr_weights diverged after round-trip"
@@ -7833,7 +7832,7 @@ mod tests {
         );
     }
 
-    // ── MAGI I2: GAE → TD(n) mode switch via apply_config ────────────
+    // ── GAE → TD(n) mode switch via apply_config ─────────────────────
 
     #[test]
     fn test_apply_config_gae_to_td_switch() {

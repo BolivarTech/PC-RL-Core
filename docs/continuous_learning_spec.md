@@ -1675,7 +1675,5 @@ Guards at multiple levels prevent silent corruption from non-finite values:
 - `step_masked()` returns `Result<usize, PcError>` (was panic)
 - `to_cl_state()` uses `ClState::default()` comparison (auto-detects any non-default CL field)
 - `compute_decay_factors()` extracted as single source of truth
-- MAGI review: 4 cycles on CL, unanimous STRONG GO; 2 cycles on TD(n), unanimous STRONG GO;
-  2 cycles on bidirectional coupling, unanimous STRONG GO
 
  
