@@ -2618,6 +2618,27 @@ mod tests {
         agent
     }
 
+    /// Build an agent configured for cross-wake regression tests.
+    ///
+    /// Both hysteresis state machines are enabled. The four coupling flags
+    /// and their thresholds are caller-supplied so each of the five
+    /// cross-wake tests can share this setup without repeating config boilerplate.
+    fn make_cross_wake_test_agent(
+        actor_wakes_critic: bool,
+        actor_wakes_critic_threshold: u64,
+        critic_wakes_actor: bool,
+        critic_wakes_actor_threshold: u64,
+    ) -> PcActorCritic {
+        let mut cfg = default_config();
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.actor_wakes_critic = actor_wakes_critic;
+        cfg.actor_wakes_critic_threshold = actor_wakes_critic_threshold;
+        cfg.critic_wakes_actor = critic_wakes_actor;
+        cfg.critic_wakes_actor_threshold = critic_wakes_actor_threshold;
+        PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap()
+    }
+
     fn make_trajectory(agent: &mut PcActorCritic) -> Vec<TrajectoryStep> {
         let input = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
         let valid = vec![2, 7];
@@ -6957,13 +6978,7 @@ mod tests {
     #[test]
     #[ignore = "Red: requires sustained-path cross-wake fix (unignore in Phase 2)"]
     fn critic_wakes_actor_after_sustained_plastic_state() {
-        let mut cfg = default_config();
-        cfg.actor_hysteresis = true;
-        cfg.critic_hysteresis = true;
-        cfg.critic_wakes_actor = true;
-        cfg.critic_wakes_actor_threshold = 50;
-        cfg.actor_wakes_critic = false;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let mut agent = make_cross_wake_test_agent(false, 1000, true, 50);
 
         agent.actor_hysteresis = Some(HysteresisState::from_snapshot(
             PlasticityState::Frozen,
@@ -7025,13 +7040,7 @@ mod tests {
     #[test]
     #[ignore = "Red: requires sustained-path cross-wake fix (unignore in Phase 2)"]
     fn cross_wake_source_counter_reset_on_sustained_firing() {
-        let mut cfg = default_config();
-        cfg.actor_hysteresis = true;
-        cfg.critic_hysteresis = true;
-        cfg.critic_wakes_actor = true;
-        cfg.critic_wakes_actor_threshold = 10;
-        cfg.actor_wakes_critic = false;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let mut agent = make_cross_wake_test_agent(false, 1000, true, 10);
 
         agent.actor_hysteresis = Some(HysteresisState::from_snapshot(
             PlasticityState::Frozen,
@@ -7082,13 +7091,7 @@ mod tests {
     #[test]
     #[ignore = "Red: requires sustained-path cross-wake fix (unignore in Phase 2)"]
     fn cross_wake_throttle_prevents_refire_before_threshold() {
-        let mut cfg = default_config();
-        cfg.actor_hysteresis = true;
-        cfg.critic_hysteresis = true;
-        cfg.critic_wakes_actor = true;
-        cfg.critic_wakes_actor_threshold = 10;
-        cfg.actor_wakes_critic = false;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let mut agent = make_cross_wake_test_agent(false, 1000, true, 10);
 
         agent.actor_hysteresis = Some(HysteresisState::from_snapshot(
             PlasticityState::Frozen,
@@ -7155,13 +7158,7 @@ mod tests {
     #[test]
     #[ignore = "Red: requires sustained-path cross-wake fix (unignore in Phase 2)"]
     fn actor_wakes_critic_after_sustained_plastic_state() {
-        let mut cfg = default_config();
-        cfg.actor_hysteresis = true;
-        cfg.critic_hysteresis = true;
-        cfg.actor_wakes_critic = true;
-        cfg.actor_wakes_critic_threshold = 50;
-        cfg.critic_wakes_actor = false;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let mut agent = make_cross_wake_test_agent(true, 50, false, 1000);
 
         agent.actor_hysteresis = Some(HysteresisState::from_snapshot(
             PlasticityState::Plastic,
@@ -7219,14 +7216,7 @@ mod tests {
     // neither cross-wake can fire). Grouped with Red siblings as an invariant
     // lock against future refactors that might relax the target guards.
     fn both_plastic_sustained_is_noop() {
-        let mut cfg = default_config();
-        cfg.actor_hysteresis = true;
-        cfg.critic_hysteresis = true;
-        cfg.actor_wakes_critic = true;
-        cfg.actor_wakes_critic_threshold = 10;
-        cfg.critic_wakes_actor = true;
-        cfg.critic_wakes_actor_threshold = 10;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let mut agent = make_cross_wake_test_agent(true, 10, true, 10);
 
         agent.actor_hysteresis = Some(HysteresisState::from_snapshot(
             PlasticityState::Plastic,
