@@ -2323,7 +2323,17 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         // Update actor hysteresis
         if let Some(ref mut hyst) = self.actor_hysteresis {
-            // Increment counters for pre-transition state
+            // ORDERING CONTRACT (load-bearing for cross-wake sustained-path
+            // fire conditions below): counters are incremented BEFORE
+            // hyst.update() and BEFORE the cross-wake guards are evaluated,
+            // using the pre-update state. This means after N consecutive
+            // calls with the agent in PLASTIC and no natural transition,
+            // `actor_plastic_step_counter == N`, so the sustained-path
+            // guard `>= threshold` fires on call #threshold. Threshold
+            // regression tests (cross_wake_throttle_*, critic_wakes_actor_*)
+            // depend on this exact ordering. A refactor that moves the
+            // increment to after the guard check will shift firing by one
+            // step and break those tests.
             if hyst.state == PlasticityState::Frozen {
                 self.actor_frozen_steps += 1;
             }
@@ -2343,7 +2353,9 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         // Update critic hysteresis
         if let Some(ref mut hyst) = self.critic_hysteresis {
-            // Increment counters for pre-transition state
+            // ORDERING CONTRACT: same as actor block above — counters
+            // incremented pre-update, pre-guard. See actor block comment
+            // for the full rationale and the tests that lock this ordering.
             if hyst.state == PlasticityState::Frozen {
                 self.critic_frozen_steps += 1;
             }
@@ -7316,6 +7328,114 @@ mod tests {
             agent.critic_plastic_step_counter > 100,
             "critic counter must keep accumulating (no fire should reset it)"
         );
+    }
+
+    #[test]
+    fn sustained_cross_wake_fires_fisher_wake_under_ewc() {
+        // Verifies the Fisher-lifecycle behavior change documented in the
+        // process_hysteresis rustdoc: under bidirectional coupling + EWC,
+        // sustained-path cross-wake firings must trigger handle_fisher_wake.
+        //
+        // The witness is f_ema_weights: handle_fisher_wake unconditionally
+        // resets it to zeros (see mod.rs:2499-2506). If the cross-wake fire
+        // block sets *_woke = true AND handle_fisher_wake is dispatched at
+        // the end of process_hysteresis, a pre-seeded f_ema_weights[0][0]
+        // must be zeroed post-fire.
+        let mut cfg = default_config();
+        cfg.ewc_lambda = 0.01;
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.critic_wakes_actor = true;
+        cfg.critic_wakes_actor_threshold = 10;
+        cfg.actor_wakes_critic = false;
+        let mut agent: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Sanity: Fisher allocation per layer under ewc_lambda > 0.
+        assert!(
+            !agent.actor_fisher.is_empty(),
+            "actor_fisher must be allocated when ewc_lambda > 0"
+        );
+
+        // Seed f_ema_weights[0][0] with a non-zero marker so we can detect
+        // handle_fisher_wake's reset step.
+        let backend = CpuLinAlg::new();
+        for fisher in agent.actor_fisher.iter_mut() {
+            backend.mat_set(&mut fisher.f_ema_weights, 0, 0, 42.0);
+        }
+        // Verify seed took effect.
+        assert_eq!(
+            backend.mat_get(&agent.actor_fisher[0].f_ema_weights, 0, 0),
+            42.0,
+            "sanity: seed applied to f_ema_weights"
+        );
+
+        // Force the deadlock state: actor long-term FROZEN, critic stable
+        // PLASTIC with min_initial_plastic=9999 blocking natural sleep.
+        agent.actor_hysteresis = Some(HysteresisState::from_snapshot(
+            PlasticityState::Frozen,
+            0.5, 100, 20,
+            0.5, 100, 500,
+            0.5, 0.005, 0,
+        ));
+        agent.actor_frozen_steps = 100;
+        agent.critic_hysteresis = Some(HysteresisState::from_snapshot(
+            PlasticityState::Plastic,
+            0.01, 100, 20,
+            0.01, 100, 200,
+            0.5, 0.3, 9999,
+        ));
+        agent.critic_plastic_step_counter = 0;
+
+        // Sustained-path fire at call #10 (see ordering contract comment
+        // at the counter-increment site).
+        for _ in 0..10 {
+            agent.process_hysteresis(0.5, 0.01);
+        }
+
+        // Primary witness: actor woke via cross-wake.
+        assert_eq!(
+            agent.actor_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic,
+            "actor must be Plastic after sustained-path cross-wake"
+        );
+
+        // Fisher-lifecycle witness: handle_fisher_wake must have run and
+        // reset f_ema_weights to zeros. If the cross-wake path failed to
+        // set actor_woke = true, or the Fisher dispatch was bypassed, the
+        // seed value would survive.
+        assert_eq!(
+            backend.mat_get(&agent.actor_fisher[0].f_ema_weights, 0, 0),
+            0.0,
+            "handle_fisher_wake must reset f_ema_weights after sustained cross-wake"
+        );
+
+        // Robustness witness: no NaN corruption in any Fisher matrix after
+        // the cross-wake path through the EWC subsystem.
+        for fisher in &agent.actor_fisher {
+            let rows = backend.mat_rows(&fisher.f_ema_weights);
+            let cols = backend.mat_cols(&fisher.f_ema_weights);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let val = backend.mat_get(&fisher.f_ema_weights, r, c);
+                    assert!(
+                        val.is_finite(),
+                        "f_ema_weights[{r}][{c}] must be finite post-wake"
+                    );
+                }
+            }
+            let total_rows = backend.mat_rows(&fisher.f_total_weights);
+            let total_cols = backend.mat_cols(&fisher.f_total_weights);
+            for r in 0..total_rows {
+                for c in 0..total_cols {
+                    let val = backend.mat_get(&fisher.f_total_weights, r, c);
+                    assert!(
+                        val.is_finite(),
+                        "f_total_weights[{r}][{c}] must be finite post-wake"
+                    );
+                }
+            }
+        }
     }
 
     // ============ GAE lambda config tests ============
