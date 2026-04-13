@@ -2284,12 +2284,37 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
     }
 
-    /// Updates hysteresis state machines after learning.
+    /// Updates both hysteresis state machines and handles bidirectional
+    /// actor↔critic coupling.
     ///
-    /// Handles EWMA updates, state transitions, counter management,
-    /// and bidirectional actor↔critic coupling.
     /// Each network uses its own signal (actor=surprise, critic=|TD error|).
-    /// Couplings are binary state overrides with EWMA k reset — no signal contamination.
+    /// The cross-wake couplings fire on EITHER (a) the source network
+    /// transitioning FROZEN→PLASTIC in the current step, OR (b) the source
+    /// network having been in PLASTIC for at least `*_wakes_*_threshold`
+    /// consecutive steps. Both paths require the target to be FROZEN with
+    /// `*_frozen_steps >= threshold`.
+    ///
+    /// **Throttling:** after any firing, both source and target counters are
+    /// reset to 0 (symmetric cooldown), so the next sustained-path firing
+    /// requires both networks to re-accumulate `threshold` steps in their
+    /// respective states. The source counter reset is **load-bearing** for
+    /// the symmetric-cooldown contract: do not remove it during future
+    /// refactors even though the target gate alone appears sufficient for
+    /// per-step refire prevention.
+    ///
+    /// **Cascade prevention:** couplings can coexist safely — after a
+    /// cross-wake, the target is Plastic, so the reverse guard
+    /// `target.state == Frozen` fails. No wake-ping-pong is possible within
+    /// a single step.
+    ///
+    /// **Fisher lifecycle interaction:** sustained-path cross-wake firings
+    /// set `actor_woke` / `critic_woke = true` inside the fire blocks, which
+    /// causes `handle_fisher_wake` to run. Under bidirectional coupling + EWC,
+    /// this is a **behavior change vs. earlier versions**: Fisher refresh now
+    /// fires on cross-wake-induced wakes (not only on natural FROZEN→PLASTIC
+    /// transitions). This is the correct semantics (the network IS waking),
+    /// but must be accounted for when interpreting EWC experiment results
+    /// across versions.
     pub(crate) fn process_hysteresis(&mut self, actor_signal: f64, critic_signal: f64) {
         let mut actor_woke = false;
         let mut actor_slept = false;
@@ -2336,8 +2361,31 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
         }
 
+        // Compute cross-wake fire conditions BEFORE either block mutates state.
+        // Each coupling fires on EITHER the one-shot transition flag OR the
+        // source network being in sustained plastic state for >= threshold
+        // steps. Without the sustained branch, networks that converge to
+        // stable equilibria would deadlock because update() stops emitting
+        // transitions.
+        let actor_should_wake_critic = self.config.actor_wakes_critic
+            && (actor_woke
+                || (self
+                    .actor_hysteresis
+                    .as_ref()
+                    .is_some_and(|h| h.state == PlasticityState::Plastic)
+                    && self.actor_plastic_step_counter
+                        >= self.config.actor_wakes_critic_threshold));
+        let critic_should_wake_actor = self.config.critic_wakes_actor
+            && (critic_woke
+                || (self
+                    .critic_hysteresis
+                    .as_ref()
+                    .is_some_and(|h| h.state == PlasticityState::Plastic)
+                    && self.critic_plastic_step_counter
+                        >= self.config.critic_wakes_actor_threshold));
+
         // Actor wakes critic coupling
-        if actor_woke && self.config.actor_wakes_critic {
+        if actor_should_wake_critic {
             if let Some(ref mut critic_hyst) = self.critic_hysteresis {
                 if critic_hyst.state == PlasticityState::Frozen
                     && self.critic_frozen_steps >= self.config.actor_wakes_critic_threshold
@@ -2350,20 +2398,22 @@ impl<L: LinAlg> PcActorCritic<L> {
                     critic_hyst.slow.k = 0;
                     self.critic_plastic_step_counter = 0;
                     self.critic_frozen_steps = 0;
+                    // Symmetric cooldown. Load-bearing — next sustained-path
+                    // fire requires BOTH networks to re-accumulate threshold
+                    // steps. DO NOT remove this reset: target counter reset
+                    // above alone would only guard against same-step refire
+                    // via the target gate, but any future refactor weakening
+                    // the target gate would silently reintroduce per-step
+                    // refire. Symmetric reset locks the cooldown invariant
+                    // into both branches of the guard.
+                    self.actor_plastic_step_counter = 0;
                     critic_woke = true;
                 }
             }
         }
 
         // Critic wakes actor coupling (reverse direction).
-        // Both couplings can coexist safely: no cascade is possible because
-        // the target guard checks "state == Frozen" — a network that just
-        // woke (naturally or via coupling) is Plastic, so the reverse
-        // coupling's guard fails. EWMA warmup (k=0 on transition) prevents
-        // immediate re-sleep, and frozen_steps threshold prevents immediate
-        // re-coupling. Fisher wake is appropriate for coupling-triggered
-        // transitions: fresh F_ema estimates are needed for the new phase.
-        if critic_woke && self.config.critic_wakes_actor {
+        if critic_should_wake_actor {
             if let Some(ref mut actor_hyst) = self.actor_hysteresis {
                 if actor_hyst.state == PlasticityState::Frozen
                     && self.actor_frozen_steps >= self.config.critic_wakes_actor_threshold
@@ -2376,6 +2426,9 @@ impl<L: LinAlg> PcActorCritic<L> {
                     actor_hyst.slow.k = 0;
                     self.actor_plastic_step_counter = 0;
                     self.actor_frozen_steps = 0;
+                    // Symmetric cooldown (see actor_should_wake_critic block
+                    // above for rationale — load-bearing, do not remove).
+                    self.critic_plastic_step_counter = 0;
                     actor_woke = true;
                 }
             }
@@ -6976,7 +7029,6 @@ mod tests {
     // ============ Cross-wake deadlock regression tests ============
 
     #[test]
-    #[ignore = "Red: requires sustained-path cross-wake fix (unignore in Phase 2)"]
     fn critic_wakes_actor_after_sustained_plastic_state() {
         let mut agent = make_cross_wake_test_agent(false, 1000, true, 50);
 
@@ -7038,7 +7090,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires sustained-path cross-wake fix (unignore in Phase 2)"]
     fn cross_wake_source_counter_reset_on_sustained_firing() {
         let mut agent = make_cross_wake_test_agent(false, 1000, true, 10);
 
@@ -7089,7 +7140,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires sustained-path cross-wake fix (unignore in Phase 2)"]
     fn cross_wake_throttle_prevents_refire_before_threshold() {
         let mut agent = make_cross_wake_test_agent(false, 1000, true, 10);
 
@@ -7156,7 +7206,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires sustained-path cross-wake fix (unignore in Phase 2)"]
     fn actor_wakes_critic_after_sustained_plastic_state() {
         let mut agent = make_cross_wake_test_agent(true, 50, false, 1000);
 
