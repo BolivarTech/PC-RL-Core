@@ -18,12 +18,8 @@ use rand::rngs::StdRng;
 use crate::error::PcError;
 use crate::linalg::cpu::CpuLinAlg;
 use crate::linalg::LinAlg;
-use crate::mlp_critic::MlpCritic;
-#[cfg(test)]
-use crate::mlp_critic::MlpCriticConfig;
-#[cfg(test)]
-use crate::pc_actor::PcActorConfig;
-use crate::pc_actor::{InferResult, PcActor, SelectionMode};
+use crate::mlp_critic::{MlpCritic, MlpCriticConfig};
+use crate::pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
 use crate::pc_actor_critic::trajectory::cache_to_matrices;
 
 pub mod config;
@@ -178,17 +174,139 @@ impl<L: LinAlg> PcActorCritic<L> {
         (actor_decay_factors, critic_decay_factors, layer_error_ema)
     }
 
-    /// Creates a new PC Actor-Critic agent.
+    /// Builds an optional `HysteresisState` from config parameters.
     ///
-    /// # Arguments
+    /// Returns `Some(fresh Plastic state)` when enabled, `None` when disabled.
+    /// Shared by `new()` and `apply_config()` to avoid construction duplication.
+    fn build_hysteresis(
+        enabled: bool,
+        fast_window: usize,
+        slow_window: usize,
+        wake_fraction: f64,
+        sleep_fraction: f64,
+    ) -> Option<HysteresisState> {
+        if enabled {
+            Some(HysteresisState {
+                fast: EwmaTracker::new(fast_window),
+                slow: EwmaTracker::new(slow_window),
+                state: PlasticityState::Plastic,
+                wake_fraction,
+                sleep_fraction,
+                min_initial_plastic: slow_window as u64,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Allocates Fisher state for a set of layers when EWC is enabled.
     ///
-    /// * `config` - Agent configuration with actor, critic, and learning parameters.
-    /// * `seed` - Random seed for reproducibility.
+    /// Returns one `FisherState` per layer when `ewc_lambda > 0`, or an empty
+    /// `Vec` when EWC is disabled (zero overhead).
+    /// Shared by `new()` and `apply_config()`.
+    fn build_fisher_for_layers(
+        backend: &L,
+        layers: &[crate::layer::Layer<L>],
+        ewc_lambda: f64,
+    ) -> Vec<FisherState<L>> {
+        if ewc_lambda > 0.0 {
+            layers
+                .iter()
+                .map(|layer| {
+                    let rows = backend.mat_rows(&layer.weights);
+                    let cols = backend.mat_cols(&layer.weights);
+                    let bias_size = backend.vec_len(&layer.bias);
+                    FisherState::new(backend, rows, cols, bias_size)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Computes the minimum Fisher phase length from `fisher_ema_beta`.
+    ///
+    /// Returns `ceil(1 / (1 - beta))` when EWC is enabled, 0 otherwise.
+    fn min_fisher_phase(config: &PcActorCriticConfig) -> u64 {
+        if config.ewc_lambda > 0.0 {
+            (1.0 / (1.0 - config.fisher_ema_beta)).ceil() as u64
+        } else {
+            0
+        }
+    }
+
+    /// Validates a [`PcActorCriticConfig`] for internal consistency.
+    ///
+    /// Checks gamma range, surprise buffer size, scale floor/ceil ordering,
+    /// hysteresis fractions, consolidation decay bounds, EWC parameter bounds,
+    /// td_steps validity, and gae_lambda/td_steps mutual exclusion.
+    ///
+    /// Shared by [`new()`](Self::new) and [`apply_config()`](Self::apply_config) to ensure
+    /// identical validation rules. Does NOT validate topology match (that
+    /// requires an existing agent).
+    ///
     /// # Errors
     ///
-    /// Returns `PcError::ConfigValidation` if gamma is out of `[0.0, 1.0]`,
-    /// or if actor/critic config is invalid.
-    pub fn new(backend: L, config: PcActorCriticConfig, seed: u64) -> Result<Self, PcError> {
+    /// Returns [`PcError::ConfigValidation`] with a descriptive message on
+    /// the first failing check.
+    fn validate_config(config: &PcActorCriticConfig) -> Result<(), PcError> {
+        // Per-network f64 fields: reject NaN/Inf early to prevent confusing
+        // topology-mismatch errors downstream (NaN != NaN is always true).
+        if !config.actor.lr_weights.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor lr_weights must be finite, got {}",
+                config.actor.lr_weights
+            )));
+        }
+        if !config.actor.alpha.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor alpha must be finite, got {}",
+                config.actor.alpha
+            )));
+        }
+        if !config.actor.tol.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor tol must be finite, got {}",
+                config.actor.tol
+            )));
+        }
+        if !config.actor.temperature.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor temperature must be finite, got {}",
+                config.actor.temperature
+            )));
+        }
+        if !config.actor.local_lambda.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor local_lambda must be finite, got {}",
+                config.actor.local_lambda
+            )));
+        }
+        if !config.actor.rezero_init.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor rezero_init must be finite, got {}",
+                config.actor.rezero_init
+            )));
+        }
+        if !config.critic.lr.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "critic lr must be finite, got {}",
+                config.critic.lr
+            )));
+        }
+        if !config.scale_floor.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "scale_floor must be finite, got {}",
+                config.scale_floor
+            )));
+        }
+        if !config.scale_ceil.is_finite() {
+            return Err(PcError::ConfigValidation(format!(
+                "scale_ceil must be finite, got {}",
+                config.scale_ceil
+            )));
+        }
+
         if !(0.0..=1.0).contains(&config.gamma) {
             return Err(PcError::ConfigValidation(format!(
                 "gamma must be in [0.0, 1.0], got {}",
@@ -323,87 +441,417 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Relative-epsilon comparison for `f64` config fields.
+    ///
+    /// Tolerates small round-trip drift (JSON serialize/parse, repeated
+    /// arithmetic) while still catching any semantically meaningful change.
+    /// Returns true when `a == b` exactly, or when
+    /// `|a - b| <= 4 * eps * max(|a|, |b|, 1.0)`.
+    fn f64_approx_eq(a: f64, b: f64) -> bool {
+        if a == b {
+            return true;
+        }
+        if !a.is_finite() || !b.is_finite() {
+            return false;
+        }
+        let scale = a.abs().max(b.abs()).max(1.0);
+        (a - b).abs() <= 4.0 * f64::EPSILON * scale
+    }
+
+    /// Validates that a new config's network topology, structural parameters,
+    /// and per-network parameters match the current agent.
+    ///
+    /// **Topology:** actor input/hidden/output sizes, critic input/hidden
+    /// sizes, and hidden-layer activation functions (empirically these
+    /// change network dynamics drastically — see CLAUDE.md training results
+    /// for the tanh→relu depth collapse).
+    /// **Structural:** output_activation, residual, rezero_init — these
+    /// affect how existing weights are interpreted during forward pass.
+    /// **Per-network:** actor lr_weights/alpha/tol/min_steps/max_steps/
+    /// temperature/local_lambda/synchronous, critic lr — these live in
+    /// `self.actor.config` and `self.critic.config` separately; mismatches
+    /// would create divergence with `self.config.actor`/`self.config.critic`.
+    /// Per-network params are immutable across [`apply_config`](Self::apply_config);
+    /// reconstruct the agent with [`new`](Self::new) if they need to change.
+    ///
+    /// `f64` fields are compared with a relative epsilon
+    /// ([`f64_approx_eq`](Self::f64_approx_eq)) to tolerate JSON round-trip
+    /// drift; all other fields use exact equality.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcError::ConfigValidation`] identifying which field mismatches.
+    fn validate_topology_match(&self, config: &PcActorCriticConfig) -> Result<(), PcError> {
+        // Exhaustive destructuring forces a compile error when a new field is
+        // added to PcActorConfig or MlpCriticConfig, preventing silent drift
+        // of this check. Do NOT replace these with `..` — the compile error is
+        // the point.
+        let PcActorConfig {
+            input_size: cur_a_input,
+            hidden_layers: cur_a_hidden,
+            output_size: cur_a_output,
+            output_activation: cur_a_out_act,
+            alpha: cur_a_alpha,
+            tol: cur_a_tol,
+            min_steps: cur_a_min_steps,
+            max_steps: cur_a_max_steps,
+            lr_weights: cur_a_lr,
+            synchronous: cur_a_sync,
+            temperature: cur_a_temp,
+            local_lambda: cur_a_lambda,
+            residual: cur_a_residual,
+            rezero_init: cur_a_rezero,
+        } = &self.config.actor;
+        let PcActorConfig {
+            input_size: new_a_input,
+            hidden_layers: new_a_hidden,
+            output_size: new_a_output,
+            output_activation: new_a_out_act,
+            alpha: new_a_alpha,
+            tol: new_a_tol,
+            min_steps: new_a_min_steps,
+            max_steps: new_a_max_steps,
+            lr_weights: new_a_lr,
+            synchronous: new_a_sync,
+            temperature: new_a_temp,
+            local_lambda: new_a_lambda,
+            residual: new_a_residual,
+            rezero_init: new_a_rezero,
+        } = &config.actor;
+        let MlpCriticConfig {
+            input_size: cur_c_input,
+            hidden_layers: cur_c_hidden,
+            output_activation: cur_c_out_act,
+            lr: cur_c_lr,
+        } = &self.config.critic;
+        let MlpCriticConfig {
+            input_size: new_c_input,
+            hidden_layers: new_c_hidden,
+            output_activation: new_c_out_act,
+            lr: new_c_lr,
+        } = &config.critic;
+
+        // Actor topology
+        if cur_a_input != new_a_input {
+            return Err(PcError::ConfigValidation(format!(
+                "actor input_size mismatch: current {cur_a_input} vs new {new_a_input}"
+            )));
+        }
+        if cur_a_hidden.len() != new_a_hidden.len() {
+            return Err(PcError::ConfigValidation(format!(
+                "actor hidden layer count mismatch: current {} vs new {}",
+                cur_a_hidden.len(),
+                new_a_hidden.len()
+            )));
+        }
+        for (i, (cur, new)) in cur_a_hidden.iter().zip(new_a_hidden.iter()).enumerate() {
+            if cur.size != new.size {
+                return Err(PcError::ConfigValidation(format!(
+                    "actor hidden layer {} size mismatch: current {} vs new {}",
+                    i, cur.size, new.size
+                )));
+            }
+            if cur.activation != new.activation {
+                return Err(PcError::ConfigValidation(format!(
+                    "actor hidden layer {} activation mismatch: current {:?} vs new {:?} — \
+                     empirically, changing activation mid-training can collapse learned \
+                     behavior; reconstruct agent instead",
+                    i, cur.activation, new.activation
+                )));
+            }
+        }
+        if cur_a_output != new_a_output {
+            return Err(PcError::ConfigValidation(format!(
+                "actor output_size mismatch: current {cur_a_output} vs new {new_a_output}"
+            )));
+        }
+
+        // Critic topology
+        if cur_c_input != new_c_input {
+            return Err(PcError::ConfigValidation(format!(
+                "critic input_size mismatch: current {cur_c_input} vs new {new_c_input}"
+            )));
+        }
+        if cur_c_hidden.len() != new_c_hidden.len() {
+            return Err(PcError::ConfigValidation(format!(
+                "critic hidden layer count mismatch: current {} vs new {}",
+                cur_c_hidden.len(),
+                new_c_hidden.len()
+            )));
+        }
+        for (i, (cur, new)) in cur_c_hidden.iter().zip(new_c_hidden.iter()).enumerate() {
+            if cur.size != new.size {
+                return Err(PcError::ConfigValidation(format!(
+                    "critic hidden layer {} size mismatch: current {} vs new {}",
+                    i, cur.size, new.size
+                )));
+            }
+            if cur.activation != new.activation {
+                return Err(PcError::ConfigValidation(format!(
+                    "critic hidden layer {} activation mismatch: current {:?} vs new {:?} — \
+                     reconstruct agent instead",
+                    i, cur.activation, new.activation
+                )));
+            }
+        }
+
+        // Actor structural (affect weight interpretation)
+        if cur_a_out_act != new_a_out_act {
+            return Err(PcError::ConfigValidation(format!(
+                "actor output_activation mismatch: current {cur_a_out_act:?} vs new {new_a_out_act:?}"
+            )));
+        }
+        if cur_a_residual != new_a_residual {
+            return Err(PcError::ConfigValidation(format!(
+                "actor residual mismatch: current {cur_a_residual} vs new {new_a_residual}"
+            )));
+        }
+        if !Self::f64_approx_eq(*cur_a_rezero, *new_a_rezero) {
+            return Err(PcError::ConfigValidation(format!(
+                "actor rezero_init mismatch: current {cur_a_rezero} vs new {new_a_rezero}"
+            )));
+        }
+
+        // Actor per-network params (must match self.actor.config exactly;
+        // apply_config cannot mutate fields that live in the inner network).
+        if !Self::f64_approx_eq(*cur_a_lr, *new_a_lr) {
+            return Err(PcError::ConfigValidation(format!(
+                "actor lr_weights mismatch: current {cur_a_lr} vs new {new_a_lr} — \
+                 per-network params are immutable across apply_config(); reconstruct agent instead"
+            )));
+        }
+        if !Self::f64_approx_eq(*cur_a_alpha, *new_a_alpha) {
+            return Err(PcError::ConfigValidation(format!(
+                "actor alpha mismatch: current {cur_a_alpha} vs new {new_a_alpha} — \
+                 per-network params are immutable across apply_config()"
+            )));
+        }
+        if !Self::f64_approx_eq(*cur_a_tol, *new_a_tol) {
+            return Err(PcError::ConfigValidation(format!(
+                "actor tol mismatch: current {cur_a_tol} vs new {new_a_tol}"
+            )));
+        }
+        if cur_a_min_steps != new_a_min_steps {
+            return Err(PcError::ConfigValidation(format!(
+                "actor min_steps mismatch: current {cur_a_min_steps} vs new {new_a_min_steps}"
+            )));
+        }
+        if cur_a_max_steps != new_a_max_steps {
+            return Err(PcError::ConfigValidation(format!(
+                "actor max_steps mismatch: current {cur_a_max_steps} vs new {new_a_max_steps}"
+            )));
+        }
+        if !Self::f64_approx_eq(*cur_a_temp, *new_a_temp) {
+            return Err(PcError::ConfigValidation(format!(
+                "actor temperature mismatch: current {cur_a_temp} vs new {new_a_temp} — \
+                 per-network params are immutable across apply_config()"
+            )));
+        }
+        if !Self::f64_approx_eq(*cur_a_lambda, *new_a_lambda) {
+            return Err(PcError::ConfigValidation(format!(
+                "actor local_lambda mismatch: current {cur_a_lambda} vs new {new_a_lambda}"
+            )));
+        }
+        if cur_a_sync != new_a_sync {
+            return Err(PcError::ConfigValidation(format!(
+                "actor synchronous mismatch: current {cur_a_sync} vs new {new_a_sync}"
+            )));
+        }
+
+        // Critic per-network params
+        if !Self::f64_approx_eq(*cur_c_lr, *new_c_lr) {
+            return Err(PcError::ConfigValidation(format!(
+                "critic lr mismatch: current {cur_c_lr} vs new {new_c_lr} — \
+                 per-network params are immutable across apply_config(); reconstruct agent instead"
+            )));
+        }
+        if cur_c_out_act != new_c_out_act {
+            return Err(PcError::ConfigValidation(format!(
+                "critic output_activation mismatch: current {cur_c_out_act:?} vs new {new_c_out_act:?}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Applies a new configuration to the agent, preserving weights and topology.
+    ///
+    /// Reconfigures **agent-level** learning parameters (gamma, surprise, CL,
+    /// TD/GAE mode). Per-network parameters (actor lr, temperature, alpha;
+    /// critic lr) cannot be changed here — they live in `self.actor.config` /
+    /// `self.critic.config` and are immutable across this call. Pass the same
+    /// actor/critic sub-config the agent was constructed with; mismatches are
+    /// rejected. If per-network params need to change, reconstruct the agent
+    /// with [`new`](Self::new) and transfer weights via the serializer.
+    ///
+    /// `f64` fields are compared with a relative epsilon to tolerate JSON
+    /// round-trip drift; see [`f64_approx_eq`](Self::f64_approx_eq).
+    ///
+    /// All continuous learning state is reset to provide a clean baseline.
+    ///
+    /// # What changes
+    ///
+    /// Gamma, surprise thresholds, scale floor/ceil (M1), hysteresis (M2),
+    /// consolidation decay (M3), EWC parameters (M4), TD(n) steps, GAE lambda,
+    /// entropy coefficient, logits reversal, bidirectional coupling.
+    ///
+    /// # What does NOT change
+    ///
+    /// Actor/critic weights and biases, network topology, actor lr/alpha/tol/
+    /// min_steps/max_steps/temperature/local_lambda, critic lr, RNG state
+    /// (continues generating fresh pseudo-random numbers from current position),
+    /// backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::ConfigValidation` if the new config fails validation
+    /// or if its topology does not match the current agent.
+    pub fn apply_config(&mut self, config: PcActorCriticConfig) -> Result<(), PcError> {
+        // 0. Defense-in-depth: verify config coherence invariant.
+        // All per-network fields in self.config.actor/critic must match
+        // self.actor.config / self.critic.config. If not, a prior mutation
+        // bypassed the API contract. Do not make these fields pub without
+        // adding a runtime check.
+        debug_assert!(
+            self.config.actor.lr_weights == self.actor.config.lr_weights
+                && self.config.actor.temperature == self.actor.config.temperature
+                && self.config.actor.alpha == self.actor.config.alpha
+                && self.config.actor.tol == self.actor.config.tol
+                && self.config.actor.min_steps == self.actor.config.min_steps
+                && self.config.actor.max_steps == self.actor.config.max_steps
+                && self.config.actor.local_lambda == self.actor.config.local_lambda
+                && self.config.actor.synchronous == self.actor.config.synchronous
+                && self.config.critic.lr == self.critic.config.lr
+                && self.config.critic.output_activation == self.critic.config.output_activation,
+            "BUG: self.config and self.actor/critic.config are out of sync"
+        );
+
+        // 1. Validate new config internally
+        Self::validate_config(&config)?;
+
+        // 2. Validate topology match
+        self.validate_topology_match(&config)?;
+
+        // 3. Recompute derived state
+        let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
+            Self::compute_decay_factors(&config);
+        let trace_len = Self::gae_trace_len(&config);
+
+        // 4. Rebuild hysteresis state machines (DRY via build_hysteresis helper)
+        let mut actor_hysteresis = Self::build_hysteresis(
+            config.actor_hysteresis,
+            config.actor_fast_window,
+            config.actor_slow_window,
+            config.actor_wake_fraction,
+            config.actor_sleep_fraction,
+        );
+        let mut critic_hysteresis = Self::build_hysteresis(
+            config.critic_hysteresis,
+            config.critic_fast_window,
+            config.critic_slow_window,
+            config.critic_wake_fraction,
+            config.critic_sleep_fraction,
+        );
+
+        // 5. Update min_initial_plastic for Fisher warmup
+        let mfp = Self::min_fisher_phase(&config);
+        if let Some(ref mut hyst) = actor_hysteresis {
+            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, mfp);
+        }
+        if let Some(ref mut hyst) = critic_hysteresis {
+            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, mfp);
+        }
+
+        // 6. Reallocate Fisher state (DRY via build_fisher_for_layers helper)
+        let actor_fisher =
+            Self::build_fisher_for_layers(&self.backend, &self.actor.layers, config.ewc_lambda);
+        let critic_fisher =
+            Self::build_fisher_for_layers(&self.backend, &self.critic.layers, config.ewc_lambda);
+
+        // 7. Apply all fields atomically
+        self.config = config;
+        self.surprise_buffer = VecDeque::new();
+        self.state_prev = None;
+        self.action_prev = None;
+        self.infer_prev = None;
+        self.valid_actions_prev = None;
+        self.actor_hysteresis = actor_hysteresis;
+        self.critic_hysteresis = critic_hysteresis;
+        self.actor_plastic_step_counter = 0;
+        self.critic_plastic_step_counter = 0;
+        self.critic_frozen_steps = 0;
+        self.actor_frozen_steps = 0;
+        self.td_error_buffer = VecDeque::new();
+        self.last_td_error = 0.0;
+        self.actor_decay_factors = actor_decay_factors;
+        self.critic_decay_factors = critic_decay_factors;
+        self.layer_error_ema = layer_error_ema;
+        self.actor_fisher = actor_fisher;
+        self.critic_fisher = critic_fisher;
+        self.actor_last_phase_reliable = false;
+        self.critic_last_phase_reliable = false;
+        self.td_buffer = VecDeque::new();
+        self.actor_trace = vec![0.0; trace_len];
+
+        Ok(())
+    }
+
+    /// Creates a new PC Actor-Critic agent.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Agent configuration with actor, critic, and learning parameters.
+    /// * `seed` - Random seed for reproducibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::ConfigValidation` if any configuration field is invalid
+    /// (gamma range, surprise buffer size, scale floor/ceil ordering, hysteresis
+    /// fractions, consolidation decay bounds, EWC params, td_steps, gae_lambda).
+    pub fn new(backend: L, config: PcActorCriticConfig, seed: u64) -> Result<Self, PcError> {
+        Self::validate_config(&config)?;
+
         let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
             Self::compute_decay_factors(&config);
 
-        // Build hysteresis state machines when enabled
-        let actor_hysteresis = if config.actor_hysteresis {
-            Some(HysteresisState {
-                fast: EwmaTracker::new(config.actor_fast_window),
-                slow: EwmaTracker::new(config.actor_slow_window),
-                state: PlasticityState::Plastic,
-                wake_fraction: config.actor_wake_fraction,
-                sleep_fraction: config.actor_sleep_fraction,
-                min_initial_plastic: config.actor_slow_window as u64,
-            })
-        } else {
-            None
-        };
+        // Build hysteresis state machines (DRY via build_hysteresis helper)
+        let mut actor_hysteresis = Self::build_hysteresis(
+            config.actor_hysteresis,
+            config.actor_fast_window,
+            config.actor_slow_window,
+            config.actor_wake_fraction,
+            config.actor_sleep_fraction,
+        );
+        let mut critic_hysteresis = Self::build_hysteresis(
+            config.critic_hysteresis,
+            config.critic_fast_window,
+            config.critic_slow_window,
+            config.critic_wake_fraction,
+            config.critic_sleep_fraction,
+        );
 
-        let critic_hysteresis = if config.critic_hysteresis {
-            Some(HysteresisState {
-                fast: EwmaTracker::new(config.critic_fast_window),
-                slow: EwmaTracker::new(config.critic_slow_window),
-                state: PlasticityState::Plastic,
-                wake_fraction: config.critic_wake_fraction,
-                sleep_fraction: config.critic_sleep_fraction,
-                min_initial_plastic: config.critic_slow_window as u64,
-            })
-        } else {
-            None
-        };
-
-        // Compute min_fisher_phase and update hysteresis warmup guard
-        let min_fisher_phase = if config.ewc_lambda > 0.0 {
-            (1.0 / (1.0 - config.fisher_ema_beta)).ceil() as u64
-        } else {
-            0
-        };
+        // Update min_initial_plastic for Fisher warmup
+        let mfp = Self::min_fisher_phase(&config);
+        if let Some(ref mut hyst) = actor_hysteresis {
+            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, mfp);
+        }
+        if let Some(ref mut hyst) = critic_hysteresis {
+            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, mfp);
+        }
 
         use rand::SeedableRng;
         let mut rng = StdRng::seed_from_u64(seed);
         let actor = PcActor::<L>::new(backend.clone(), config.actor.clone(), &mut rng)?;
         let critic = MlpCritic::<L>::new(backend.clone(), config.critic.clone(), &mut rng)?;
 
-        // Allocate Fisher state when EWC is enabled
-        let actor_fisher = if config.ewc_lambda > 0.0 {
-            actor
-                .layers
-                .iter()
-                .map(|layer| {
-                    let rows = backend.mat_rows(&layer.weights);
-                    let cols = backend.mat_cols(&layer.weights);
-                    let bias_size = backend.vec_len(&layer.bias);
-                    FisherState::new(&backend, rows, cols, bias_size)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let critic_fisher = if config.ewc_lambda > 0.0 {
-            critic
-                .layers
-                .iter()
-                .map(|layer| {
-                    let rows = backend.mat_rows(&layer.weights);
-                    let cols = backend.mat_cols(&layer.weights);
-                    let bias_size = backend.vec_len(&layer.bias);
-                    FisherState::new(&backend, rows, cols, bias_size)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // Update hysteresis min_initial_plastic to max(slow_window, min_fisher_phase)
-        let mut actor_hysteresis = actor_hysteresis;
-        if let Some(ref mut hyst) = actor_hysteresis {
-            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, min_fisher_phase);
-        }
-        let mut critic_hysteresis = critic_hysteresis;
-        if let Some(ref mut hyst) = critic_hysteresis {
-            hyst.min_initial_plastic = std::cmp::max(hyst.min_initial_plastic, min_fisher_phase);
-        }
+        // Allocate Fisher state (DRY via build_fisher_for_layers helper)
+        let actor_fisher =
+            Self::build_fisher_for_layers(&backend, &actor.layers, config.ewc_lambda);
+        let critic_fisher =
+            Self::build_fisher_for_layers(&backend, &critic.layers, config.ewc_lambda);
         let new_trace_len = Self::gae_trace_len(&config);
 
         Ok(Self {
@@ -6746,5 +7194,679 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── apply_config: topology validation ─────────────────────────────
+
+    #[test]
+    fn test_validate_topology_match_identical_config_ok() {
+        let agent = make_agent();
+        let config = default_config();
+        assert!(agent.validate_topology_match(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_actor_input_size() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.input_size = 4;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor input_size mismatch"),
+            "Expected actor input_size mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_actor_hidden_count() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.hidden_layers.push(LayerDef {
+            size: 12,
+            activation: Activation::Tanh,
+        });
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor hidden layer count mismatch"),
+            "Expected actor hidden layer count error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_actor_hidden_size() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.hidden_layers[0].size = 27;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor hidden layer 0 size mismatch"),
+            "Expected actor hidden layer size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_actor_output_size() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.output_size = 4;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor output_size mismatch"),
+            "Expected actor output_size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_critic_input_size() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.critic.input_size = 18;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("critic input_size mismatch"),
+            "Expected critic input_size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_critic_hidden_count() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.critic.hidden_layers.push(LayerDef {
+            size: 24,
+            activation: Activation::Tanh,
+        });
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("critic hidden layer count mismatch"),
+            "Expected critic hidden layer count error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_critic_hidden_size() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.critic.hidden_layers[0].size = 24;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("critic hidden layer 0 size mismatch"),
+            "Expected critic hidden layer size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_rejects_different_hidden_activation() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.hidden_layers[0].activation = Activation::Softsign;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor hidden layer 0 activation mismatch"),
+            "Expected actor hidden activation mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_rejects_different_critic_hidden_activation() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.critic.hidden_layers[0].activation = Activation::Softsign;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("critic hidden layer 0 activation mismatch"),
+            "Expected critic hidden activation mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_tolerates_f64_round_trip_drift() {
+        // 1 ULP perturbation on every f64 field must not reject.
+        let agent = make_agent();
+        let mut config = default_config();
+        let base_lr = config.actor.lr_weights;
+        config.actor.lr_weights = f64::from_bits(base_lr.to_bits() + 1);
+        let base_temp = config.actor.temperature;
+        config.actor.temperature = f64::from_bits(base_temp.to_bits() + 1);
+        let base_alpha = config.actor.alpha;
+        config.actor.alpha = f64::from_bits(base_alpha.to_bits() + 1);
+        let base_clr = config.critic.lr;
+        config.critic.lr = f64::from_bits(base_clr.to_bits() + 1);
+        assert!(agent.validate_topology_match(&config).is_ok());
+    }
+
+    // ── MAGI W1: structural parameter validation ──────────────────────
+
+    #[test]
+    fn test_validate_topology_match_different_output_activation() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.output_activation = Activation::Linear;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor output_activation mismatch"),
+            "Expected output_activation mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_residual() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.residual = true;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor residual mismatch"),
+            "Expected residual mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_rezero_init() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.rezero_init = 0.5;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor rezero_init mismatch"),
+            "Expected rezero_init mismatch, got: {err}"
+        );
+    }
+
+    // ── MAGI C1: per-network param divergence prevention ──────────────
+
+    #[test]
+    fn test_validate_topology_match_different_actor_lr() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.lr_weights = 0.1;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor lr_weights mismatch"),
+            "Expected actor lr_weights mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_actor_temperature() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.actor.temperature = 2.0;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("actor temperature mismatch"),
+            "Expected actor temperature mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_topology_match_different_critic_lr() {
+        let agent = make_agent();
+        let mut config = default_config();
+        config.critic.lr = 0.05;
+        let err = agent.validate_topology_match(&config).unwrap_err();
+        assert!(
+            format!("{err}").contains("critic lr mismatch"),
+            "Expected critic lr mismatch, got: {err}"
+        );
+    }
+
+    // ── apply_config: core ────────────────────────────────────────────
+
+    #[test]
+    fn test_apply_config_updates_gamma() {
+        let mut agent = make_agent();
+        assert!((agent.config.gamma - 0.95).abs() < 1e-12);
+        let mut new_config = default_config();
+        new_config.gamma = 0.99;
+        agent.apply_config(new_config).unwrap();
+        assert!((agent.config.gamma - 0.99).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_apply_config_preserves_actor_weights() {
+        let mut agent = make_agent();
+        let w_before = agent.actor.layers[0].weights.data.clone();
+        let b_before = agent.actor.layers[0].bias.clone();
+        let mut new_config = default_config();
+        new_config.gamma = 0.99;
+        new_config.entropy_coeff = 0.05;
+        agent.apply_config(new_config).unwrap();
+        assert_eq!(agent.actor.layers[0].weights.data, w_before);
+        assert_eq!(agent.actor.layers[0].bias, b_before);
+    }
+
+    #[test]
+    fn test_apply_config_preserves_critic_weights() {
+        let mut agent = make_agent();
+        let w_before = agent.critic.layers[0].weights.data.clone();
+        let b_before = agent.critic.layers[0].bias.clone();
+        let mut new_config = default_config();
+        new_config.scale_floor = 0.0;
+        new_config.scale_ceil = 3.0;
+        agent.apply_config(new_config).unwrap();
+        assert_eq!(agent.critic.layers[0].weights.data, w_before);
+        assert_eq!(agent.critic.layers[0].bias, b_before);
+    }
+
+    #[test]
+    fn test_apply_config_rejects_topology_mismatch() {
+        let mut agent = make_agent();
+        let mut new_config = default_config();
+        new_config.actor.hidden_layers[0].size = 27;
+        let result = agent.apply_config(new_config);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("actor hidden layer 0 size mismatch"),
+            "Expected topology error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_apply_config_rejects_invalid_config() {
+        let mut agent = make_agent();
+        let mut new_config = default_config();
+        new_config.gamma = 1.5;
+        let result = agent.apply_config(new_config);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("gamma"),
+            "Expected gamma validation error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_apply_config_resets_cl_state() {
+        let mut agent = make_agent();
+        let state = vec![0.5; 9];
+        let _ = agent.step(&state, 0.0, false);
+        let _ = agent.step(&state, 1.0, false);
+        assert!(agent.state_prev.is_some());
+
+        let mut new_config = default_config();
+        new_config.gamma = 0.99;
+        agent.apply_config(new_config).unwrap();
+
+        assert!(agent.state_prev.is_none());
+        assert!(agent.action_prev.is_none());
+        assert!(agent.infer_prev.is_none());
+        assert!(agent.valid_actions_prev.is_none());
+        assert_eq!(agent.actor_plastic_step_counter, 0);
+        assert_eq!(agent.critic_plastic_step_counter, 0);
+        assert_eq!(agent.actor_frozen_steps, 0);
+        assert_eq!(agent.critic_frozen_steps, 0);
+        assert!((agent.last_td_error).abs() < 1e-12);
+        assert!(!agent.actor_last_phase_reliable);
+        assert!(!agent.critic_last_phase_reliable);
+        assert!(agent.surprise_buffer.is_empty());
+        assert!(agent.td_error_buffer.is_empty());
+        assert!(agent.td_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_apply_config_rebuilds_hysteresis() {
+        let mut agent = make_agent();
+        assert!(agent.actor_hysteresis.is_none());
+        assert!(agent.critic_hysteresis.is_none());
+
+        let mut new_config = default_config();
+        new_config.actor_hysteresis = true;
+        new_config.critic_hysteresis = true;
+        agent.apply_config(new_config).unwrap();
+
+        assert!(agent.actor_hysteresis.is_some());
+        assert!(agent.critic_hysteresis.is_some());
+        let ah = agent.actor_hysteresis.as_ref().unwrap();
+        assert_eq!(ah.state, PlasticityState::Plastic);
+        assert_eq!(ah.fast.k, 0);
+        assert_eq!(ah.slow.k, 0);
+    }
+
+    #[test]
+    fn test_apply_config_disables_hysteresis() {
+        let mut config = default_config();
+        config.actor_hysteresis = true;
+        config.critic_hysteresis = true;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        assert!(agent.actor_hysteresis.is_some());
+
+        let new_config = default_config();
+        agent.apply_config(new_config).unwrap();
+        assert!(agent.actor_hysteresis.is_none());
+        assert!(agent.critic_hysteresis.is_none());
+    }
+
+    #[test]
+    fn test_apply_config_rebuilds_decay_factors() {
+        let mut agent = make_agent();
+        assert!(agent
+            .actor_decay_factors
+            .iter()
+            .all(|&f| (f - 1.0).abs() < 1e-12));
+
+        let mut new_config = default_config();
+        new_config.consolidation_decay = 0.9;
+        agent.apply_config(new_config).unwrap();
+
+        assert_eq!(agent.actor_decay_factors.len(), 1);
+        assert!((agent.actor_decay_factors[0] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_apply_config_allocates_fisher_when_ewc_enabled() {
+        let mut agent = make_agent();
+        assert!(agent.actor_fisher.is_empty());
+        assert!(agent.critic_fisher.is_empty());
+
+        let mut new_config = default_config();
+        new_config.ewc_lambda = 1.0;
+        new_config.actor_hysteresis = true;
+        new_config.critic_hysteresis = true;
+        agent.apply_config(new_config).unwrap();
+
+        assert_eq!(agent.actor_fisher.len(), agent.actor.layers.len());
+        assert_eq!(agent.critic_fisher.len(), agent.critic.layers.len());
+    }
+
+    #[test]
+    fn test_apply_config_deallocates_fisher_when_ewc_disabled() {
+        let mut config = default_config();
+        config.ewc_lambda = 1.0;
+        config.actor_hysteresis = true;
+        config.critic_hysteresis = true;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        assert!(!agent.actor_fisher.is_empty());
+
+        let new_config = default_config();
+        agent.apply_config(new_config).unwrap();
+        assert!(agent.actor_fisher.is_empty());
+        assert!(agent.critic_fisher.is_empty());
+    }
+
+    #[test]
+    fn test_apply_config_resizes_gae_trace() {
+        let mut agent = make_agent();
+        assert!(agent.actor_trace.is_empty());
+
+        let mut new_config = default_config();
+        new_config.gae_lambda = Some(0.95);
+        agent.apply_config(new_config).unwrap();
+        assert_eq!(agent.actor_trace.len(), 9);
+        assert!(agent.actor_trace.iter().all(|&v| v == 0.0));
+
+        let new_config2 = default_config();
+        agent.apply_config(new_config2).unwrap();
+        assert!(agent.actor_trace.is_empty());
+    }
+
+    #[test]
+    fn test_apply_config_switches_td_steps() {
+        let mut agent = make_agent();
+        assert_eq!(agent.config.td_steps, 0);
+        assert!(agent.td_buffer.is_empty());
+
+        let mut new_config = default_config();
+        new_config.td_steps = 4;
+        agent.apply_config(new_config).unwrap();
+        assert_eq!(agent.config.td_steps, 4);
+        assert!(agent.td_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_apply_config_rejects_gae_with_td_steps() {
+        let mut agent = make_agent();
+        let mut new_config = default_config();
+        new_config.gae_lambda = Some(0.95);
+        new_config.td_steps = 4;
+        let result = agent.apply_config(new_config);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("mutually exclusive"),
+            "Expected mutual exclusion error, got: {err_msg}"
+        );
+    }
+
+    // ── apply_config: integration ─────────────────────────────────────
+
+    #[test]
+    fn test_apply_config_then_step_works() {
+        let mut agent = make_agent();
+        let state = vec![0.5; 9];
+        let _ = agent.step(&state, 0.0, false);
+        let _ = agent.step(&state, 1.0, false);
+
+        let mut new_config = default_config();
+        new_config.gamma = 0.99;
+        new_config.entropy_coeff = 0.0;
+        agent.apply_config(new_config).unwrap();
+
+        let action = agent.step(&state, 0.0, false);
+        assert!(action < 9);
+        let action2 = agent.step(&state, 1.0, false);
+        assert!(action2 < 9);
+        let _ = agent.step(&state, 0.0, true);
+    }
+
+    #[test]
+    fn test_apply_config_then_step_masked_works() {
+        let mut agent = make_agent();
+        let state = vec![0.5; 9];
+        let valid = vec![0, 3, 6];
+        let _ = agent.step_masked(&state, &valid, 0.0, false).unwrap();
+
+        let mut new_config = default_config();
+        new_config.surprise_low = 0.01;
+        new_config.surprise_high = 0.2;
+        agent.apply_config(new_config).unwrap();
+
+        let action = agent.step_masked(&state, &valid, 0.0, false).unwrap();
+        assert!(valid.contains(&action));
+        let _ = agent.step_masked(&state, &valid, 1.0, true).unwrap();
+    }
+
+    #[test]
+    fn test_apply_config_mid_td_n_episode_clears_buffer() {
+        let mut config = default_config();
+        config.td_steps = 4;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        let state = vec![0.5; 9];
+        let _ = agent.step(&state, 0.0, false);
+        let _ = agent.step(&state, 1.0, false);
+        assert!(
+            !agent.td_buffer.is_empty(),
+            "TD buffer should have transitions"
+        );
+
+        let mut new_config = default_config();
+        new_config.td_steps = 0;
+        agent.apply_config(new_config).unwrap();
+        assert!(agent.td_buffer.is_empty());
+
+        let action = agent.step(&state, 0.0, false);
+        assert!(action < 9);
+        let _ = agent.step(&state, 0.5, true);
+    }
+
+    #[test]
+    fn test_apply_config_new_gamma_takes_effect() {
+        // Create two agents from the same seed, train identically for 1 episode,
+        // then diverge only on gamma via apply_config. The weight deltas after
+        // the second episode must differ, proving gamma causality.
+        // Key: the second episode must include a NON-TERMINAL step where
+        // td_target = reward + gamma * V(next), so gamma actually matters.
+        // Terminal steps use td_target = reward (gamma irrelevant).
+        let mut agent_a = make_agent();
+        let mut agent_b = make_agent();
+        let state = vec![0.5; 9];
+
+        // Identical warmup episode (3 steps: init, non-terminal learn, terminal)
+        let _ = agent_a.step(&state, 0.0, false);
+        let _ = agent_a.step(&state, 1.0, false); // non-terminal: gamma matters
+        let _ = agent_a.step(&state, 0.5, true);
+        let _ = agent_b.step(&state, 0.0, false);
+        let _ = agent_b.step(&state, 1.0, false);
+        let _ = agent_b.step(&state, 0.5, true);
+
+        // Both should have identical weights after identical training
+        assert_eq!(
+            agent_a.actor.layers[0].weights.data,
+            agent_b.actor.layers[0].weights.data
+        );
+
+        // Diverge: agent_a keeps gamma=0.95, agent_b gets gamma=0.5
+        let mut new_config = default_config();
+        new_config.gamma = 0.5;
+        agent_b.apply_config(new_config).unwrap();
+
+        // Second episode with non-terminal steps where gamma matters
+        let _ = agent_a.step(&state, 0.0, false);
+        let _ = agent_a.step(&state, 1.0, false); // td_target = 1.0 + 0.95*V(s)
+        let _ = agent_a.step(&state, 0.5, true);
+        let _ = agent_b.step(&state, 0.0, false);
+        let _ = agent_b.step(&state, 1.0, false); // td_target = 1.0 + 0.50*V(s)
+        let _ = agent_b.step(&state, 0.5, true);
+
+        // Weights must now differ — different gamma produces different TD targets
+        assert_ne!(
+            agent_a.actor.layers[0].weights.data, agent_b.actor.layers[0].weights.data,
+            "Different gamma should produce different weight updates"
+        );
+        assert!((agent_b.config.gamma - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_apply_config_preserves_weights_across_multiple_calls() {
+        let mut agent = make_agent();
+        let w_orig = agent.actor.layers[0].weights.data.clone();
+
+        let mut c1 = default_config();
+        c1.gamma = 0.9;
+        agent.apply_config(c1).unwrap();
+        assert_eq!(agent.actor.layers[0].weights.data, w_orig);
+
+        let mut c2 = default_config();
+        c2.gamma = 0.99;
+        c2.entropy_coeff = 0.0;
+        agent.apply_config(c2).unwrap();
+        assert_eq!(agent.actor.layers[0].weights.data, w_orig);
+
+        let mut c3 = default_config();
+        c3.actor_hysteresis = true;
+        c3.ewc_lambda = 0.5;
+        agent.apply_config(c3).unwrap();
+        assert_eq!(agent.actor.layers[0].weights.data, w_orig);
+    }
+
+    // ── MAGI W3: serialization round-trip after apply_config ─────────
+
+    #[test]
+    fn test_apply_config_serialization_round_trip() {
+        use crate::serializer;
+
+        let mut agent = make_agent();
+        let state = vec![0.5; 9];
+        let _ = agent.step(&state, 0.0, false);
+        let _ = agent.step(&state, 1.0, true);
+
+        let mut new_config = default_config();
+        new_config.gamma = 0.99;
+        new_config.entropy_coeff = 0.0;
+        agent.apply_config(new_config).unwrap();
+
+        let _ = agent.step(&state, 0.0, false);
+        let _ = agent.step(&state, 0.5, true);
+
+        let (action_before, _) = agent.act(&state, &[0, 1, 2, 3], SelectionMode::Play);
+        let w_before = agent.actor.layers[0].weights.data.clone();
+
+        let path = format!(
+            "{}/test_apply_config_roundtrip_{}.json",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        serializer::save_agent(&agent, &path, 0, None).expect("serialize failed");
+        let (mut loaded, _meta) =
+            serializer::load_agent(&path, CpuLinAlg::new()).expect("deserialize failed");
+        std::fs::remove_file(&path).ok();
+
+        // JSON serialization preserves f64 to ~15 significant digits; use
+        // a tight relative tolerance rather than exact bit-for-bit equality.
+        let max_weight_err = loaded.actor.layers[0]
+            .weights
+            .data
+            .iter()
+            .zip(w_before.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_weight_err < 1e-12,
+            "Weight round-trip error too large: {max_weight_err}"
+        );
+        assert!((loaded.config.gamma - 0.99).abs() < 1e-12);
+        assert!((loaded.config.entropy_coeff).abs() < 1e-12);
+
+        // MAGI v2: sub-config coherence
+        assert_eq!(
+            loaded.config.actor.lr_weights, loaded.actor.config.lr_weights,
+            "actor lr_weights diverged after round-trip"
+        );
+        assert_eq!(
+            loaded.config.actor.temperature, loaded.actor.config.temperature,
+            "actor temperature diverged after round-trip"
+        );
+        assert_eq!(
+            loaded.config.actor.local_lambda, loaded.actor.config.local_lambda,
+            "actor local_lambda diverged after round-trip"
+        );
+        assert_eq!(
+            loaded.config.critic.lr, loaded.critic.config.lr,
+            "critic lr diverged after round-trip"
+        );
+
+        let (action_after, _) = loaded.act(&state, &[0, 1, 2, 3], SelectionMode::Play);
+        assert_eq!(
+            action_before, action_after,
+            "Behavioral equivalence after round-trip"
+        );
+    }
+
+    // ── MAGI I2: GAE → TD(n) mode switch via apply_config ────────────
+
+    #[test]
+    fn test_apply_config_gae_to_td_switch() {
+        let mut config = default_config();
+        config.gae_lambda = Some(0.95);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        assert_eq!(agent.actor_trace.len(), 9);
+
+        let mut new_config = default_config();
+        new_config.td_steps = 4;
+        new_config.gae_lambda = None;
+        agent.apply_config(new_config).unwrap();
+
+        assert!(agent.actor_trace.is_empty());
+        assert_eq!(agent.config.td_steps, 4);
+        assert!(agent.config.gae_lambda.is_none());
+
+        let state = vec![0.5; 9];
+        let action = agent.step(&state, 0.0, false);
+        assert!(action < 9);
+        let _ = agent.step(&state, 1.0, true);
+    }
+
+    #[test]
+    fn test_apply_config_enables_adaptive_consolidation() {
+        let mut agent = make_agent();
+        assert!(agent.layer_error_ema.is_empty());
+
+        let mut new_config = default_config();
+        new_config.adaptive_consolidation = true;
+        agent.apply_config(new_config).unwrap();
+
+        assert_eq!(agent.layer_error_ema.len(), 1);
+        assert!((agent.layer_error_ema[0]).abs() < 1e-12);
     }
 }
