@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- Cross-wake couplings in `PcActorCritic::process_hysteresis` now fire on
+  sustained plastic state (not only on FROZEN→PLASTIC transitions), preventing
+  a deadlock where both networks converge to stable equilibria and neither
+  cross-wake can trigger. Affects configurations with `actor_hysteresis = true`,
+  `critic_hysteresis = true`, and at least one bidirectional coupling enabled.
+
+### Changed
+- Under bidirectional coupling + EWC, `handle_fisher_wake` now fires on
+  sustained-path cross-wake events (previously fired only on natural
+  FROZEN→PLASTIC transitions). This is a behavior change for downstream EWC
+  experiments: Fisher refresh cadence may differ under long-running
+  configurations where cross-wake firings were previously deadlocked.
+  No config migration needed; existing `ClState` checkpoints remain compatible.
+
 ## [2.1.0] - 2026-04-11
 
 ### Added
