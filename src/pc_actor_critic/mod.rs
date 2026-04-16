@@ -42,6 +42,13 @@ pub mod trajectory;
 
 pub use trajectory::{ActivationCache, TrajectoryStep};
 
+/// Default cooldown (in learning steps) between consecutive `rollback_hard()` calls.
+///
+/// Prevents thrashing when the caller repeatedly reverts the actor to the
+/// frozen champion. Set to 0 via [`PcActorCritic::set_rollback_hard_cooldown`]
+/// to disable the cooldown entirely.
+pub const DEFAULT_ROLLBACK_HARD_COOLDOWN: u64 = 100;
+
 /// Integrated PC Actor-Critic agent.
 ///
 /// Combines a predictive coding actor with an MLP critic for
@@ -2864,6 +2871,69 @@ impl<L: LinAlg> PcActorCritic<L> {
                 fisher.theta_snapshot_bias = Some(self.critic.layers[i].bias.clone());
             }
         }
+    }
+
+    /// Rolls back the live actor to the Polyak-averaged target weights.
+    ///
+    /// Copies all weights (layers, biases, ReZero alphas, skip projections)
+    /// from the Polyak target into the live actor. Also resets transient
+    /// actor state (eligibility trace, plastic step counter, frozen steps,
+    /// TD error buffer).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcError::ConfigValidation`] if the Polyak target is not
+    /// allocated (`distillation_lambda_polyak == 0.0`).
+    pub fn rollback_soft(&mut self) -> Result<(), PcError> {
+        todo!("Phase 1 commit 8: implement rollback_soft")
+    }
+
+    /// Rolls back the live actor (and Polyak target, if present) to the
+    /// frozen champion weights.
+    ///
+    /// Restores actor weights from the frozen champion. If a Polyak target
+    /// exists, it is also reset to the frozen champion. EWC Fisher running
+    /// EMA (`f_ema`) is zeroed while `f_total` and `theta_snapshot` are
+    /// preserved. The critic is explicitly NOT touched.
+    ///
+    /// Subject to a cooldown gate: if fewer than `rollback_hard_cooldown_steps`
+    /// learning steps have elapsed since the last successful call, the
+    /// method returns an error and performs no mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcError::ConfigValidation`] if the frozen champion is not
+    /// allocated (`distillation_lambda_frozen == 0.0`) or if the cooldown
+    /// window has not elapsed.
+    pub fn rollback_hard(&mut self) -> Result<(), PcError> {
+        todo!("Phase 1 commit 8: implement rollback_hard")
+    }
+
+    /// Promotes the current live actor weights into the frozen champion slot.
+    ///
+    /// Copies all weights from the live actor into the frozen champion.
+    /// The Polyak target and all learning state are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcError::ConfigValidation`] if the frozen champion is not
+    /// allocated (`distillation_lambda_frozen == 0.0`).
+    pub fn champion_update(&mut self) -> Result<(), PcError> {
+        todo!("Phase 1 commit 8: implement champion_update")
+    }
+
+    /// Sets the cooldown window (in learning steps) between consecutive
+    /// `rollback_hard()` calls.
+    ///
+    /// Pass `0` to disable the cooldown entirely.
+    ///
+    /// # Arguments
+    ///
+    /// * `steps` - Number of learning steps that must elapse before a
+    ///   subsequent `rollback_hard()` is allowed.
+    pub fn set_rollback_hard_cooldown(&mut self, steps: u64) {
+        let _ = steps;
+        todo!("Phase 1 commit 8: implement set_rollback_hard_cooldown")
     }
 }
 
@@ -9445,5 +9515,483 @@ mod tests {
             kl += p * (log_p - log_q);
         }
         kl.max(0.0)
+    }
+
+    // ── rollback / champion control methods ──────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 8"]
+    fn test_rollback_soft_restores_live_from_polyak() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.1;
+        cfg.polyak_tau = 0.005;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Drift live for 50 steps
+        for _ in 0..50 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false);
+        }
+        let _ = agent.step_masked(&state, &valid, 0.0, true);
+
+        // Capture polyak weights before rollback
+        let polyak_weights: Vec<Vec<f64>> = agent
+            .polyak_target
+            .as_ref()
+            .unwrap()
+            .layers
+            .iter()
+            .map(|l| l.weights.data.clone())
+            .collect();
+
+        // Rollback soft
+        agent.rollback_soft().unwrap();
+
+        // Live weights must now equal captured polyak weights
+        for (i, layer) in agent.actor.layers.iter().enumerate() {
+            assert_eq!(
+                layer.weights.data, polyak_weights[i],
+                "layer {i}: live weights must match polyak after rollback_soft"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 8"]
+    fn test_rollback_soft_resets_actor_trace() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.1;
+        cfg.polyak_tau = 0.005;
+        cfg.gae_lambda = Some(0.95);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Drive steps to populate actor_trace
+        for _ in 0..10 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false);
+        }
+
+        agent.rollback_soft().unwrap();
+
+        // actor_trace must be all zeros
+        assert!(
+            agent.actor_trace.iter().all(|&v| v == 0.0),
+            "actor_trace must be zeroed after rollback_soft"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 8"]
+    fn test_rollback_soft_returns_err_when_polyak_disabled() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let result = agent.rollback_soft();
+        assert!(
+            result.is_err(),
+            "rollback_soft must fail when polyak disabled"
+        );
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => {
+                assert!(
+                    msg.contains("rollback_soft"),
+                    "error message must mention rollback_soft, got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigValidation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 8"]
+    fn test_rollback_hard_restores_live_and_polyak_from_frozen() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.1;
+        cfg.polyak_tau = 0.005;
+        cfg.distillation_lambda_frozen = 0.1;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Capture frozen weights at t=0 (identical to initial live)
+        let frozen_weights: Vec<Vec<f64>> = agent
+            .frozen_champion
+            .as_ref()
+            .unwrap()
+            .layers
+            .iter()
+            .map(|l| l.weights.data.clone())
+            .collect();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Drift both live and polyak
+        for _ in 0..50 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false);
+        }
+        let _ = agent.step_masked(&state, &valid, 0.0, true);
+
+        // Capture critic weights RIGHT BEFORE rollback
+        let critic_before: Vec<Vec<f64>> = agent
+            .critic
+            .layers
+            .iter()
+            .map(|l| l.weights.data.clone())
+            .collect();
+
+        // Rollback hard
+        agent.rollback_hard().unwrap();
+
+        // Live weights must equal frozen
+        for (i, layer) in agent.actor.layers.iter().enumerate() {
+            assert_eq!(
+                layer.weights.data, frozen_weights[i],
+                "layer {i}: live weights must match frozen after rollback_hard"
+            );
+        }
+
+        // Polyak weights must equal frozen
+        let polyak = agent.polyak_target.as_ref().unwrap();
+        for (i, layer) in polyak.layers.iter().enumerate() {
+            assert_eq!(
+                layer.weights.data, frozen_weights[i],
+                "layer {i}: polyak weights must match frozen after rollback_hard"
+            );
+        }
+
+        // Critic weights must be UNCHANGED (rollback_hard is actor-only)
+        for (i, layer) in agent.critic.layers.iter().enumerate() {
+            assert_eq!(
+                layer.weights.data, critic_before[i],
+                "critic layer {i}: weights must be unchanged after rollback_hard"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 8"]
+    fn test_rollback_hard_returns_err_when_frozen_disabled() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_frozen = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let result = agent.rollback_hard();
+        assert!(
+            result.is_err(),
+            "rollback_hard must fail when frozen disabled"
+        );
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => {
+                assert!(
+                    msg.contains("rollback_hard"),
+                    "error message must mention rollback_hard, got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigValidation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 8"]
+    fn test_rollback_hard_clears_fisher_f_ema_preserves_f_total() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_frozen = 0.1;
+        cfg.ewc_lambda = 1.0;
+        cfg.fisher_ema_beta = 0.99;
+        cfg.actor_hysteresis = true;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Drive learning to populate f_ema
+        for _ in 0..20 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false);
+        }
+        let _ = agent.step_masked(&state, &valid, 0.0, true);
+
+        // Verify f_ema is non-zero
+        let f_ema_sum_before: f64 = agent.actor_fisher[0]
+            .f_ema_weights
+            .data
+            .iter()
+            .map(|v| v.abs())
+            .sum();
+        assert!(
+            f_ema_sum_before > 0.0,
+            "f_ema must be non-zero before rollback"
+        );
+
+        // Capture f_total and theta_snapshot before rollback
+        let f_total_before: Vec<f64> = agent.actor_fisher[0].f_total_weights.data.clone();
+        let theta_snap_before: Option<Vec<f64>> = agent.actor_fisher[0]
+            .theta_snapshot_weights
+            .as_ref()
+            .map(|m| m.data.clone());
+
+        agent.rollback_hard().unwrap();
+
+        // (a) f_ema must be all zeros
+        let f_ema_sum_after: f64 = agent.actor_fisher[0]
+            .f_ema_weights
+            .data
+            .iter()
+            .map(|v| v.abs())
+            .sum();
+        assert_eq!(
+            f_ema_sum_after, 0.0,
+            "f_ema must be zeroed after rollback_hard"
+        );
+
+        // (b) f_total must be byte-exact
+        assert_eq!(
+            agent.actor_fisher[0].f_total_weights.data, f_total_before,
+            "f_total must be preserved after rollback_hard"
+        );
+
+        // (c) theta_snapshot must be preserved
+        let theta_snap_after: Option<Vec<f64>> = agent.actor_fisher[0]
+            .theta_snapshot_weights
+            .as_ref()
+            .map(|m| m.data.clone());
+        assert_eq!(
+            theta_snap_after, theta_snap_before,
+            "theta_snapshot must be preserved after rollback_hard"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 8"]
+    fn test_champion_update_replaces_frozen_with_live() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.1;
+        cfg.polyak_tau = 0.005;
+        cfg.distillation_lambda_frozen = 0.1;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Drift live
+        for _ in 0..50 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false);
+        }
+        let _ = agent.step_masked(&state, &valid, 0.0, true);
+
+        // Capture live weights and polyak weights before champion_update
+        let live_weights: Vec<Vec<f64>> = agent
+            .actor
+            .layers
+            .iter()
+            .map(|l| l.weights.data.clone())
+            .collect();
+        let polyak_weights: Vec<Vec<f64>> = agent
+            .polyak_target
+            .as_ref()
+            .unwrap()
+            .layers
+            .iter()
+            .map(|l| l.weights.data.clone())
+            .collect();
+
+        agent.champion_update().unwrap();
+
+        // Frozen must now equal live
+        let frozen = agent.frozen_champion.as_ref().unwrap();
+        for (i, layer) in frozen.layers.iter().enumerate() {
+            assert_eq!(
+                layer.weights.data, live_weights[i],
+                "layer {i}: frozen must match live after champion_update"
+            );
+        }
+
+        // Polyak must be unchanged
+        let polyak = agent.polyak_target.as_ref().unwrap();
+        for (i, layer) in polyak.layers.iter().enumerate() {
+            assert_eq!(
+                layer.weights.data, polyak_weights[i],
+                "layer {i}: polyak must be unchanged after champion_update"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 8"]
+    fn test_champion_update_returns_err_when_frozen_disabled() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_frozen = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let result = agent.champion_update();
+        assert!(
+            result.is_err(),
+            "champion_update must fail when frozen disabled"
+        );
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => {
+                assert!(
+                    msg.contains("champion_update"),
+                    "error message must mention champion_update, got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigValidation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 8"]
+    fn test_rollback_hard_preserves_ewc_theta_snapshot_across_continued_learning() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_frozen = 0.1;
+        cfg.ewc_lambda = 1.0;
+        cfg.fisher_ema_beta = 0.99;
+        cfg.actor_hysteresis = true;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Drive enough steps to populate theta_snapshot via Fisher merge
+        // min_fisher_phase = ceil(1 / (1 - 0.99)) = 100
+        // We need a PLASTIC->FROZEN transition. With hysteresis enabled,
+        // we drive many steps.
+        for _ in 0..200 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false);
+        }
+        let _ = agent.step_masked(&state, &valid, 0.0, true);
+
+        // Capture theta_snapshot as theta_pre
+        let theta_pre: Vec<Option<Vec<f64>>> = agent
+            .actor_fisher
+            .iter()
+            .map(|f| f.theta_snapshot_weights.as_ref().map(|m| m.data.clone()))
+            .collect();
+
+        // Rollback hard
+        agent.rollback_hard().unwrap();
+
+        // (a) theta_snapshot must be byte-equal to theta_pre after rollback
+        for (i, fisher) in agent.actor_fisher.iter().enumerate() {
+            let snap = fisher
+                .theta_snapshot_weights
+                .as_ref()
+                .map(|m| m.data.clone());
+            assert_eq!(
+                snap, theta_pre[i],
+                "layer {i}: theta_snapshot must be preserved after rollback_hard"
+            );
+        }
+
+        // (b) f_ema must be zero after rollback
+        for fisher in &agent.actor_fisher {
+            let sum: f64 = fisher.f_ema_weights.data.iter().map(|v| v.abs()).sum();
+            assert_eq!(sum, 0.0, "f_ema must be zeroed after rollback_hard");
+        }
+
+        // Drive 20 more learning steps post-rollback
+        for _ in 0..20 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false);
+        }
+
+        // (b continued) theta_snapshot must still be byte-equal to theta_pre
+        // (NOT re-anchored by post-rollback learning since no Fisher merge happened)
+        for (i, fisher) in agent.actor_fisher.iter().enumerate() {
+            let snap = fisher
+                .theta_snapshot_weights
+                .as_ref()
+                .map(|m| m.data.clone());
+            assert_eq!(
+                snap, theta_pre[i],
+                "layer {i}: theta_snapshot must remain stable after 20 post-rollback steps"
+            );
+        }
+
+        // (c) f_ema should have grown during post-rollback steps
+        let f_ema_sum: f64 = agent.actor_fisher[0]
+            .f_ema_weights
+            .data
+            .iter()
+            .map(|v| v.abs())
+            .sum();
+        assert!(
+            f_ema_sum > 0.0,
+            "f_ema must grow during post-rollback learning"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 8"]
+    fn test_rollback_hard_cooldown_blocks_reentry_within_window() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_frozen = 0.1;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+        // First call succeeds
+        assert!(
+            agent.rollback_hard().is_ok(),
+            "first rollback_hard must succeed"
+        );
+
+        // Immediate second call must be rejected (cooldown active)
+        let rejected = agent.rollback_hard();
+        assert!(
+            rejected.is_err(),
+            "immediate second rollback_hard must be rejected by cooldown"
+        );
+
+        // Capture f_ema to verify the rejected call was a no-op
+        // (f_ema was zeroed by the first call; if the rejected call touched it,
+        // this would fail or at minimum we'd see a mutation).
+
+        // Drive ~110 step_masked calls to exceed default cooldown (100)
+        for _ in 0..110 {
+            let _ = agent.step_masked(&state, &valid, 0.5, false);
+        }
+
+        // Third call succeeds (cooldown elapsed)
+        assert!(
+            agent.rollback_hard().is_ok(),
+            "rollback_hard must succeed after cooldown elapsed"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 8"]
+    fn test_rollback_hard_cooldown_window_is_configurable() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_frozen = 0.1;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // First call succeeds
+        assert!(
+            agent.rollback_hard().is_ok(),
+            "first rollback_hard must succeed"
+        );
+
+        // Disable cooldown
+        agent.set_rollback_hard_cooldown(0);
+
+        // Immediate call succeeds (cooldown disabled)
+        assert!(
+            agent.rollback_hard().is_ok(),
+            "rollback_hard must succeed when cooldown is 0"
+        );
+
+        // Restore a default cooldown
+        agent.set_rollback_hard_cooldown(DEFAULT_ROLLBACK_HARD_COOLDOWN);
+
+        // Immediate call must be rejected (cooldown just re-enabled, counter was
+        // reset to 0 by the previous successful rollback_hard)
+        assert!(
+            agent.rollback_hard().is_err(),
+            "rollback_hard must be rejected after restoring cooldown"
+        );
     }
 }
