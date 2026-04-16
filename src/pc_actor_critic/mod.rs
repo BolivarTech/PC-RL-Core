@@ -8365,4 +8365,181 @@ mod tests {
         assert_eq!(agent.layer_error_ema.len(), 1);
         assert!((agent.layer_error_ema[0]).abs() < 1e-12);
     }
+
+    // ── Polyak target slot + KL_polyak integration tests ────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 4"]
+    fn test_polyak_target_allocated_when_lambda_positive() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.1;
+        cfg.polyak_tau = 0.005;
+        cfg.distillation_lambda_frozen = 0.0;
+        let agent: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        assert!(
+            agent.polyak_target.is_some(),
+            "polyak_target must be allocated when lambda > 0"
+        );
+
+        // At t=0 the polyak target must be identical to the live actor
+        let polyak = agent.polyak_target.as_ref().unwrap();
+        let state = vec![0.5; 9];
+        let live_infer = agent.actor.infer(&state);
+        let polyak_infer = polyak.infer(&state);
+        let live_logits = agent.backend.vec_to_vec(&live_infer.y_conv);
+        let polyak_logits = agent.backend.vec_to_vec(&polyak_infer.y_conv);
+        let max_err: f64 = live_logits
+            .iter()
+            .zip(polyak_logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_err < 1e-12,
+            "polyak target must be identical to live at t=0, max_err={max_err}"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 4"]
+    fn test_polyak_target_not_allocated_when_lambda_zero() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.polyak_tau = 0.005;
+        cfg.distillation_lambda_frozen = 0.0;
+        let agent: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        assert!(
+            agent.polyak_target.is_none(),
+            "polyak_target must be None when lambda == 0"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 4"]
+    fn test_polyak_target_tracks_live_with_lag() {
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.1;
+        cfg.polyak_tau = 0.01;
+        cfg.distillation_lambda_frozen = 0.0;
+        cfg.entropy_coeff = 0.0;
+        let mut agent: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Record initial polyak weights
+        let polyak_init = agent.polyak_target.as_ref().unwrap().clone();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Drive 100 steps to move live actor weights
+        for _ in 0..100 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false);
+        }
+        let _ = agent.step_masked(&state, &valid, 0.0, true);
+
+        // Polyak target should have moved from its initial position
+        let polyak_now = agent.polyak_target.as_ref().unwrap();
+        let test_state = vec![0.5; 9];
+        let init_logits = agent.backend.vec_to_vec(&polyak_init.infer(&test_state).y_conv);
+        let now_logits = agent.backend.vec_to_vec(&polyak_now.infer(&test_state).y_conv);
+        let polyak_drift: f64 = init_logits
+            .iter()
+            .zip(now_logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+
+        // Polyak target should lag behind live
+        let live_logits = agent.backend.vec_to_vec(&agent.actor.infer(&test_state).y_conv);
+        let live_drift: f64 = init_logits
+            .iter()
+            .zip(live_logits.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+
+        assert!(
+            polyak_drift > 1e-10,
+            "polyak target must have moved after 100 steps, drift={polyak_drift}"
+        );
+        assert!(
+            live_drift > polyak_drift,
+            "live actor must drift more than polyak target (live={live_drift}, polyak={polyak_drift})"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 4"]
+    fn test_kl_polyak_pulls_live_toward_polyak() {
+        // Create agent with strong Polyak distillation
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 1.0;
+        cfg.polyak_tau = 0.001; // very slow tracking so polyak stays ~initial
+        cfg.distillation_lambda_frozen = 0.0;
+        cfg.entropy_coeff = 0.0;
+        cfg.scale_floor = 1.0; // no surprise scaling — full lr always
+        cfg.scale_ceil = 2.0;
+        let mut agent: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+        // Record initial polyak distribution
+        let polyak_logits_before = {
+            let polyak = agent.polyak_target.as_ref().unwrap();
+            let infer = polyak.infer(&state);
+            agent.backend.vec_to_vec(&infer.y_conv)
+        };
+
+        // Manually perturb the live actor weights to create divergence
+        // by running a few steps with extreme rewards
+        for _ in 0..10 {
+            let _ = agent.step_masked(&state, &valid, 10.0, false);
+        }
+
+        // Record live distribution before KL step
+        let live_infer_pre = agent.actor.infer(&state);
+        let live_logits_pre = agent.backend.vec_to_vec(&live_infer_pre.y_conv);
+
+        // Compute KL divergence: KL(live || polyak) before
+        let kl_before = compute_kl_divergence(&live_logits_pre, &polyak_logits_before, &valid);
+
+        // Run one more step — KL gradient should pull live toward polyak
+        let _ = agent.step_masked(&state, &valid, 0.0, false);
+
+        let live_infer_post = agent.actor.infer(&state);
+        let live_logits_post = agent.backend.vec_to_vec(&live_infer_post.y_conv);
+        let polyak_logits_after = {
+            let polyak = agent.polyak_target.as_ref().unwrap();
+            agent.backend.vec_to_vec(&polyak.infer(&state).y_conv)
+        };
+
+        let kl_after = compute_kl_divergence(&live_logits_post, &polyak_logits_after, &valid);
+
+        // KL should decrease (live moved toward polyak)
+        assert!(
+            kl_after < kl_before,
+            "KL must decrease: before={kl_before}, after={kl_after}"
+        );
+    }
+
+    /// Compute KL(live || target) over valid actions using log-softmax.
+    fn compute_kl_divergence(live_logits: &[f64], target_logits: &[f64], valid: &[usize]) -> f64 {
+        let max_live = valid.iter().map(|&i| live_logits[i]).fold(f64::NEG_INFINITY, f64::max);
+        let max_target = valid.iter().map(|&i| target_logits[i]).fold(f64::NEG_INFINITY, f64::max);
+
+        let lse_live: f64 = valid.iter().map(|&i| (live_logits[i] - max_live).exp()).sum::<f64>().ln() + max_live;
+        let lse_target: f64 = valid.iter().map(|&i| (target_logits[i] - max_target).exp()).sum::<f64>().ln() + max_target;
+
+        let mut kl = 0.0;
+        for &i in valid {
+            let log_p = live_logits[i] - lse_live;
+            let log_q = target_logits[i] - lse_target;
+            let p = log_p.exp();
+            kl += p * (log_p - log_q);
+        }
+        kl.max(0.0)
+    }
 }
