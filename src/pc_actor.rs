@@ -960,6 +960,44 @@ impl<L: LinAlg> PcActor<L> {
         }
     }
 
+    /// In-place soft (Polyak) update toward another actor.
+    ///
+    /// Updates each layer's weights and biases via:
+    ///     `self.weights <- tau * other.weights + (1 - tau) * self.weights`
+    ///     `self.bias    <- tau * other.bias    + (1 - tau) * self.bias`
+    ///
+    /// Includes residual ReZero scaling factors and skip projection weights
+    /// when present.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - Source actor whose weights provide the target.
+    /// * `tau` - Mixing rate in `[0.0, 1.0]`. Special cases: `0.0` is no-op,
+    ///   `1.0` is equivalent to `copy_weights_from`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::DimensionMismatch` if topologies differ.
+    pub fn polyak_update_from(&mut self, _other: &PcActor<L>, _tau: f64) -> Result<(), PcError> {
+        todo!("Phase 1 commit 2: implement polyak_update_from")
+    }
+
+    /// In-place hard copy of weights and biases from another actor.
+    ///
+    /// Copies all weights, biases, ReZero scaling factors, and skip
+    /// projection matrices directly without arithmetic interpolation.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - Source actor whose weights are copied.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::DimensionMismatch` if topologies differ.
+    pub fn copy_weights_from(&mut self, _other: &PcActor<L>) -> Result<(), PcError> {
+        todo!("Phase 1 commit 2: implement copy_weights_from")
+    }
+
     /// Extracts a serializable snapshot of current weights.
     ///
     /// Converts generic layers and skip projections to CPU-backed types.
@@ -3577,6 +3615,136 @@ mod tests {
         assert!(
             matches!(err, PcError::DimensionMismatch { .. }),
             "Expected DimensionMismatch, got: {err}"
+        );
+    }
+
+    // ── Polyak Update Tests ─────────────────────────────────────────
+
+    /// Helper: creates two actors with the same config but different seeds.
+    fn make_two_actors(config: &PcActorConfig) -> (PcActor, PcActor) {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(99);
+        let a = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let b = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
+        (a, b)
+    }
+
+    /// Helper: collects all weight and bias values from an actor into a flat vector.
+    fn snapshot_weights(actor: &PcActor) -> Vec<f64> {
+        let b = &actor.backend;
+        let mut vals = Vec::new();
+        for layer in &actor.layers {
+            let rows = b.mat_rows(&layer.weights);
+            let cols = b.mat_cols(&layer.weights);
+            for r in 0..rows {
+                for c in 0..cols {
+                    vals.push(b.mat_get(&layer.weights, r, c));
+                }
+            }
+            let len = b.vec_len(&layer.bias);
+            for i in 0..len {
+                vals.push(b.vec_get(&layer.bias, i));
+            }
+        }
+        for &alpha in &actor.rezero_alpha {
+            vals.push(alpha);
+        }
+        for m in actor.skip_projections.iter().flatten() {
+            let rows = b.mat_rows(m);
+            let cols = b.mat_cols(m);
+            for r in 0..rows {
+                for c in 0..cols {
+                    vals.push(b.mat_get(m, r, c));
+                }
+            }
+        }
+        vals
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 2"]
+    fn test_polyak_update_tau_zero_no_change() {
+        let (mut delayed, other) = make_two_actors(&default_config());
+        let before = snapshot_weights(&delayed);
+        delayed.polyak_update_from(&other, 0.0).unwrap();
+        let after = snapshot_weights(&delayed);
+        assert_eq!(before, after, "tau=0 must leave weights unchanged");
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 2"]
+    fn test_polyak_update_tau_one_full_copy() {
+        let (mut delayed, other) = make_two_actors(&default_config());
+        delayed.polyak_update_from(&other, 1.0).unwrap();
+        let delayed_snap = snapshot_weights(&delayed);
+        let other_snap = snapshot_weights(&other);
+        assert_eq!(
+            delayed_snap, other_snap,
+            "tau=1 must produce weights identical to other"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 2"]
+    fn test_polyak_update_partial_interpolation() {
+        let config = default_config();
+        let (mut delayed, other) = make_two_actors(&config);
+        let before = snapshot_weights(&delayed);
+        let other_snap = snapshot_weights(&other);
+        let tau = 0.5;
+        delayed.polyak_update_from(&other, tau).unwrap();
+        let after = snapshot_weights(&delayed);
+        for (i, (&a, (&b, &o))) in after
+            .iter()
+            .zip(before.iter().zip(other_snap.iter()))
+            .enumerate()
+        {
+            let expected = tau * o + (1.0 - tau) * b;
+            assert!(
+                (a - expected).abs() < 1e-12,
+                "tau=0.5 mismatch at index {i}: got {a}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 2"]
+    fn test_polyak_update_rejects_topology_mismatch() {
+        let (mut actor_a, _) = make_two_actors(&default_config());
+        let mut rng = StdRng::seed_from_u64(77);
+        let actor_b = PcActor::new(CpuLinAlg::new(), two_hidden_config(), &mut rng).unwrap();
+        let result = actor_a.polyak_update_from(&actor_b, 0.5);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch for topology mismatch"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 2"]
+    fn test_copy_weights_from_exact() {
+        let (mut delayed, other) = make_two_actors(&default_config());
+        delayed.copy_weights_from(&other).unwrap();
+        let delayed_snap = snapshot_weights(&delayed);
+        let other_snap = snapshot_weights(&other);
+        assert_eq!(
+            delayed_snap, other_snap,
+            "copy_weights_from must produce byte-exact equality"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 2"]
+    fn test_copy_weights_from_rejects_topology_mismatch() {
+        let (mut actor_a, _) = make_two_actors(&default_config());
+        let mut rng = StdRng::seed_from_u64(77);
+        let actor_b = PcActor::new(CpuLinAlg::new(), two_hidden_config(), &mut rng).unwrap();
+        let result = actor_a.copy_weights_from(&actor_b);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch for topology mismatch"
         );
     }
 }
