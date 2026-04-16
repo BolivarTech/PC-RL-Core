@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+### Added
+
+- Self-distillation with dual anchors for self-recovery during continuous learning.
+  **The two anchors serve fundamentally different purposes (MAGI R4 W5 — read
+  this before tuning either lambda):**
+  - **Polyak-tracked target (`distillation_lambda_polyak`, `polyak_tau`)** —
+    purpose: **noise smoothing.** The Polyak target tracks the live actor with
+    a lag of approximately `1/polyak_tau` steps (~200 at the default
+    `polyak_tau = 0.005`). Use case: a soft inertia against short-term
+    gradient noise, preventing the live actor from oscillating around a local
+    minimum. **NOT useful for cascade recovery** — by the time a slow
+    cascade has been detected (typically over hundreds of steps), the Polyak
+    target has tracked the cascade itself and `rollback_soft()` recovers
+    only a small fraction of the degradation. Use `rollback_soft()` for
+    short-window noise spikes, not for sustained drift.
+  - **Frozen champion anchor (`distillation_lambda_frozen`)** — purpose:
+    **cascade recovery.** The frozen anchor is **immutable** between explicit
+    `champion_update()` calls. It does not track live drift at all.
+    Use case: provide a stable rollback target that the consumer can fall
+    back to via `rollback_hard()` when fitness signals indicate sustained
+    degradation. This is the workhorse for catastrophic-forgetting recovery.
+    Loaded automatically from saved actor weights at `load_agent()` time, or
+    auto-initialized from the live actor on legacy save files.
+  - **Asymmetry summary table:**
+
+    | | Polyak target | Frozen champion |
+    |---|---|---|
+    | Updates after every step | yes (`τ` blend) | no (only `champion_update`) |
+    | Tracks live drift | yes (with lag) | no |
+    | Recovery method | `rollback_soft` | `rollback_hard` |
+    | Detection window | ~`1/polyak_tau` steps | unbounded |
+    | Use case | noise smoothing | cascade recovery |
+    | KL coefficient | `distillation_lambda_polyak` | `distillation_lambda_frozen` |
+
+  - Both anchors contribute additive KL regularization terms to the actor
+    loss when their respective lambdas are non-zero. They can be enabled
+    independently or together; the defaults are 0.0 (no slot allocation).
+  - New public methods: `rollback_soft()` (live ← polyak), `rollback_hard()`
+    (live ← frozen, polyak ← frozen), `champion_update()` (frozen ← live).
+  - **`rollback_hard` has a load-bearing cooldown contract** (~100-200 steps
+    at `gamma = 0.99`). See the rustdoc on `rollback_hard` for the full
+    rationale; calling it in a tight loop in an automated pipeline can
+    trigger a positive feedback loop that deepens the EWC-protection gap.
+  - New helpers `PcActor::polyak_update_from()` and `PcActor::copy_weights_from()`
+    are independently useful for GA crossover and teacher-student setups.
+- Backward-compatible serialization: legacy save files without the new anchor
+  weights load cleanly with anchors auto-initialized from the live actor.
+
 ### Fixed
 - Cross-wake couplings in `PcActorCritic::process_hysteresis` now fire on
   sustained plastic state (not only on FROZEN→PLASTIC transitions), preventing
