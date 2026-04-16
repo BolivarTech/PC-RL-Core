@@ -7348,8 +7348,7 @@ mod tests {
         cfg.critic_wakes_actor = true;
         cfg.critic_wakes_actor_threshold = 10;
         cfg.actor_wakes_critic = false;
-        let mut agent: PcActorCritic =
-            PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
         // Sanity: Fisher allocation per layer under ewc_lambda > 0.
         assert!(
@@ -7374,16 +7373,28 @@ mod tests {
         // PLASTIC with min_initial_plastic=9999 blocking natural sleep.
         agent.actor_hysteresis = Some(HysteresisState::from_snapshot(
             PlasticityState::Frozen,
-            0.5, 100, 20,
-            0.5, 100, 500,
-            0.5, 0.005, 0,
+            0.5,
+            100,
+            20,
+            0.5,
+            100,
+            500,
+            0.5,
+            0.005,
+            0,
         ));
         agent.actor_frozen_steps = 100;
         agent.critic_hysteresis = Some(HysteresisState::from_snapshot(
             PlasticityState::Plastic,
-            0.01, 100, 20,
-            0.01, 100, 200,
-            0.5, 0.3, 9999,
+            0.01,
+            100,
+            20,
+            0.01,
+            100,
+            200,
+            0.5,
+            0.3,
+            9999,
         ));
         agent.critic_plastic_step_counter = 0;
 

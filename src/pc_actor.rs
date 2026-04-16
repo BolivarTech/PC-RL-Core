@@ -1099,8 +1099,9 @@ impl<L: LinAlg> PcActor<L> {
 
     /// Validates that two actors have matching topologies.
     ///
-    /// Checks layer count, per-layer weight/bias dimensions, and residual
-    /// component counts.
+    /// Checks layer count, per-layer weight/bias dimensions, residual
+    /// component counts, per-slot skip projection presence agreement,
+    /// and skip projection matrix dimensions.
     ///
     /// # Errors
     ///
@@ -1115,7 +1116,7 @@ impl<L: LinAlg> PcActor<L> {
         }
         for (i, (la, lb)) in a.layers.iter().zip(b.layers.iter()).enumerate() {
             let ra = a.backend.mat_rows(&la.weights);
-            let rb = a.backend.mat_rows(&lb.weights);
+            let rb = b.backend.mat_rows(&lb.weights);
             if ra != rb {
                 return Err(PcError::DimensionMismatch {
                     expected: ra,
@@ -1128,7 +1129,7 @@ impl<L: LinAlg> PcActor<L> {
                 });
             }
             let ca = a.backend.mat_cols(&la.weights);
-            let cb = a.backend.mat_cols(&lb.weights);
+            let cb = b.backend.mat_cols(&lb.weights);
             if ca != cb {
                 return Err(PcError::DimensionMismatch {
                     expected: ca,
@@ -1154,6 +1155,46 @@ impl<L: LinAlg> PcActor<L> {
                 got: b.skip_projections.len(),
                 context: "polyak actor skip_projections count",
             });
+        }
+        // Per-slot skip projection presence agreement and dimension check
+        for (sa, sb) in a.skip_projections.iter().zip(b.skip_projections.iter()) {
+            match (sa, sb) {
+                (Some(ma), Some(mb)) => {
+                    let ra = a.backend.mat_rows(ma);
+                    let rb = b.backend.mat_rows(mb);
+                    if ra != rb {
+                        return Err(PcError::DimensionMismatch {
+                            expected: ra,
+                            got: rb,
+                            context: "polyak actor skip_projection rows",
+                        });
+                    }
+                    let ca = a.backend.mat_cols(ma);
+                    let cb = b.backend.mat_cols(mb);
+                    if ca != cb {
+                        return Err(PcError::DimensionMismatch {
+                            expected: ca,
+                            got: cb,
+                            context: "polyak actor skip_projection cols",
+                        });
+                    }
+                }
+                (None, None) => {}
+                (Some(_), None) => {
+                    return Err(PcError::DimensionMismatch {
+                        expected: 1,
+                        got: 0,
+                        context: "polyak actor skip_projection presence at slot",
+                    });
+                }
+                (None, Some(_)) => {
+                    return Err(PcError::DimensionMismatch {
+                        expected: 0,
+                        got: 1,
+                        context: "polyak actor skip_projection presence at slot",
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -3899,6 +3940,113 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), PcError::DimensionMismatch { .. }),
             "Expected DimensionMismatch for topology mismatch"
+        );
+    }
+
+    fn residual_hetero_config() -> PcActorConfig {
+        PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Softsign,
+                },
+                LayerDef {
+                    size: 12,
+                    activation: Activation::Softsign,
+                },
+            ],
+            ..default_config()
+        }
+    }
+
+    /// Drifts all layer weights, biases, rezero alphas, and skip projections
+    /// by a fixed offset to create a measurable difference between actors.
+    fn drift_actor_weights(actor: &mut PcActor, offset: f64) {
+        let b = &actor.backend;
+        for layer in &mut actor.layers {
+            let rows = b.mat_rows(&layer.weights);
+            let cols = b.mat_cols(&layer.weights);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let v = b.mat_get(&layer.weights, r, c);
+                    b.mat_set(&mut layer.weights, r, c, v + offset);
+                }
+            }
+            let len = b.vec_len(&layer.bias);
+            for i in 0..len {
+                let v = b.vec_get(&layer.bias, i);
+                b.vec_set(&mut layer.bias, i, v + offset);
+            }
+        }
+        for alpha in &mut actor.rezero_alpha {
+            *alpha += offset;
+        }
+        for m in actor.skip_projections.iter_mut().flatten() {
+            let rows = b.mat_rows(m);
+            let cols = b.mat_cols(m);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let v = b.mat_get(m, r, c);
+                    b.mat_set(m, r, c, v + offset);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_polyak_update_with_residual_actors() {
+        let config = residual_hetero_config();
+        let (mut target, mut source) = make_two_actors(&config);
+
+        // Verify skip projections are allocated (heterogeneous sizes)
+        assert_eq!(target.skip_projections.len(), 1);
+        assert!(target.skip_projections[0].is_some());
+
+        // Drift source weights so target and source differ measurably
+        drift_actor_weights(&mut source, 1.0);
+
+        let before = snapshot_weights(&target);
+        let source_snap = snapshot_weights(&source);
+        let tau = 0.5;
+
+        target.polyak_update_from(&source, tau).unwrap();
+
+        let after = snapshot_weights(&target);
+        // snapshot_weights includes layers, rezero_alpha, AND skip_projections
+        assert_eq!(before.len(), after.len(), "snapshot length must not change");
+        for (i, (&a, (&b, &o))) in after
+            .iter()
+            .zip(before.iter().zip(source_snap.iter()))
+            .enumerate()
+        {
+            let expected = tau * o + (1.0 - tau) * b;
+            assert!(
+                (a - expected).abs() < 1e-12,
+                "residual polyak mismatch at index {i}: got {a}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_copy_weights_from_with_residual_actors() {
+        let config = residual_hetero_config();
+        let (mut target, mut source) = make_two_actors(&config);
+
+        // Verify skip projections are allocated (heterogeneous sizes)
+        assert_eq!(target.skip_projections.len(), 1);
+        assert!(target.skip_projections[0].is_some());
+
+        // Drift source weights so target and source differ
+        drift_actor_weights(&mut source, 1.0);
+
+        target.copy_weights_from(&source).unwrap();
+
+        let target_snap = snapshot_weights(&target);
+        let source_snap = snapshot_weights(&source);
+        assert_eq!(
+            target_snap, source_snap,
+            "copy_weights_from must produce byte-exact equality for residual actors"
         );
     }
 }
