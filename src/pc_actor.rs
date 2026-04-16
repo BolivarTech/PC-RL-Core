@@ -978,8 +978,65 @@ impl<L: LinAlg> PcActor<L> {
     /// # Errors
     ///
     /// Returns `PcError::DimensionMismatch` if topologies differ.
-    pub fn polyak_update_from(&mut self, _other: &PcActor<L>, _tau: f64) -> Result<(), PcError> {
-        todo!("Phase 1 commit 2: implement polyak_update_from")
+    pub fn polyak_update_from(&mut self, other: &PcActor<L>, tau: f64) -> Result<(), PcError> {
+        Self::validate_topology_match(self, other)?;
+
+        if tau == 0.0 {
+            return Ok(());
+        }
+
+        let one_minus_tau = 1.0 - tau;
+
+        // Update layer weights and biases
+        for (self_layer, other_layer) in self.layers.iter_mut().zip(other.layers.iter()) {
+            let rows = self.backend.mat_rows(&self_layer.weights);
+            let cols = self.backend.mat_cols(&self_layer.weights);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let s = self.backend.mat_get(&self_layer.weights, r, c);
+                    let o = self.backend.mat_get(&other_layer.weights, r, c);
+                    self.backend.mat_set(
+                        &mut self_layer.weights,
+                        r,
+                        c,
+                        tau * o + one_minus_tau * s,
+                    );
+                }
+            }
+            let len = self.backend.vec_len(&self_layer.bias);
+            for i in 0..len {
+                let s = self.backend.vec_get(&self_layer.bias, i);
+                let o = self.backend.vec_get(&other_layer.bias, i);
+                self.backend
+                    .vec_set(&mut self_layer.bias, i, tau * o + one_minus_tau * s);
+            }
+        }
+
+        // Update ReZero scaling factors
+        for (sa, oa) in self.rezero_alpha.iter_mut().zip(other.rezero_alpha.iter()) {
+            *sa = tau * oa + one_minus_tau * (*sa);
+        }
+
+        // Update skip projection matrices
+        for (sp, op) in self
+            .skip_projections
+            .iter_mut()
+            .zip(other.skip_projections.iter())
+        {
+            if let (Some(sm), Some(om)) = (sp, op) {
+                let rows = self.backend.mat_rows(sm);
+                let cols = self.backend.mat_cols(sm);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let s = self.backend.mat_get(sm, r, c);
+                        let o = self.backend.mat_get(om, r, c);
+                        self.backend.mat_set(sm, r, c, tau * o + one_minus_tau * s);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// In-place hard copy of weights and biases from another actor.
@@ -994,8 +1051,111 @@ impl<L: LinAlg> PcActor<L> {
     /// # Errors
     ///
     /// Returns `PcError::DimensionMismatch` if topologies differ.
-    pub fn copy_weights_from(&mut self, _other: &PcActor<L>) -> Result<(), PcError> {
-        todo!("Phase 1 commit 2: implement copy_weights_from")
+    pub fn copy_weights_from(&mut self, other: &PcActor<L>) -> Result<(), PcError> {
+        Self::validate_topology_match(self, other)?;
+
+        // Copy layer weights and biases
+        for (self_layer, other_layer) in self.layers.iter_mut().zip(other.layers.iter()) {
+            let rows = self.backend.mat_rows(&self_layer.weights);
+            let cols = self.backend.mat_cols(&self_layer.weights);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let val = self.backend.mat_get(&other_layer.weights, r, c);
+                    self.backend.mat_set(&mut self_layer.weights, r, c, val);
+                }
+            }
+            let len = self.backend.vec_len(&self_layer.bias);
+            for i in 0..len {
+                let val = self.backend.vec_get(&other_layer.bias, i);
+                self.backend.vec_set(&mut self_layer.bias, i, val);
+            }
+        }
+
+        // Copy ReZero scaling factors
+        for (sa, oa) in self.rezero_alpha.iter_mut().zip(other.rezero_alpha.iter()) {
+            *sa = *oa;
+        }
+
+        // Copy skip projection matrices
+        for (sp, op) in self
+            .skip_projections
+            .iter_mut()
+            .zip(other.skip_projections.iter())
+        {
+            if let (Some(sm), Some(om)) = (sp, op) {
+                let rows = self.backend.mat_rows(sm);
+                let cols = self.backend.mat_cols(sm);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let val = self.backend.mat_get(om, r, c);
+                        self.backend.mat_set(sm, r, c, val);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates that two actors have matching topologies.
+    ///
+    /// Checks layer count, per-layer weight/bias dimensions, and residual
+    /// component counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::DimensionMismatch` if any topology element differs.
+    fn validate_topology_match(a: &PcActor<L>, b: &PcActor<L>) -> Result<(), PcError> {
+        if a.layers.len() != b.layers.len() {
+            return Err(PcError::DimensionMismatch {
+                expected: a.layers.len(),
+                got: b.layers.len(),
+                context: "polyak actor layer count",
+            });
+        }
+        for (i, (la, lb)) in a.layers.iter().zip(b.layers.iter()).enumerate() {
+            let ra = a.backend.mat_rows(&la.weights);
+            let rb = a.backend.mat_rows(&lb.weights);
+            if ra != rb {
+                return Err(PcError::DimensionMismatch {
+                    expected: ra,
+                    got: rb,
+                    context: if i < a.layers.len() - 1 {
+                        "polyak actor hidden layer rows"
+                    } else {
+                        "polyak actor output layer rows"
+                    },
+                });
+            }
+            let ca = a.backend.mat_cols(&la.weights);
+            let cb = a.backend.mat_cols(&lb.weights);
+            if ca != cb {
+                return Err(PcError::DimensionMismatch {
+                    expected: ca,
+                    got: cb,
+                    context: if i < a.layers.len() - 1 {
+                        "polyak actor hidden layer cols"
+                    } else {
+                        "polyak actor output layer cols"
+                    },
+                });
+            }
+        }
+        if a.rezero_alpha.len() != b.rezero_alpha.len() {
+            return Err(PcError::DimensionMismatch {
+                expected: a.rezero_alpha.len(),
+                got: b.rezero_alpha.len(),
+                context: "polyak actor rezero_alpha count",
+            });
+        }
+        if a.skip_projections.len() != b.skip_projections.len() {
+            return Err(PcError::DimensionMismatch {
+                expected: a.skip_projections.len(),
+                got: b.skip_projections.len(),
+                context: "polyak actor skip_projections count",
+            });
+        }
+        Ok(())
     }
 
     /// Extracts a serializable snapshot of current weights.
@@ -3662,7 +3822,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 2"]
     fn test_polyak_update_tau_zero_no_change() {
         let (mut delayed, other) = make_two_actors(&default_config());
         let before = snapshot_weights(&delayed);
@@ -3672,7 +3831,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 2"]
     fn test_polyak_update_tau_one_full_copy() {
         let (mut delayed, other) = make_two_actors(&default_config());
         delayed.polyak_update_from(&other, 1.0).unwrap();
@@ -3685,7 +3843,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 2"]
     fn test_polyak_update_partial_interpolation() {
         let config = default_config();
         let (mut delayed, other) = make_two_actors(&config);
@@ -3708,7 +3865,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 2"]
     fn test_polyak_update_rejects_topology_mismatch() {
         let (mut actor_a, _) = make_two_actors(&default_config());
         let mut rng = StdRng::seed_from_u64(77);
@@ -3722,7 +3878,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 2"]
     fn test_copy_weights_from_exact() {
         let (mut delayed, other) = make_two_actors(&default_config());
         delayed.copy_weights_from(&other).unwrap();
@@ -3735,7 +3890,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 2"]
     fn test_copy_weights_from_rejects_topology_mismatch() {
         let (mut actor_a, _) = make_two_actors(&default_config());
         let mut rng = StdRng::seed_from_u64(77);
