@@ -122,6 +122,12 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// Never updated automatically — stays byte-exact until explicit
     /// `champion_update()` call (Task 4).
     pub(crate) frozen_champion: Option<PcActor<L>>,
+    /// Cooldown window (learning steps) between consecutive `rollback_hard()` calls.
+    /// 0 disables the cooldown entirely.
+    rollback_hard_cooldown_steps: u64,
+    /// Steps since the last successful `rollback_hard()` call.
+    /// Initialized to `u64::MAX` so the first call is always allowed.
+    steps_since_last_rollback_hard: u64,
 }
 
 /// A single buffered transition for TD(n) computation.
@@ -852,6 +858,8 @@ impl<L: LinAlg> PcActorCritic<L> {
         self.actor_trace = vec![0.0; trace_len];
         self.polyak_target = polyak_target;
         self.frozen_champion = frozen_champion;
+        self.rollback_hard_cooldown_steps = DEFAULT_ROLLBACK_HARD_COOLDOWN;
+        self.steps_since_last_rollback_hard = u64::MAX;
 
         Ok(())
     }
@@ -951,6 +959,8 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_trace: vec![0.0; new_trace_len],
             polyak_target,
             frozen_champion,
+            rollback_hard_cooldown_steps: DEFAULT_ROLLBACK_HARD_COOLDOWN,
+            steps_since_last_rollback_hard: u64::MAX,
         })
     }
 
@@ -1077,6 +1087,8 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_trace: vec![0.0; child_trace_len],
             polyak_target,
             frozen_champion,
+            rollback_hard_cooldown_steps: DEFAULT_ROLLBACK_HARD_COOLDOWN,
+            steps_since_last_rollback_hard: u64::MAX,
         })
     }
 
@@ -1138,6 +1150,8 @@ impl<L: LinAlg> PcActorCritic<L> {
             actor_trace: vec![0.0; parts_trace_len],
             polyak_target,
             frozen_champion,
+            rollback_hard_cooldown_steps: DEFAULT_ROLLBACK_HARD_COOLDOWN,
+            steps_since_last_rollback_hard: u64::MAX,
         }
     }
 
@@ -1477,6 +1491,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         next_infer: &InferResult<L>,
         terminal: bool,
     ) -> f64 {
+        self.steps_since_last_rollback_hard = self.steps_since_last_rollback_hard.saturating_add(1);
         self.learn_continuous_inner(
             input,
             infer,
@@ -2885,7 +2900,18 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// Returns [`PcError::ConfigValidation`] if the Polyak target is not
     /// allocated (`distillation_lambda_polyak == 0.0`).
     pub fn rollback_soft(&mut self) -> Result<(), PcError> {
-        todo!("Phase 1 commit 8: implement rollback_soft")
+        let polyak = self.polyak_target.as_ref().ok_or_else(|| {
+            PcError::ConfigValidation(
+                "rollback_soft requires distillation_lambda_polyak > 0".into(),
+            )
+        })?;
+        self.actor.copy_weights_from(polyak)?;
+        self.actor_trace.fill(0.0);
+        self.actor_plastic_step_counter = 0;
+        self.actor_frozen_steps = 0;
+        self.td_error_buffer.clear();
+        self.last_td_error = 0.0;
+        Ok(())
     }
 
     /// Rolls back the live actor (and Polyak target, if present) to the
@@ -2906,7 +2932,53 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// allocated (`distillation_lambda_frozen == 0.0`) or if the cooldown
     /// window has not elapsed.
     pub fn rollback_hard(&mut self) -> Result<(), PcError> {
-        todo!("Phase 1 commit 8: implement rollback_hard")
+        // Cooldown gate — reject entirely (no mutation) if within window
+        if self.rollback_hard_cooldown_steps > 0
+            && self.steps_since_last_rollback_hard < self.rollback_hard_cooldown_steps
+        {
+            return Err(PcError::ConfigValidation(format!(
+                "rollback_hard rejected: cooldown active ({} of {} steps)",
+                self.steps_since_last_rollback_hard, self.rollback_hard_cooldown_steps,
+            )));
+        }
+        let frozen = self.frozen_champion.as_ref().ok_or_else(|| {
+            PcError::ConfigValidation(
+                "rollback_hard requires distillation_lambda_frozen > 0".into(),
+            )
+        })?;
+        let frozen_clone = frozen.clone();
+
+        // 1. Actor weights <- frozen
+        self.actor.copy_weights_from(&frozen_clone)?;
+
+        // 2. Polyak <- frozen (if allocated)
+        if let Some(ref mut polyak) = self.polyak_target {
+            polyak.copy_weights_from(&frozen_clone)?;
+        }
+
+        // 3. EWC Fisher: clear f_ema, preserve f_total and theta_snapshot
+        if self.config.ewc_lambda > 0.0 {
+            for fisher in self.actor_fisher.iter_mut() {
+                let rows = self.backend.mat_rows(&fisher.f_ema_weights);
+                let cols = self.backend.mat_cols(&fisher.f_ema_weights);
+                fisher.f_ema_weights = self.backend.zeros_mat(rows, cols);
+                let bias_len = self.backend.vec_len(&fisher.f_ema_bias);
+                fisher.f_ema_bias = self.backend.zeros_vec(bias_len);
+            }
+        }
+
+        // 4. Actor transient state reset
+        self.actor_trace.fill(0.0);
+        self.actor_plastic_step_counter = 0;
+        self.actor_frozen_steps = 0;
+        self.td_error_buffer.clear();
+        self.last_td_error = 0.0;
+
+        // 5. Cooldown reset
+        self.steps_since_last_rollback_hard = 0;
+
+        // Critic is EXPLICITLY NOT TOUCHED
+        Ok(())
     }
 
     /// Promotes the current live actor weights into the frozen champion slot.
@@ -2919,7 +2991,13 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// Returns [`PcError::ConfigValidation`] if the frozen champion is not
     /// allocated (`distillation_lambda_frozen == 0.0`).
     pub fn champion_update(&mut self) -> Result<(), PcError> {
-        todo!("Phase 1 commit 8: implement champion_update")
+        let frozen = self.frozen_champion.as_mut().ok_or_else(|| {
+            PcError::ConfigValidation(
+                "champion_update requires distillation_lambda_frozen > 0".into(),
+            )
+        })?;
+        frozen.copy_weights_from(&self.actor)?;
+        Ok(())
     }
 
     /// Sets the cooldown window (in learning steps) between consecutive
@@ -2932,8 +3010,7 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// * `steps` - Number of learning steps that must elapse before a
     ///   subsequent `rollback_hard()` is allowed.
     pub fn set_rollback_hard_cooldown(&mut self, steps: u64) {
-        let _ = steps;
-        todo!("Phase 1 commit 8: implement set_rollback_hard_cooldown")
+        self.rollback_hard_cooldown_steps = steps;
     }
 }
 
@@ -9520,7 +9597,6 @@ mod tests {
     // ── rollback / champion control methods ──────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 8"]
     fn test_rollback_soft_restores_live_from_polyak() {
         let mut cfg = default_config();
         cfg.distillation_lambda_polyak = 0.1;
@@ -9559,7 +9635,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 8"]
     fn test_rollback_soft_resets_actor_trace() {
         let mut cfg = default_config();
         cfg.distillation_lambda_polyak = 0.1;
@@ -9585,7 +9660,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 8"]
     fn test_rollback_soft_returns_err_when_polyak_disabled() {
         let mut cfg = default_config();
         cfg.distillation_lambda_polyak = 0.0;
@@ -9608,7 +9682,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 8"]
     fn test_rollback_hard_restores_live_and_polyak_from_frozen() {
         let mut cfg = default_config();
         cfg.distillation_lambda_polyak = 0.1;
@@ -9673,7 +9746,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 8"]
     fn test_rollback_hard_returns_err_when_frozen_disabled() {
         let mut cfg = default_config();
         cfg.distillation_lambda_frozen = 0.0;
@@ -9696,7 +9768,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 8"]
     fn test_rollback_hard_clears_fisher_f_ema_preserves_f_total() {
         let mut cfg = default_config();
         cfg.distillation_lambda_frozen = 0.1;
@@ -9765,7 +9836,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 8"]
     fn test_champion_update_replaces_frozen_with_live() {
         let mut cfg = default_config();
         cfg.distillation_lambda_polyak = 0.1;
@@ -9820,7 +9890,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 8"]
     fn test_champion_update_returns_err_when_frozen_disabled() {
         let mut cfg = default_config();
         cfg.distillation_lambda_frozen = 0.0;
@@ -9843,7 +9912,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 8"]
     fn test_rollback_hard_preserves_ewc_theta_snapshot_across_continued_learning() {
         let mut cfg = default_config();
         cfg.distillation_lambda_frozen = 0.1;
@@ -9924,7 +9992,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 8"]
     fn test_rollback_hard_cooldown_blocks_reentry_within_window() {
         let mut cfg = default_config();
         cfg.distillation_lambda_frozen = 0.1;
@@ -9963,7 +10030,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 8"]
     fn test_rollback_hard_cooldown_window_is_configurable() {
         let mut cfg = default_config();
         cfg.distillation_lambda_frozen = 0.1;
