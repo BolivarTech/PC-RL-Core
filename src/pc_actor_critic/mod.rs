@@ -106,6 +106,10 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// Output-level eligibility trace for GAE(λ). Empty when gae_lambda=None.
     /// Not serialized — transient mid-episode state.
     actor_trace: Vec<f64>,
+    /// Polyak-averaged target actor for KL distillation.
+    /// `Some` when `distillation_lambda_polyak > 0`, `None` otherwise.
+    /// Updated via soft Polyak averaging after each actor weight update.
+    pub(crate) polyak_target: Option<PcActor<L>>,
 }
 
 /// A single buffered transition for TD(n) computation.
@@ -441,6 +445,31 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
         }
 
+        // Validate Polyak distillation parameters
+        if config.distillation_lambda_polyak < 0.0 {
+            return Err(PcError::ConfigValidation(format!(
+                "distillation_lambda_polyak must be >= 0.0, got {}",
+                config.distillation_lambda_polyak
+            )));
+        }
+        if !config.polyak_tau.is_finite() || !(0.0..=1.0).contains(&config.polyak_tau) {
+            return Err(PcError::ConfigValidation(format!(
+                "polyak_tau must be finite and in [0.0, 1.0], got {}",
+                config.polyak_tau
+            )));
+        }
+        if config.distillation_lambda_polyak > 0.0 && config.polyak_tau == 0.0 {
+            return Err(PcError::ConfigValidation(
+                "polyak_tau must be > 0.0 when distillation_lambda_polyak > 0".to_string(),
+            ));
+        }
+        if config.distillation_lambda_frozen < 0.0 {
+            return Err(PcError::ConfigValidation(format!(
+                "distillation_lambda_frozen must be >= 0.0, got {}",
+                config.distillation_lambda_frozen
+            )));
+        }
+
         Ok(())
     }
 
@@ -771,6 +800,13 @@ impl<L: LinAlg> PcActorCritic<L> {
         let critic_fisher =
             Self::build_fisher_for_layers(&self.backend, &self.critic.layers, config.ewc_lambda);
 
+        // 6b. Reallocate Polyak target on lambda transition
+        let polyak_target = if config.distillation_lambda_polyak > 0.0 {
+            Some(self.actor.clone())
+        } else {
+            None
+        };
+
         // 7. Apply all fields atomically
         self.config = config;
         self.surprise_buffer = VecDeque::new();
@@ -795,6 +831,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         self.critic_last_phase_reliable = false;
         self.td_buffer = VecDeque::new();
         self.actor_trace = vec![0.0; trace_len];
+        self.polyak_target = polyak_target;
 
         Ok(())
     }
@@ -853,6 +890,11 @@ impl<L: LinAlg> PcActorCritic<L> {
         let critic_fisher =
             Self::build_fisher_for_layers(&backend, &critic.layers, config.ewc_lambda);
         let new_trace_len = Self::gae_trace_len(&config);
+        let polyak_target = if config.distillation_lambda_polyak > 0.0 {
+            Some(actor.clone())
+        } else {
+            None
+        };
 
         Ok(Self {
             actor,
@@ -882,6 +924,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             critic_last_phase_reliable: false,
             td_buffer: VecDeque::new(),
             actor_trace: vec![0.0; new_trace_len],
+            polyak_target,
         })
     }
 
@@ -967,6 +1010,11 @@ impl<L: LinAlg> PcActorCritic<L> {
         let (child_actor_decay, child_critic_decay, child_layer_error_ema) =
             Self::compute_decay_factors(&child_config);
         let child_trace_len = Self::gae_trace_len(&child_config);
+        let polyak_target = if child_config.distillation_lambda_polyak > 0.0 {
+            Some(actor.clone())
+        } else {
+            None
+        };
 
         Ok(Self {
             actor,
@@ -996,6 +1044,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             critic_last_phase_reliable: false,
             td_buffer: VecDeque::new(),
             actor_trace: vec![0.0; child_trace_len],
+            polyak_target,
         })
     }
 
@@ -1017,6 +1066,11 @@ impl<L: LinAlg> PcActorCritic<L> {
         let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
             Self::compute_decay_factors(&config);
         let parts_trace_len = Self::gae_trace_len(&config);
+        let polyak_target = if config.distillation_lambda_polyak > 0.0 {
+            Some(actor.clone())
+        } else {
+            None
+        };
         Self {
             actor,
             critic,
@@ -1045,6 +1099,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             critic_last_phase_reliable: false,
             td_buffer: VecDeque::new(),
             actor_trace: vec![0.0; parts_trace_len],
+            polyak_target,
         }
     }
 
@@ -1594,6 +1649,25 @@ impl<L: LinAlg> PcActorCritic<L> {
         let s_scale = self.effective_actor_scale(infer.surprise_score);
         let actor_decay = self.effective_actor_decay();
 
+        // KL_polyak gradient: inject distillation signal into delta before weight update.
+        // Conditions: lambda > 0, polyak_target allocated, actor not frozen, >1 valid action.
+        let effective_delta: Vec<f64> = if self.config.distillation_lambda_polyak > 0.0
+            && self.polyak_target.is_some()
+            && valid_actions.len() > 1
+            && !self.is_actor_frozen()
+        {
+            let g_kl_full = self.compute_kl_polyak_gradient(input, y_conv_vec, valid_actions);
+            let lambda = self.config.distillation_lambda_polyak;
+            delta
+                .iter()
+                .zip(g_kl_full.iter())
+                .map(|(&d, &g)| d + lambda * g)
+                .collect()
+        } else {
+            delta.to_vec()
+        };
+        let delta = &effective_delta;
+
         // Fisher EMA accumulation and EWC correction (M4)
         if self.config.ewc_lambda > 0.0 && !self.actor_fisher.is_empty() {
             // Step 2: Extract per-layer gradients for Fisher EMA (read-only)
@@ -1632,6 +1706,13 @@ impl<L: LinAlg> PcActorCritic<L> {
         } else {
             self.actor
                 .update_weights(delta, infer, input, s_scale, &actor_decay);
+        }
+
+        // Polyak target update: AFTER actor weights are updated.
+        if let Some(ref mut polyak) = self.polyak_target {
+            // polyak_update_from cannot fail here — topology is guaranteed identical
+            // because polyak_target is always cloned from self.actor.
+            let _ = polyak.polyak_update_from(&self.actor, self.config.polyak_tau);
         }
 
         // Update per-layer prediction error EMA for adaptive consolidation (M3b)
@@ -2070,6 +2151,108 @@ impl<L: LinAlg> PcActorCritic<L> {
         } else {
             self.actor_decay_factors.clone()
         }
+    }
+
+    /// Returns `true` if the actor is in FROZEN hysteresis state.
+    ///
+    /// When hysteresis is disabled (`None`), returns `false` (always plastic).
+    fn is_actor_frozen(&self) -> bool {
+        matches!(
+            &self.actor_hysteresis,
+            Some(h) if h.state == PlasticityState::Frozen
+        )
+    }
+
+    /// Computes the KL divergence gradient from the live actor toward the
+    /// Polyak-averaged target, using log-softmax for numerical stability.
+    ///
+    /// Returns a full-action-space gradient vector where:
+    /// - Valid action indices contain `g_kl[i] = π_live[i] * (log π_live[i] - log π_target[i] - KL)`.
+    /// - Invalid action indices are zero.
+    ///
+    /// The gradient points in the direction that increases KL(π_live || π_target),
+    /// so the caller adds `+lambda * g_kl` to the policy gradient delta (which
+    /// is a descent direction in the minimization convention used here).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `polyak_target` is `None` (caller must check).
+    fn compute_kl_polyak_gradient(
+        &self,
+        input: &[f64],
+        y_conv_vec: &[f64],
+        valid_actions: &[usize],
+    ) -> Vec<f64> {
+        let polyak = self
+            .polyak_target
+            .as_ref()
+            .expect("polyak_target must be Some");
+        let n_actions = y_conv_vec.len();
+        let temp = self.actor.config.temperature;
+
+        // Live logits scaled by temperature
+        let live_logits: Vec<f64> = valid_actions
+            .iter()
+            .map(|&i| y_conv_vec[i] / temp)
+            .collect();
+
+        // Forward pass through polyak target to get target logits
+        let polyak_infer = polyak.infer(input);
+        let polyak_y_conv = self.backend.vec_to_vec(&polyak_infer.y_conv);
+        let target_logits: Vec<f64> = valid_actions
+            .iter()
+            .map(|&i| polyak_y_conv[i] / temp)
+            .collect();
+
+        // log_softmax for live and target (numerically stable)
+        let max_live = live_logits
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let max_target = target_logits
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let lse_live = live_logits
+            .iter()
+            .map(|&x| (x - max_live).exp())
+            .sum::<f64>()
+            .ln()
+            + max_live;
+        let lse_target = target_logits
+            .iter()
+            .map(|&x| (x - max_target).exp())
+            .sum::<f64>()
+            .ln()
+            + max_target;
+
+        let log_pi_live: Vec<f64> = live_logits.iter().map(|&x| x - lse_live).collect();
+        let log_pi_target: Vec<f64> = target_logits.iter().map(|&x| x - lse_target).collect();
+        let pi_live: Vec<f64> = log_pi_live.iter().map(|&lp| lp.exp()).collect();
+
+        // KL(π_live || π_target) = Σ_i π_live[i] * (log π_live[i] - log π_target[i])
+        let kl_value: f64 = pi_live
+            .iter()
+            .zip(log_pi_live.iter())
+            .zip(log_pi_target.iter())
+            .map(|((&p, &lp), &lq)| p * (lp - lq))
+            .sum();
+
+        // g_kl[i] = π_live[i] * (log π_live[i] - log π_target[i] - KL)
+        let g_kl: Vec<f64> = pi_live
+            .iter()
+            .zip(log_pi_live.iter())
+            .zip(log_pi_target.iter())
+            .map(|((&p, &lp), &lq)| p * (lp - lq - kl_value))
+            .collect();
+
+        // Scatter back to full action space
+        let mut g_kl_full = vec![0.0; n_actions];
+        for (idx, &a) in valid_actions.iter().enumerate() {
+            g_kl_full[a] = g_kl[idx];
+        }
+        g_kl_full
     }
 
     /// Accumulates Fisher EMA for actor layers from extracted gradients.
@@ -2674,6 +2857,9 @@ mod tests {
             logits_reversal: false,
             td_steps: 0,
             gae_lambda: None,
+            distillation_lambda_polyak: 0.0,
+            polyak_tau: 0.005,
+            distillation_lambda_frozen: 0.0,
         }
     }
 
@@ -3163,6 +3349,9 @@ mod tests {
             logits_reversal: false,
             td_steps: 0,
             gae_lambda: None,
+            distillation_lambda_polyak: 0.0,
+            polyak_tau: 0.005,
+            distillation_lambda_frozen: 0.0,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -4358,6 +4547,9 @@ mod tests {
             logits_reversal: false,
             td_steps: 0,
             gae_lambda: None,
+            distillation_lambda_polyak: 0.0,
+            polyak_tau: 0.005,
+            distillation_lambda_frozen: 0.0,
         }
     }
 
@@ -8369,14 +8561,12 @@ mod tests {
     // ── Polyak target slot + KL_polyak integration tests ────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 4"]
     fn test_polyak_target_allocated_when_lambda_positive() {
         let mut cfg = default_config();
         cfg.distillation_lambda_polyak = 0.1;
         cfg.polyak_tau = 0.005;
         cfg.distillation_lambda_frozen = 0.0;
-        let agent: PcActorCritic =
-            PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
         assert!(
             agent.polyak_target.is_some(),
@@ -8402,14 +8592,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 4"]
     fn test_polyak_target_not_allocated_when_lambda_zero() {
         let mut cfg = default_config();
         cfg.distillation_lambda_polyak = 0.0;
         cfg.polyak_tau = 0.005;
         cfg.distillation_lambda_frozen = 0.0;
-        let agent: PcActorCritic =
-            PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
         assert!(
             agent.polyak_target.is_none(),
@@ -8418,15 +8606,13 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 4"]
     fn test_polyak_target_tracks_live_with_lag() {
         let mut cfg = default_config();
         cfg.distillation_lambda_polyak = 0.1;
         cfg.polyak_tau = 0.01;
         cfg.distillation_lambda_frozen = 0.0;
         cfg.entropy_coeff = 0.0;
-        let mut agent: PcActorCritic =
-            PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
         // Record initial polyak weights
         let polyak_init = agent.polyak_target.as_ref().unwrap().clone();
@@ -8443,8 +8629,12 @@ mod tests {
         // Polyak target should have moved from its initial position
         let polyak_now = agent.polyak_target.as_ref().unwrap();
         let test_state = vec![0.5; 9];
-        let init_logits = agent.backend.vec_to_vec(&polyak_init.infer(&test_state).y_conv);
-        let now_logits = agent.backend.vec_to_vec(&polyak_now.infer(&test_state).y_conv);
+        let init_logits = agent
+            .backend
+            .vec_to_vec(&polyak_init.infer(&test_state).y_conv);
+        let now_logits = agent
+            .backend
+            .vec_to_vec(&polyak_now.infer(&test_state).y_conv);
         let polyak_drift: f64 = init_logits
             .iter()
             .zip(now_logits.iter())
@@ -8452,7 +8642,9 @@ mod tests {
             .fold(0.0_f64, f64::max);
 
         // Polyak target should lag behind live
-        let live_logits = agent.backend.vec_to_vec(&agent.actor.infer(&test_state).y_conv);
+        let live_logits = agent
+            .backend
+            .vec_to_vec(&agent.actor.infer(&test_state).y_conv);
         let live_drift: f64 = init_logits
             .iter()
             .zip(live_logits.iter())
@@ -8470,7 +8662,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 4"]
     fn test_kl_polyak_pulls_live_toward_polyak() {
         // Create agent with strong Polyak distillation
         let mut cfg = default_config();
@@ -8480,8 +8671,7 @@ mod tests {
         cfg.entropy_coeff = 0.0;
         cfg.scale_floor = 1.0; // no surprise scaling — full lr always
         cfg.scale_ceil = 2.0;
-        let mut agent: PcActorCritic =
-            PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
 
         let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
         let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -8527,11 +8717,27 @@ mod tests {
 
     /// Compute KL(live || target) over valid actions using log-softmax.
     fn compute_kl_divergence(live_logits: &[f64], target_logits: &[f64], valid: &[usize]) -> f64 {
-        let max_live = valid.iter().map(|&i| live_logits[i]).fold(f64::NEG_INFINITY, f64::max);
-        let max_target = valid.iter().map(|&i| target_logits[i]).fold(f64::NEG_INFINITY, f64::max);
+        let max_live = valid
+            .iter()
+            .map(|&i| live_logits[i])
+            .fold(f64::NEG_INFINITY, f64::max);
+        let max_target = valid
+            .iter()
+            .map(|&i| target_logits[i])
+            .fold(f64::NEG_INFINITY, f64::max);
 
-        let lse_live: f64 = valid.iter().map(|&i| (live_logits[i] - max_live).exp()).sum::<f64>().ln() + max_live;
-        let lse_target: f64 = valid.iter().map(|&i| (target_logits[i] - max_target).exp()).sum::<f64>().ln() + max_target;
+        let lse_live: f64 = valid
+            .iter()
+            .map(|&i| (live_logits[i] - max_live).exp())
+            .sum::<f64>()
+            .ln()
+            + max_live;
+        let lse_target: f64 = valid
+            .iter()
+            .map(|&i| (target_logits[i] - max_target).exp())
+            .sum::<f64>()
+            .ln()
+            + max_target;
 
         let mut kl = 0.0;
         for &i in valid {

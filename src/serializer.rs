@@ -423,6 +423,9 @@ mod tests {
             logits_reversal: false,
             td_steps: 0,
             gae_lambda: None,
+            distillation_lambda_polyak: 0.0,
+            polyak_tau: 0.005,
+            distillation_lambda_frozen: 0.0,
         }
     }
 

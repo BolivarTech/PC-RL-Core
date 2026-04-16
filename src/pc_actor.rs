@@ -230,7 +230,7 @@ pub enum SelectionMode {
 /// let result = actor.infer(&[0.0; 9]);
 /// assert_eq!(result.y_conv.len(), 9);
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PcActor<L: LinAlg = CpuLinAlg> {
     /// Network layers: hidden_layers.len() + 1 (output layer).
     pub(crate) layers: Vec<Layer<L>>,

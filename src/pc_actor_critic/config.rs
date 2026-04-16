@@ -183,6 +183,12 @@ fn default_gae_lambda() -> Option<f64> {
     None
 }
 
+/// Default Polyak averaging rate for soft target network updates.
+/// Standard SAC/DQN value. Must be in (0.0, 1.0].
+pub fn default_polyak_tau() -> f64 {
+    0.005
+}
+
 /// Configuration for the integrated PC Actor-Critic agent.
 ///
 /// # Examples
@@ -246,6 +252,9 @@ fn default_gae_lambda() -> Option<f64> {
 ///     logits_reversal: false,
 ///     td_steps: 0,
 ///     gae_lambda: None,
+///     distillation_lambda_polyak: 0.0,
+///     polyak_tau: 0.005,
+///     distillation_lambda_frozen: 0.0,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,6 +410,23 @@ pub struct PcActorCriticConfig {
     /// Default: `None` (backward compatible). Recommended: `Some(0.95)` for short episodes.
     #[serde(default = "default_gae_lambda")]
     pub gae_lambda: Option<f64>,
+    /// Strength of KL divergence distillation toward the Polyak-averaged
+    /// target actor. 0.0 (default) disables Polyak distillation entirely
+    /// — no target is allocated. When > 0.0, a slow-moving copy of the actor
+    /// is maintained and its distribution regularizes the live policy gradient.
+    #[serde(default)]
+    pub distillation_lambda_polyak: f64,
+    /// Polyak averaging rate for soft target network updates.
+    /// `target = (1 - tau) * target + tau * live` after each actor weight update.
+    /// Must be in (0.0, 1.0] when `distillation_lambda_polyak > 0`.
+    /// Default: 0.005.
+    #[serde(default = "default_polyak_tau")]
+    pub polyak_tau: f64,
+    /// Strength of KL divergence distillation toward a frozen snapshot actor.
+    /// 0.0 (default) disables frozen distillation entirely.
+    /// Allocated/deallocated by Task 3 (Phase 1 commit 5-6).
+    #[serde(default)]
+    pub distillation_lambda_frozen: f64,
 }
 
 #[cfg(test)]
@@ -498,7 +524,10 @@ mod tests {
         let mut cfg = base_config();
         cfg.distillation_lambda_polyak = -0.1;
         let result = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42);
-        assert!(result.is_err(), "negative distillation_lambda_polyak must be rejected");
+        assert!(
+            result.is_err(),
+            "negative distillation_lambda_polyak must be rejected"
+        );
         match result.unwrap_err() {
             PcError::ConfigValidation(msg) => {
                 assert!(
@@ -533,7 +562,10 @@ mod tests {
         cfg.distillation_lambda_polyak = 0.1;
         cfg.polyak_tau = 0.0;
         let result = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42);
-        assert!(result.is_err(), "polyak_tau=0 with lambda>0 must be rejected");
+        assert!(
+            result.is_err(),
+            "polyak_tau=0 with lambda>0 must be rejected"
+        );
         match result.unwrap_err() {
             PcError::ConfigValidation(msg) => {
                 assert!(
