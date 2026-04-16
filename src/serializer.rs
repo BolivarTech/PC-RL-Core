@@ -178,6 +178,12 @@ pub struct SaveFile {
     /// Continuous learning state (None for legacy/v2.0.0 files).
     #[serde(default)]
     pub cl_state: Option<ClState>,
+    /// Polyak-averaged target actor weights (None when lambda == 0 or legacy file).
+    #[serde(default)]
+    pub polyak_target_weights: Option<PcActorWeights>,
+    /// Frozen champion actor weights (None when lambda == 0 or legacy file).
+    #[serde(default)]
+    pub frozen_champion_weights: Option<PcActorWeights>,
 }
 
 /// Saves the agent's full state to a JSON file.
@@ -214,6 +220,8 @@ pub fn save_agent<L: LinAlg>(
         actor_weights: agent.actor.to_weights(),
         critic_weights: agent.critic.to_weights(),
         cl_state: agent.to_cl_state(),
+        polyak_target_weights: agent.polyak_target.as_ref().map(|a| a.to_weights()),
+        frozen_champion_weights: agent.frozen_champion.as_ref().map(|a| a.to_weights()),
     };
 
     let json = serde_json::to_string_pretty(&save_file)?;
@@ -289,7 +297,43 @@ pub fn load_agent_generic<L: LinAlg>(
     use rand::SeedableRng;
     let rng = rand::rngs::StdRng::from_entropy();
 
-    let mut agent = PcActorCritic::from_parts(save_file.config, actor, critic, rng, backend);
+    let mut agent = PcActorCritic::from_parts(
+        save_file.config.clone(),
+        actor,
+        critic,
+        rng,
+        backend.clone(),
+    );
+
+    // Restore Polyak target: saved weights > legacy clone > None
+    if save_file.config.distillation_lambda_polyak > 0.0 {
+        if let Some(polyak_weights) = save_file.polyak_target_weights {
+            let polyak = PcActor::<L>::from_weights(
+                backend.clone(),
+                save_file.config.actor.clone(),
+                polyak_weights,
+            )?;
+            agent.polyak_target = Some(polyak);
+        }
+        // else: from_parts already cloned actor (legacy compat)
+    } else {
+        agent.polyak_target = None;
+    }
+
+    // Restore frozen champion: saved weights > legacy clone > None
+    if save_file.config.distillation_lambda_frozen > 0.0 {
+        if let Some(frozen_weights) = save_file.frozen_champion_weights {
+            let frozen = PcActor::<L>::from_weights(
+                backend,
+                save_file.config.actor.clone(),
+                frozen_weights,
+            )?;
+            agent.frozen_champion = Some(frozen);
+        }
+        // else: from_parts already cloned actor (legacy compat)
+    } else {
+        agent.frozen_champion = None;
+    }
 
     if let Some(cl_state) = save_file.cl_state {
         agent.restore_cl_state(cl_state);
@@ -1122,7 +1166,7 @@ mod tests {
     // ── Section 08: Distillation anchor serialization ──────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 10"]
+
     fn test_save_load_preserves_polyak_target() {
         use crate::linalg::cpu::CpuLinAlg;
 
@@ -1175,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 10"]
+
     fn test_save_load_preserves_frozen_champion_after_update() {
         use crate::linalg::cpu::CpuLinAlg;
 
@@ -1224,7 +1268,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 10"]
+
     fn test_legacy_save_file_initializes_anchors_from_loaded_actor() {
         use crate::linalg::cpu::CpuLinAlg;
 
@@ -1262,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 1 commit 10"]
+
     fn test_load_drops_orphan_anchor_weights_when_lambda_zero() {
         use crate::linalg::cpu::CpuLinAlg;
 
