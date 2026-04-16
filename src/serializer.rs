@@ -1118,4 +1118,208 @@ mod tests {
 
         let _ = fs::remove_file(&rt_path);
     }
+
+    // ── Section 08: Distillation anchor serialization ──────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 10"]
+    fn test_save_load_preserves_polyak_target() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        let mut config = default_config();
+        config.distillation_lambda_polyak = 0.1;
+        config.polyak_tau = 0.005;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Drift live actor for 100 steps so Polyak diverges from live
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for _ in 0..50 {
+            agent.step(&s1, 0.0, false);
+            agent.step(&s2, 1.0, true);
+        }
+
+        // Polyak target should have diverged from live actor
+        let polyak_w = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+        let live_w = agent.actor.layers[0].weights.data.clone();
+        assert_ne!(
+            polyak_w, live_w,
+            "Polyak must differ from live after training"
+        );
+
+        let path = temp_path("test_polyak_roundtrip.json");
+        save_agent(&agent, &path, 100, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        // Loaded polyak_target must be byte-equal to the saved state
+        let loaded_polyak = loaded
+            .polyak_target
+            .as_ref()
+            .expect("polyak_target must be Some");
+        for (i, (a, b)) in polyak_w
+            .iter()
+            .zip(loaded_polyak.layers[0].weights.data.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-15,
+                "polyak_target weight[{i}] differs: {a} vs {b}"
+            );
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 10"]
+    fn test_save_load_preserves_frozen_champion_after_update() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        let mut config = default_config();
+        config.distillation_lambda_frozen = 0.1;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Drift live actor so frozen will differ from initial
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for _ in 0..30 {
+            agent.step(&s1, 0.0, false);
+            agent.step(&s2, 1.0, true);
+        }
+
+        // Call champion_update to snapshot the trained live actor
+        agent.champion_update().unwrap();
+
+        let frozen_w = agent.frozen_champion.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+
+        let path = temp_path("test_frozen_champion_roundtrip.json");
+        save_agent(&agent, &path, 200, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        // Loaded frozen_champion must match the post-update state
+        let loaded_frozen = loaded
+            .frozen_champion
+            .as_ref()
+            .expect("frozen_champion must be Some");
+        for (i, (a, b)) in frozen_w
+            .iter()
+            .zip(loaded_frozen.layers[0].weights.data.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-15,
+                "frozen_champion weight[{i}] differs: {a} vs {b}"
+            );
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 10"]
+    fn test_legacy_save_file_initializes_anchors_from_loaded_actor() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        // Create an agent without distillation, save it (mimics pre-distillation save)
+        let agent = make_agent();
+        let path = temp_path("test_legacy_anchor_init.json");
+        save_agent(&agent, &path, 50, None).unwrap();
+
+        // Tamper: set both lambdas > 0 in the saved config
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut save_file: SaveFile = serde_json::from_str(&json_str).unwrap();
+        save_file.config.distillation_lambda_polyak = 0.05;
+        save_file.config.distillation_lambda_frozen = 0.05;
+        let tampered = serde_json::to_string_pretty(&save_file).unwrap();
+        fs::write(&path, tampered).unwrap();
+
+        // Load — anchors must auto-initialize from the loaded actor
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        let loaded_actor_w = &loaded.actor.layers[0].weights.data;
+        let polyak = loaded
+            .polyak_target
+            .as_ref()
+            .expect("polyak_target must be Some for lambda > 0");
+        let frozen = loaded
+            .frozen_champion
+            .as_ref()
+            .expect("frozen_champion must be Some for lambda > 0");
+
+        // Both anchors must be copies of the loaded actor
+        assert_vecs_approx_eq(loaded_actor_w, &polyak.layers[0].weights.data);
+        assert_vecs_approx_eq(loaded_actor_w, &frozen.layers[0].weights.data);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    #[ignore = "Red: requires Phase 1 commit 10"]
+    fn test_load_drops_orphan_anchor_weights_when_lambda_zero() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        // Create agent with both lambdas > 0, train to populate non-trivial anchors
+        let mut config = default_config();
+        config.distillation_lambda_polyak = 0.1;
+        config.polyak_tau = 0.005;
+        config.distillation_lambda_frozen = 0.1;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for _ in 0..50 {
+            agent.step(&s1, 0.0, false);
+            agent.step(&s2, 1.0, true);
+        }
+
+        // Save with anchors populated
+        let path = temp_path("test_orphan_anchor_drop.json");
+        save_agent(&agent, &path, 300, None).unwrap();
+
+        // Tamper: set both lambdas to 0 in the saved JSON
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        json["config"]["distillation_lambda_polyak"] = serde_json::json!(0.0);
+        json["config"]["distillation_lambda_frozen"] = serde_json::json!(0.0);
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        // Load — anchors must be None despite anchor weights in file
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+        assert!(
+            loaded.polyak_target.is_none(),
+            "polyak_target must be None when lambda == 0"
+        );
+        assert!(
+            loaded.frozen_champion.is_none(),
+            "frozen_champion must be None when lambda == 0"
+        );
+
+        // Re-save and verify no anchor weights are serialized
+        let resave_path = temp_path("test_orphan_anchor_resave.json");
+        save_agent(&loaded, &resave_path, 301, None).unwrap();
+        let resave_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&resave_path).unwrap()).unwrap();
+        assert!(
+            resave_json.get("polyak_target_weights").is_none()
+                || resave_json["polyak_target_weights"].is_null(),
+            "Re-saved file must not contain polyak_target_weights"
+        );
+        assert!(
+            resave_json.get("frozen_champion_weights").is_none()
+                || resave_json["frozen_champion_weights"].is_null(),
+            "Re-saved file must not contain frozen_champion_weights"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&resave_path);
+    }
 }
