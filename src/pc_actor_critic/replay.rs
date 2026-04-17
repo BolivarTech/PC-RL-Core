@@ -16,6 +16,7 @@
 //! back to the non-empty compartment when one is empty.
 
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
@@ -60,13 +61,11 @@ pub struct ReplayTransition {
 pub struct ReplayBuffer {
     /// Sealed successful trajectories collected during the training phase.
     pub training_memories: VecDeque<ReplayTransition>,
-    /// Maximum size of `training_memories` (populated in commit 14).
-    #[allow(dead_code)]
+    /// Maximum size of `training_memories`.
     training_capacity: usize,
     /// Rolling window of post-seal transitions.
     pub recent_memories: VecDeque<ReplayTransition>,
-    /// Maximum size of `recent_memories` (populated in commit 14).
-    #[allow(dead_code)]
+    /// Maximum size of `recent_memories`.
     recent_capacity: usize,
     /// `true` until [`ReplayBuffer::seal_training_memories`] is called.
     pub training_phase: bool,
@@ -87,8 +86,14 @@ impl ReplayBuffer {
     ///
     /// A buffer with `training_phase = true` and both compartments empty.
     pub fn new(training_capacity: usize, recent_capacity: usize, positive_only: bool) -> Self {
-        let _ = (training_capacity, recent_capacity, positive_only);
-        todo!("Implemented in commit 14")
+        Self {
+            training_memories: VecDeque::with_capacity(training_capacity),
+            training_capacity,
+            recent_memories: VecDeque::with_capacity(recent_capacity),
+            recent_capacity,
+            training_phase: true,
+            positive_only,
+        }
     }
 
     /// Insert a transition into the active compartment.
@@ -96,8 +101,28 @@ impl ReplayBuffer {
     /// Routing depends on `training_phase`: `true` → `training_memories`,
     /// `false` → `recent_memories`. Applies the `positive_only` filter and
     /// evicts the oldest entry when the target compartment is at capacity.
-    pub fn push(&mut self, _transition: ReplayTransition) {
-        todo!("Implemented in commit 14")
+    pub fn push(&mut self, transition: ReplayTransition) {
+        // positive_only filter: silently drop non-positive rewards.
+        if self.positive_only && transition.reward <= 0.0 {
+            return;
+        }
+        if self.training_phase {
+            // Training compartment (A): accept up to capacity, then drop.
+            // Training memories are immutable once accumulated — no eviction.
+            if self.training_memories.len() >= self.training_capacity {
+                return;
+            }
+            self.training_memories.push_back(transition);
+        } else {
+            // Recent compartment (B): FIFO eviction when at capacity.
+            if self.recent_capacity == 0 {
+                return;
+            }
+            if self.recent_memories.len() >= self.recent_capacity {
+                self.recent_memories.pop_front();
+            }
+            self.recent_memories.push_back(transition);
+        }
     }
 
     /// Transition from the training phase to the recent-memory phase.
@@ -106,7 +131,7 @@ impl ReplayBuffer {
     /// calls land in `recent_memories`. `training_memories` is preserved
     /// read-only.
     pub fn seal_training_memories(&mut self) {
-        todo!("Implemented in commit 14")
+        self.training_phase = false;
     }
 
     /// Draw up to `batch_size` transitions from both compartments.
@@ -125,13 +150,46 @@ impl ReplayBuffer {
     ///
     /// A `Vec<ReplayTransition>` of length `min(batch_size, total_len())`
     /// or empty if the buffer is empty.
-    pub fn sample(&self, _batch_size: usize, _rng: &mut StdRng) -> Vec<ReplayTransition> {
-        todo!("Implemented in commit 14")
+    pub fn sample(&self, batch_size: usize, rng: &mut StdRng) -> Vec<ReplayTransition> {
+        let a_len = self.training_memories.len();
+        let b_len = self.recent_memories.len();
+        if (a_len == 0 && b_len == 0) || batch_size == 0 {
+            return Vec::new();
+        }
+        let target_a = batch_size / 2;
+        let target_b = batch_size - target_a;
+        // Fallback: if one compartment is empty, take the full batch from the other.
+        let (actual_a, actual_b) = match (a_len, b_len) {
+            (0, _) => (0, batch_size),
+            (_, 0) => (batch_size, 0),
+            _ => (target_a, target_b),
+        };
+        // Respect actual compartment sizes (cannot draw more than len).
+        let actual_a = actual_a.min(a_len);
+        let actual_b = actual_b.min(b_len);
+        let mut out = Vec::with_capacity(actual_a + actual_b);
+        // Draw from A (training) without replacement.
+        if actual_a > 0 {
+            let mut indices: Vec<usize> = (0..a_len).collect();
+            indices.shuffle(rng);
+            for &i in indices.iter().take(actual_a) {
+                out.push(self.training_memories[i].clone());
+            }
+        }
+        // Draw from B (recent) without replacement.
+        if actual_b > 0 {
+            let mut indices: Vec<usize> = (0..b_len).collect();
+            indices.shuffle(rng);
+            for &i in indices.iter().take(actual_b) {
+                out.push(self.recent_memories[i].clone());
+            }
+        }
+        out
     }
 
     /// Total number of stored transitions across both compartments.
     pub fn total_len(&self) -> usize {
-        todo!("Implemented in commit 14")
+        self.training_memories.len() + self.recent_memories.len()
     }
 }
 
@@ -154,7 +212,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 14"]
     fn test_replay_buffer_empty_sample_returns_empty() {
         let buf = ReplayBuffer::new(100, 50, true);
         let mut rng = StdRng::seed_from_u64(42);
@@ -163,7 +220,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 14"]
     fn test_replay_buffer_push_respects_training_phase() {
         let mut buf = ReplayBuffer::new(100, 50, false);
         assert!(buf.training_phase);
@@ -183,7 +239,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 14"]
     fn test_replay_buffer_positive_only_filter() {
         let mut buf = ReplayBuffer::new(100, 50, true);
 
@@ -195,7 +250,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 14"]
     fn test_replay_buffer_fifo_eviction_recent_compartment() {
         let mut buf = ReplayBuffer::new(100, 3, false);
         buf.seal_training_memories();
@@ -217,7 +271,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 14"]
     fn test_replay_buffer_seal_routes_new_pushes_to_recent() {
         let mut buf = ReplayBuffer::new(100, 50, false);
 
@@ -234,7 +287,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 14"]
     fn test_replay_buffer_sample_50_50_split() {
         let mut buf = ReplayBuffer::new(100, 100, false);
 
@@ -266,7 +318,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 14"]
     fn test_replay_buffer_sample_fallback_when_one_empty() {
         // A-only: training compartment populated, recent empty.
         let mut buf_a = ReplayBuffer::new(200, 200, false);
@@ -297,7 +348,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 14"]
     fn test_replay_buffer_serialization_round_trip() {
         let mut buf = ReplayBuffer::new(10, 5, true);
 
