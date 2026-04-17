@@ -464,9 +464,10 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
 
         // Validate Polyak distillation parameters
-        if config.distillation_lambda_polyak < 0.0 {
+        if !config.distillation_lambda_polyak.is_finite() || config.distillation_lambda_polyak < 0.0
+        {
             return Err(PcError::ConfigValidation(format!(
-                "distillation_lambda_polyak must be >= 0.0, got {}",
+                "distillation_lambda_polyak must be finite and >= 0.0, got {}",
                 config.distillation_lambda_polyak
             )));
         }
@@ -481,9 +482,10 @@ impl<L: LinAlg> PcActorCritic<L> {
                 "polyak_tau must be > 0.0 when distillation_lambda_polyak > 0".to_string(),
             ));
         }
-        if config.distillation_lambda_frozen < 0.0 {
+        if !config.distillation_lambda_frozen.is_finite() || config.distillation_lambda_frozen < 0.0
+        {
             return Err(PcError::ConfigValidation(format!(
-                "distillation_lambda_frozen must be >= 0.0, got {}",
+                "distillation_lambda_frozen must be finite and >= 0.0, got {}",
                 config.distillation_lambda_frozen
             )));
         }
@@ -2315,6 +2317,14 @@ impl<L: LinAlg> PcActorCritic<L> {
         for (idx, &a) in valid_actions.iter().enumerate() {
             g_kl_full[a] = g_kl[idx];
         }
+
+        // NaN/Inf defense-in-depth (MAGI gate A — Caspar W1): if any
+        // element is non-finite (e.g., from corrupted logits), fall back
+        // to zero gradient rather than propagating NaN into weights.
+        if g_kl_full.iter().any(|v| !v.is_finite()) {
+            return vec![0.0; n_actions];
+        }
+
         g_kl_full
     }
 
