@@ -189,6 +189,16 @@ pub fn default_polyak_tau() -> f64 {
     0.005
 }
 
+/// Default positive-reward-only filter flag for the replay buffer.
+fn default_replay_positive_only() -> bool {
+    true
+}
+
+/// Default batch size for each `replay_learn()` call.
+fn default_replay_batch_size() -> usize {
+    64
+}
+
 /// Configuration for the integrated PC Actor-Critic agent.
 ///
 /// # Examples
@@ -255,6 +265,10 @@ pub fn default_polyak_tau() -> f64 {
 ///     distillation_lambda_polyak: 0.0,
 ///     polyak_tau: 0.005,
 ///     distillation_lambda_frozen: 0.0,
+///     replay_training_capacity: 0,
+///     replay_recent_capacity: 0,
+///     replay_positive_only: true,
+///     replay_batch_size: 64,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +441,20 @@ pub struct PcActorCriticConfig {
     /// Allocated/deallocated by Task 3 (Phase 1 commit 5-6).
     #[serde(default)]
     pub distillation_lambda_frozen: f64,
+    /// Capacity of the training-phase replay compartment.
+    /// 0 disables the replay buffer entirely. Default: 0.
+    #[serde(default)]
+    pub replay_training_capacity: usize,
+    /// Capacity of the recent-stress replay compartment.
+    /// 0 disables stress-phase recording. Default: 0.
+    #[serde(default)]
+    pub replay_recent_capacity: usize,
+    /// If true, only transitions with reward > 0 are stored. Default: true.
+    #[serde(default = "default_replay_positive_only")]
+    pub replay_positive_only: bool,
+    /// Batch size for each `replay_learn()` call. Default: 64.
+    #[serde(default = "default_replay_batch_size")]
+    pub replay_batch_size: usize,
 }
 
 #[cfg(test)]
@@ -508,6 +536,10 @@ mod tests {
             distillation_lambda_polyak: 0.0,
             polyak_tau: 0.005,
             distillation_lambda_frozen: 0.0,
+            replay_training_capacity: 0,
+            replay_recent_capacity: 0,
+            replay_positive_only: true,
+            replay_batch_size: 64,
         }
     }
 

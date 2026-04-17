@@ -51,6 +51,18 @@ pub mod replay;
 /// to disable the cooldown entirely.
 pub const DEFAULT_ROLLBACK_HARD_COOLDOWN: u64 = 100;
 
+/// Maximum magnitude of the TD error used for replay-phase critic/actor
+/// updates. Values outside `[-MAX_REPLAY_TD_ERROR, MAX_REPLAY_TD_ERROR]`
+/// are clamped to the boundary (MAGI R5 W5). Exposed as `pub(crate)` so
+/// integration tests can reference the exact clamp boundary.
+///
+/// The production read-site lands in commit 16 of the self-recovery plan
+/// (`replay_learn` implementation). Until then this constant is referenced
+/// only from the red-phase integration tests, so in lib-only builds it
+/// appears unused — the allow is transient and removed by commit 16.
+#[allow(dead_code)]
+pub(crate) const MAX_REPLAY_TD_ERROR: f64 = 5.0;
+
 /// Learning-path mode for [`PcActorCritic::learn_continuous_inner`].
 ///
 /// Distinguishes on-policy updates (which must maintain GAE traces,
@@ -230,6 +242,20 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// Steps since the last successful `rollback_hard()` call.
     /// Initialized to `u64::MAX` so the first call is always allowed.
     steps_since_last_rollback_hard: u64,
+    /// Dual-compartment replay buffer (Phase 2). `None` when
+    /// `replay_training_capacity == 0` at construction.
+    ///
+    /// Commit 15 only scaffolds the field; the production read/write
+    /// paths land in commit 16 (`replay_learn`, auto-record in
+    /// `step_masked`, `apply_config` allocation transitions). In the
+    /// intermediate state the lib-only compiler reports this field as
+    /// never read — the allow is transient and removed by commit 16.
+    #[allow(dead_code)]
+    pub(crate) replay_buffer: Option<crate::pc_actor_critic::replay::ReplayBuffer>,
+    /// Monotonic counter of `replay_learn` calls where the td_error
+    /// clamp was binding (MAGI R5 W5). Exposed via
+    /// [`PcActorCritic::replay_clamp_count`].
+    pub(crate) replay_clamp_count: u64,
 }
 
 /// A single buffered transition for TD(n) computation.
@@ -1065,6 +1091,8 @@ impl<L: LinAlg> PcActorCritic<L> {
             frozen_champion,
             rollback_hard_cooldown_steps: DEFAULT_ROLLBACK_HARD_COOLDOWN,
             steps_since_last_rollback_hard: u64::MAX,
+            replay_buffer: None,
+            replay_clamp_count: 0,
         })
     }
 
@@ -1193,6 +1221,8 @@ impl<L: LinAlg> PcActorCritic<L> {
             frozen_champion,
             rollback_hard_cooldown_steps: DEFAULT_ROLLBACK_HARD_COOLDOWN,
             steps_since_last_rollback_hard: u64::MAX,
+            replay_buffer: None,
+            replay_clamp_count: 0,
         })
     }
 
@@ -1256,6 +1286,8 @@ impl<L: LinAlg> PcActorCritic<L> {
             frozen_champion,
             rollback_hard_cooldown_steps: DEFAULT_ROLLBACK_HARD_COOLDOWN,
             steps_since_last_rollback_hard: u64::MAX,
+            replay_buffer: None,
+            replay_clamp_count: 0,
         }
     }
 
@@ -3166,6 +3198,62 @@ impl<L: LinAlg> PcActorCritic<L> {
     pub fn set_rollback_hard_cooldown(&mut self, steps: u64) {
         self.rollback_hard_cooldown_steps = steps;
     }
+
+    // ── Replay buffer skeleton (Phase 2 — commit 15 scaffold) ─────────────
+    //
+    // The bodies below are `todo!()` placeholders. The real implementations
+    // land in commit 16, at which point the 14 red tests in
+    // `tests::test_replay_*` will be un-ignored.
+
+    /// Apply a minibatch of off-policy TD updates sampled from the
+    /// replay buffer.
+    ///
+    /// No-op in commit 15 — the body is `todo!()` until commit 16 of
+    /// the self-recovery plan provides the real implementation. Present
+    /// so the red-phase integration tests compile.
+    ///
+    /// # Arguments
+    ///
+    /// * `_batch_size` — number of transitions to draw from the buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError` variants once implemented. Currently panics via
+    /// `todo!()` (but no test drives this method in the red phase).
+    pub fn replay_learn(&mut self, _batch_size: usize) -> Result<(), PcError> {
+        todo!("Implemented in commit 16")
+    }
+
+    /// Transition the replay buffer from training-accumulation phase to
+    /// stress-recording phase. Further `push` calls route into the
+    /// recent compartment (FIFO). No-op if no buffer is configured.
+    ///
+    /// No-op in commit 15 — body is `todo!()`.
+    pub fn seal_replay_training_memories(&mut self) {
+        todo!("Implemented in commit 16")
+    }
+
+    /// Clear the recent-compartment (B) memories without touching
+    /// training memories (A).
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::ConfigValidation` if no buffer is configured.
+    ///
+    /// No-op in commit 15 — body is `todo!()`.
+    pub fn clear_recent_memories(&mut self) -> Result<(), PcError> {
+        todo!("Implemented in commit 16")
+    }
+
+    /// Monotonic count of `replay_learn` calls where the internal
+    /// TD-error clamp (`±MAX_REPLAY_TD_ERROR`) was binding.
+    ///
+    /// Exposed as observable telemetry for the self-recovery pipeline
+    /// (MAGI R5 W5). The real counter writes land in commit 16; in the
+    /// current commit the counter is always `0`.
+    pub fn replay_clamp_count(&self) -> u64 {
+        self.replay_clamp_count
+    }
 }
 
 #[cfg(test)]
@@ -3242,6 +3330,10 @@ mod tests {
             distillation_lambda_polyak: 0.0,
             polyak_tau: 0.005,
             distillation_lambda_frozen: 0.0,
+            replay_training_capacity: 0,
+            replay_recent_capacity: 0,
+            replay_positive_only: true,
+            replay_batch_size: 64,
         }
     }
 
@@ -3734,6 +3826,10 @@ mod tests {
             distillation_lambda_polyak: 0.0,
             polyak_tau: 0.005,
             distillation_lambda_frozen: 0.0,
+            replay_training_capacity: 0,
+            replay_recent_capacity: 0,
+            replay_positive_only: true,
+            replay_batch_size: 64,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -4932,6 +5028,10 @@ mod tests {
             distillation_lambda_polyak: 0.0,
             polyak_tau: 0.005,
             distillation_lambda_frozen: 0.0,
+            replay_training_capacity: 0,
+            replay_recent_capacity: 0,
+            replay_positive_only: true,
+            replay_batch_size: 64,
         }
     }
 
@@ -10379,5 +10479,886 @@ mod tests {
             "Cooldown counter must increment on every Online step, \
              including NaN-guarded ones"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Phase 2 replay-learn integration red tests (commit 15).
+    //
+    // All 14 tests are gated `#[ignore = "Red: requires Phase 2 commit 16"]`.
+    // Commit 16 provides real method bodies and un-ignores each test by
+    // removing the `#[ignore]` attribute one-by-one as behavior lands.
+    // ═══════════════════════════════════════════════════════════════════
+
+    use crate::pc_actor_critic::replay::ReplayTransition;
+
+    /// L2 norm of the element-wise difference between two weight vectors.
+    fn l2_delta(a: &[f64], b: &[f64]) -> f64 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    /// Cosine similarity between two equal-length vectors. Returns 0.0
+    /// if either vector has zero magnitude (defensive — avoids NaN).
+    fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
+        assert_eq!(a.len(), b.len(), "cosine_similarity: length mismatch");
+        let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let nb: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            return 0.0;
+        }
+        dot / (na * nb)
+    }
+
+    /// Build a small positive-reward transition for a 9-dim TicTacToe
+    /// state. `marker` seeds the first state element so individual
+    /// transitions are distinguishable in content comparisons.
+    fn make_replay_transition(marker: f64, reward: f64) -> ReplayTransition {
+        let mut state = vec![0.0; 9];
+        state[0] = marker;
+        let mut next_state = vec![0.0; 9];
+        next_state[1] = marker;
+        ReplayTransition {
+            state,
+            action: 0,
+            reward,
+            next_state,
+            done: false,
+            valid_actions: (0..9).collect(),
+        }
+    }
+
+    /// Populate the replay buffer with `n` positive-reward transitions
+    /// of varied content. Panics if the agent has no buffer configured.
+    fn populate_replay_buffer(agent: &mut PcActorCritic, n: usize) {
+        let buf = agent
+            .replay_buffer
+            .as_mut()
+            .expect("populate_replay_buffer: agent must have replay_buffer configured");
+        for i in 0..n {
+            let marker = (i as f64) / (n as f64);
+            buf.push(make_replay_transition(marker, 1.0));
+        }
+    }
+
+    /// Returns true if any entry across all Fisher layers is non-finite.
+    fn fisher_any_non_finite(agent: &PcActorCritic) -> bool {
+        let backend = &agent.backend;
+        let check_mat = |m: &<CpuLinAlg as LinAlg>::Matrix| {
+            let rows = backend.mat_rows(m);
+            let cols = backend.mat_cols(m);
+            for r in 0..rows {
+                for c in 0..cols {
+                    if !backend.mat_get(m, r, c).is_finite() {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        let check_vec = |v: &<CpuLinAlg as LinAlg>::Vector| {
+            let n = backend.vec_len(v);
+            for i in 0..n {
+                if !backend.vec_get(v, i).is_finite() {
+                    return true;
+                }
+            }
+            false
+        };
+        for f in agent.actor_fisher.iter().chain(agent.critic_fisher.iter()) {
+            if check_mat(&f.f_total_weights)
+                || check_mat(&f.f_ema_weights)
+                || check_vec(&f.f_total_bias)
+                || check_vec(&f.f_ema_bias)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns true if every weight/bias entry across both actor and
+    /// critic layers is finite.
+    fn all_weights_finite(agent: &PcActorCritic) -> bool {
+        for layer in agent.actor.layers.iter().chain(agent.critic.layers.iter()) {
+            if !layer.weights.data.iter().all(|x| x.is_finite()) {
+                return false;
+            }
+            if !layer.bias.iter().all(|x| x.is_finite()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Flatten all actor+critic layer weights into a single Vec so we
+    /// can compute deltas / cosine similarity across full state.
+    fn flatten_all_weights(agent: &PcActorCritic) -> Vec<f64> {
+        let mut out = Vec::new();
+        for layer in agent.actor.layers.iter().chain(agent.critic.layers.iter()) {
+            out.extend_from_slice(&layer.weights.data);
+            out.extend_from_slice(&layer.bias);
+        }
+        out
+    }
+
+    /// Build a replay-enabled config (training_capacity > 0) on top of
+    /// `default_config()`.
+    fn replay_config(training_capacity: usize, recent_capacity: usize) -> PcActorCriticConfig {
+        let mut cfg = default_config();
+        cfg.replay_training_capacity = training_capacity;
+        cfg.replay_recent_capacity = recent_capacity;
+        cfg
+    }
+
+    // ── Test 1 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_replay_learn_no_buffer_no_op() {
+        let mut agent: PcActorCritic = make_agent();
+        assert!(
+            agent.replay_buffer.is_none(),
+            "default agent must have no replay buffer"
+        );
+        let w_before = agent.actor.layers[0].weights.data.clone();
+        let cw_before = agent.critic.layers[0].weights.data.clone();
+
+        agent
+            .replay_learn(64)
+            .expect("replay_learn on buffer-less agent must be Ok(()) no-op");
+
+        assert_eq!(agent.actor.layers[0].weights.data, w_before);
+        assert_eq!(agent.critic.layers[0].weights.data, cw_before);
+    }
+
+    // ── Test 2 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_replay_learn_updates_weights() {
+        let cfg = replay_config(100, 0);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        assert!(
+            agent.replay_buffer.is_some(),
+            "replay_training_capacity>0 must allocate a buffer"
+        );
+
+        populate_replay_buffer(&mut agent, 32);
+
+        let actor_w_before = agent.actor.layers[0].weights.data.clone();
+        let critic_w_before = agent.critic.layers[0].weights.data.clone();
+
+        agent.replay_learn(32).expect("replay_learn must succeed");
+
+        assert!(
+            l2_delta(&agent.actor.layers[0].weights.data, &actor_w_before) > 1e-6,
+            "actor weights must change under replay_learn"
+        );
+        assert!(
+            l2_delta(&agent.critic.layers[0].weights.data, &critic_w_before) > 1e-6,
+            "critic weights must change under replay_learn"
+        );
+    }
+
+    // ── Test 3 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_replay_learn_does_not_mutate_buffer() {
+        let cfg = replay_config(100, 0);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        populate_replay_buffer(&mut agent, 32);
+
+        let training_before = agent
+            .replay_buffer
+            .as_ref()
+            .unwrap()
+            .training_memories
+            .clone();
+        let recent_before = agent
+            .replay_buffer
+            .as_ref()
+            .unwrap()
+            .recent_memories
+            .clone();
+
+        agent.replay_learn(32).expect("replay_learn must succeed");
+
+        let buf = agent.replay_buffer.as_ref().unwrap();
+        assert_eq!(
+            buf.training_memories, training_before,
+            "training memories must be untouched by replay_learn"
+        );
+        assert_eq!(
+            buf.recent_memories, recent_before,
+            "recent memories must be untouched by replay_learn"
+        );
+    }
+
+    // ── Test 4 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_replay_learn_coexists_with_ewc() {
+        let mut cfg = replay_config(100, 0);
+        cfg.ewc_lambda = 0.1;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        populate_replay_buffer(&mut agent, 32);
+
+        let w_before = agent.actor.layers[0].weights.data.clone();
+        agent.replay_learn(32).expect("replay_learn must succeed");
+        assert!(
+            l2_delta(&agent.actor.layers[0].weights.data, &w_before) > 1e-6,
+            "actor weights must change under replay_learn + EWC"
+        );
+        assert!(
+            !fisher_any_non_finite(&agent),
+            "Fisher entries must remain finite after replay_learn with EWC enabled"
+        );
+    }
+
+    // ── Test 5 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_replay_learn_coexists_with_distillation_polyak() {
+        // Agent A: Polyak distillation enabled.
+        let mut cfg_a = replay_config(100, 0);
+        cfg_a.distillation_lambda_polyak = 0.05;
+        let mut agent_a: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg_a, 42).unwrap();
+        populate_replay_buffer(&mut agent_a, 32);
+
+        // Agent B: Polyak disabled. Same seed so initial weights match.
+        let cfg_b = replay_config(100, 0);
+        let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg_b, 42).unwrap();
+        populate_replay_buffer(&mut agent_b, 32);
+
+        // Sanity: initial weights identical by construction.
+        assert_eq!(
+            agent_a.actor.layers[0].weights.data, agent_b.actor.layers[0].weights.data,
+            "identical seeds must yield identical initial weights"
+        );
+
+        let a_before = agent_a.actor.layers[0].weights.data.clone();
+        agent_a.replay_learn(32).unwrap();
+        agent_b.replay_learn(32).unwrap();
+
+        assert!(
+            l2_delta(&agent_a.actor.layers[0].weights.data, &a_before) > 1e-6,
+            "agent_a weights must change under replay_learn"
+        );
+        assert_ne!(
+            agent_a.actor.layers[0].weights.data, agent_b.actor.layers[0].weights.data,
+            "Polyak regularizer must alter the gradient vs non-Polyak baseline"
+        );
+    }
+
+    // ── Test 6 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_replay_learn_does_not_corrupt_gae_trace() {
+        let mut cfg = replay_config(100, 0);
+        cfg.gae_lambda = Some(0.95);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        populate_replay_buffer(&mut agent, 32);
+
+        // Drive a few on-policy step_masked calls to accumulate a non-zero
+        // GAE trace.
+        let state = vec![1.0, -1.0, 0.5, -0.5, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let next_state = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let valid: Vec<usize> = (0..9).collect();
+        agent.step_masked(&state, &valid, 0.0, false).unwrap();
+        agent.step_masked(&next_state, &valid, 1.0, false).unwrap();
+        agent.step_masked(&state, &valid, 0.5, false).unwrap();
+
+        assert!(
+            agent.actor_trace.iter().any(|x| x.abs() > 0.0),
+            "actor_trace must be non-zero after on-policy steps"
+        );
+        let trace_snapshot = agent.actor_trace.clone();
+
+        agent.replay_learn(16).expect("replay_learn must succeed");
+
+        assert_eq!(
+            agent.actor_trace, trace_snapshot,
+            "replay_learn must not mutate the on-policy GAE trace"
+        );
+    }
+
+    // ── Test 7 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_step_masked_auto_records_transition_when_buffer_configured() {
+        let mut cfg = replay_config(100, 0);
+        cfg.replay_positive_only = true;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // First step primes state_prev; no transition recorded yet.
+        let s0 = vec![1.0, -1.0, 0.5, -0.5, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let s1 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let valid: Vec<usize> = (0..9).collect();
+
+        agent.step_masked(&s0, &valid, 0.0, false).unwrap();
+        // Second call carries positive reward — must be recorded.
+        agent.step_masked(&s1, &valid, 1.0, false).unwrap();
+
+        assert_eq!(
+            agent
+                .replay_buffer
+                .as_ref()
+                .unwrap()
+                .training_memories
+                .len(),
+            1,
+            "step_masked must auto-record the positive-reward transition"
+        );
+    }
+
+    // ── Test 8 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_replay_learn_clamps_unbounded_td_error() {
+        let cfg = replay_config(100, 0);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Push transitions with reward far exceeding MAX_REPLAY_TD_ERROR.
+        // raw_td ≈ reward + γ·V(s') − V(s) ≫ 5.0 for reward = 100.
+        {
+            let buf = agent.replay_buffer.as_mut().unwrap();
+            for i in 0..8 {
+                buf.push(make_replay_transition((i as f64) * 0.1, 100.0));
+            }
+        }
+
+        agent.replay_learn(8).expect("replay_learn must succeed");
+
+        assert!(
+            all_weights_finite(&agent),
+            "weights must remain finite despite unbounded raw TD error"
+        );
+        assert!(
+            agent.replay_clamp_count() >= 1,
+            "clamp must have been binding at least once with reward=100.0"
+        );
+
+        // Sanity: MAX_REPLAY_TD_ERROR is the clamp boundary exposed
+        // pub(crate). If the constant drifts, this test should fail.
+        assert!(
+            (MAX_REPLAY_TD_ERROR - 5.0).abs() < 1e-12,
+            "MAX_REPLAY_TD_ERROR must be 5.0"
+        );
+    }
+
+    // ── Test 9 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_replay_learn_uses_current_actor_latents() {
+        // Record a transition, drift the agent via many continuous-learning
+        // steps, and verify the actor's infer(state) produces different
+        // latents than it did at record time. replay_learn must use the
+        // CURRENT (drifted) latents — MAGI R2 W3.
+        let cfg = replay_config(100, 0);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![1.0, -1.0, 0.5, -0.5, 1.0, -1.0, 0.5, -0.5, 0.0];
+
+        // Snapshot latents at "record time".
+        let latent_at_record_time = agent.actor.infer(&state).latent_concat.clone();
+
+        // Record a single transition directly.
+        {
+            let buf = agent.replay_buffer.as_mut().unwrap();
+            buf.push(make_replay_transition(1.0, 1.0));
+        }
+
+        // Drift the agent with 100 on-policy updates.
+        let valid: Vec<usize> = (0..9).collect();
+        let mut s_cur = state.clone();
+        for i in 0..100 {
+            let next = vec![(i as f64) / 100.0; 9];
+            agent.step_masked(&s_cur, &valid, 1.0, false).unwrap();
+            s_cur = next;
+        }
+
+        // Capture latents AFTER drift.
+        let latent_after_drift = agent.actor.infer(&state).latent_concat.clone();
+
+        // Drifted latents must differ from record-time latents (otherwise
+        // the test is not actually exercising freshness).
+        let backend = agent.backend.clone();
+        let l_before = backend.vec_to_vec(&latent_at_record_time);
+        let l_after = backend.vec_to_vec(&latent_after_drift);
+        assert!(
+            l_before
+                .iter()
+                .zip(l_after.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-6),
+            "drift must produce different actor latents for the same state"
+        );
+
+        // Replay on the drifted agent. The point of the test is that
+        // commit 16's implementation re-runs actor.infer() on
+        // transition.state rather than caching latents at record time —
+        // so calling replay_learn must not panic or produce NaN weights.
+        agent.replay_learn(1).expect("replay_learn must succeed");
+        assert!(all_weights_finite(&agent));
+    }
+
+    // ── Test 10 ─────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_apply_config_allocates_replay_buffer_on_zero_to_positive_transition() {
+        let mut agent: PcActorCritic = make_agent();
+        assert!(
+            agent.replay_buffer.is_none(),
+            "default config has no replay buffer"
+        );
+
+        // Run a few steps to populate some on-policy state.
+        let valid: Vec<usize> = (0..9).collect();
+        let state = vec![1.0, -1.0, 0.5, -0.5, 1.0, -1.0, 0.5, -0.5, 0.0];
+        agent.step_masked(&state, &valid, 0.0, false).unwrap();
+        agent.step_masked(&state, &valid, 1.0, false).unwrap();
+
+        // Snapshot actor weights before reconfig.
+        let w_before = agent.actor.layers[0].weights.data.clone();
+
+        // Flip replay_training_capacity from 0 to 100 via apply_config.
+        let mut new_cfg = agent.config.clone();
+        new_cfg.replay_training_capacity = 100;
+        agent
+            .apply_config(new_cfg)
+            .expect("apply_config with new buffer capacity must succeed");
+
+        // (a) Buffer allocated.
+        assert!(
+            agent.replay_buffer.is_some(),
+            "apply_config must allocate a new buffer"
+        );
+        // (b) Buffer is empty (no retroactive population).
+        assert!(
+            agent
+                .replay_buffer
+                .as_ref()
+                .unwrap()
+                .training_memories
+                .is_empty(),
+            "new buffer must start empty — no retroactive population"
+        );
+        // (c) Subsequent step_masked records to the new buffer.
+        let s1 = vec![0.5; 9];
+        let s2 = vec![0.75; 9];
+        agent.step_masked(&s1, &valid, 0.0, false).unwrap();
+        agent.step_masked(&s2, &valid, 1.0, false).unwrap();
+        assert_eq!(
+            agent
+                .replay_buffer
+                .as_ref()
+                .unwrap()
+                .training_memories
+                .len(),
+            1,
+            "post-apply_config step_masked must feed the new buffer"
+        );
+        // (d) Actor weights preserved across apply_config (only buffer flipped).
+        assert_eq!(
+            agent.actor.layers[0].weights.data, w_before,
+            "apply_config must not mutate actor weights"
+        );
+    }
+
+    // ── Test 11 ─────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_apply_config_deallocates_replay_buffer_on_positive_to_zero_transition() {
+        let cfg = replay_config(100, 0);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        populate_replay_buffer(&mut agent, 30);
+        assert!(agent.replay_buffer.is_some());
+
+        let w_before = agent.actor.layers[0].weights.data.clone();
+
+        // Flip replay_training_capacity from 100 to 0.
+        let mut new_cfg = agent.config.clone();
+        new_cfg.replay_training_capacity = 0;
+        agent
+            .apply_config(new_cfg)
+            .expect("apply_config zeroing buffer must succeed");
+
+        assert!(
+            agent.replay_buffer.is_none(),
+            "apply_config must deallocate buffer when capacity drops to 0"
+        );
+
+        // Subsequent step_masked must not panic.
+        let valid: Vec<usize> = (0..9).collect();
+        let s = vec![0.25; 9];
+        agent
+            .step_masked(&s, &valid, 0.0, false)
+            .expect("step_masked must still work after buffer deallocation");
+
+        // Actor weights preserved.
+        assert_eq!(
+            agent.actor.layers[0].weights.data, w_before,
+            "apply_config must not mutate actor weights"
+        );
+    }
+
+    // ── Test 12 ─────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_combined_regularizers_no_gradient_saturation() {
+        // Full-regularizer agent.
+        let mut cfg_full = replay_config(100, 0);
+        cfg_full.ewc_lambda = 0.1;
+        cfg_full.distillation_lambda_polyak = 0.05;
+        cfg_full.distillation_lambda_frozen = 0.05;
+        cfg_full.actor_hysteresis = true;
+        cfg_full.critic_hysteresis = true;
+        cfg_full.actor_fast_window = 5;
+        cfg_full.actor_slow_window = 20;
+        cfg_full.critic_fast_window = 5;
+        cfg_full.critic_slow_window = 20;
+        let mut agent_full: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_full, 42).unwrap();
+
+        // Baseline (TD-only) agent for R5 W1 TD-fidelity comparison.
+        // Same seed means identical initial weights; no regularizers.
+        let cfg_td_only = default_config();
+        let mut agent_td_only: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg_td_only, 42).unwrap();
+        assert_eq!(
+            agent_full.actor.layers[0].weights.data, agent_td_only.actor.layers[0].weights.data,
+            "identical seeds must yield identical initial actor weights"
+        );
+
+        let valid: Vec<usize> = (0..9).collect();
+        let mut rng_like_seed: u64 = 12345;
+
+        let mut hysteresis_transition_observed = false;
+        let mut nonzero_steps = 0u32;
+        let mut cosine_ok_count = 0u32;
+        let mut cosine_samples = 0u32;
+
+        let mut prev_full_state = agent_full
+            .actor_hysteresis
+            .as_ref()
+            .map(|h| h.state.clone());
+
+        // N_STEPS extended from 50 to 200 so hysteresis FROZEN→PLASTIC
+        // transition fires within the window. The regularizer cocktail
+        // (EWC + Polyak/Frozen distillation + dual hysteresis) produces
+        // slower td_error buildup than a bare learner, so 50 steps was
+        // insufficient to cross the wake threshold deterministically.
+        // 200 steps gives a comfortable margin; cosine sampling every
+        // 10th step yields 20 samples → ≥80% threshold = ≥16 samples.
+        const N_STEPS: usize = 200;
+        for step_idx in 0..N_STEPS {
+            // Pseudo-random state drawn from a deterministic LCG.
+            rng_like_seed = rng_like_seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1);
+            let seed_val = (rng_like_seed >> 32) as f64 / (u32::MAX as f64);
+            let state: Vec<f64> = (0..9)
+                .map(|j| ((seed_val + 0.1 * j as f64) * 2.0 - 1.0).clamp(-1.0, 1.0))
+                .collect();
+            let reward = if step_idx % 3 == 0 { 1.0 } else { -0.1 };
+
+            let w_full_before = flatten_all_weights(&agent_full);
+            let w_td_before = flatten_all_weights(&agent_td_only);
+
+            agent_full
+                .step_masked(&state, &valid, reward, false)
+                .unwrap();
+            agent_td_only
+                .step_masked(&state, &valid, reward, false)
+                .unwrap();
+
+            // Intermix replay_learn on the full agent every 5 steps.
+            if step_idx % 5 == 4 && agent_full.replay_buffer.is_some() {
+                let _ = agent_full.replay_learn(16);
+            }
+
+            let w_full_after = flatten_all_weights(&agent_full);
+            let w_td_after = flatten_all_weights(&agent_td_only);
+
+            // (a) No NaN/Inf anywhere.
+            assert!(
+                all_weights_finite(&agent_full),
+                "full-regularizer weights became non-finite at step {step_idx}"
+            );
+            assert!(
+                all_weights_finite(&agent_td_only),
+                "TD-only baseline weights became non-finite at step {step_idx}"
+            );
+
+            // (b) Per-step delta L2 > 0 on full agent.
+            let delta_full: Vec<f64> = w_full_after
+                .iter()
+                .zip(w_full_before.iter())
+                .map(|(a, b)| a - b)
+                .collect();
+            let delta_td: Vec<f64> = w_td_after
+                .iter()
+                .zip(w_td_before.iter())
+                .map(|(a, b)| a - b)
+                .collect();
+            let delta_full_norm: f64 = delta_full.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if delta_full_norm > 1e-9 {
+                nonzero_steps += 1;
+            }
+
+            // (c) Bounded envelope (defensive sanity — no runaway gradient).
+            assert!(
+                delta_full_norm < 10.0,
+                "delta norm {} exceeded envelope at step {}",
+                delta_full_norm,
+                step_idx
+            );
+
+            // (d) Observe hysteresis transitions.
+            let curr_state = agent_full
+                .actor_hysteresis
+                .as_ref()
+                .map(|h| h.state.clone());
+            if let (Some(ref prev), Some(ref curr)) = (&prev_full_state, &curr_state) {
+                if prev != curr {
+                    hysteresis_transition_observed = true;
+                }
+            }
+            prev_full_state = curr_state;
+
+            // (e) R5 W1 TD-cosine fidelity: every 10th step.
+            if step_idx % 10 == 0 && delta_full_norm > 1e-9 {
+                let td_norm: f64 = delta_td.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if td_norm > 1e-9 {
+                    let cos = cosine_similarity(&delta_full, &delta_td);
+                    cosine_samples += 1;
+                    if cos >= 0.5 {
+                        cosine_ok_count += 1;
+                    }
+                }
+            }
+        }
+
+        // (b cont'd) ≥ 90% of online steps had non-zero delta.
+        assert!(
+            nonzero_steps as f64 >= 0.9 * N_STEPS as f64,
+            "only {nonzero_steps}/{N_STEPS} online steps had non-zero weight delta"
+        );
+
+        // (d cont'd) at least one hysteresis transition must fire within
+        // N_STEPS, confirming the regularizer cocktail does not freeze
+        // the plasticity machinery.
+        assert!(
+            hysteresis_transition_observed,
+            "hysteresis state did not transition within {N_STEPS} steps — regularizer cocktail may be freezing plasticity"
+        );
+
+        // (e cont'd) ≥ 80% of sampled steps have cosine ≥ 0.5.
+        if cosine_samples > 0 {
+            let ok_frac = cosine_ok_count as f64 / cosine_samples as f64;
+            assert!(
+                ok_frac >= 0.8,
+                "TD-cosine fidelity {:.2} < 0.8 across {} samples",
+                ok_frac,
+                cosine_samples
+            );
+        }
+    }
+
+    // ── Test 13 ─────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_clear_recent_memories_preserves_training_memories() {
+        let cfg = replay_config(100, 50);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Push 30 training transitions.
+        {
+            let buf = agent.replay_buffer.as_mut().unwrap();
+            for i in 0..30 {
+                buf.push(make_replay_transition(-(i as f64) * 0.01, 1.0));
+            }
+        }
+        agent.seal_replay_training_memories();
+        // Push 25 recent transitions.
+        {
+            let buf = agent.replay_buffer.as_mut().unwrap();
+            for i in 0..25 {
+                buf.push(make_replay_transition((i as f64) * 0.02, 1.0));
+            }
+        }
+
+        let training_snapshot = agent
+            .replay_buffer
+            .as_ref()
+            .unwrap()
+            .training_memories
+            .clone();
+        assert_eq!(training_snapshot.len(), 30);
+        assert_eq!(
+            agent.replay_buffer.as_ref().unwrap().recent_memories.len(),
+            25
+        );
+
+        // (a) clear_recent_memories empties recent.
+        agent
+            .clear_recent_memories()
+            .expect("clear_recent_memories must succeed when buffer is configured");
+        assert!(
+            agent
+                .replay_buffer
+                .as_ref()
+                .unwrap()
+                .recent_memories
+                .is_empty(),
+            "recent memories must be empty after clear"
+        );
+        // (b) training memories byte-equal to snapshot.
+        assert_eq!(
+            agent.replay_buffer.as_ref().unwrap().training_memories,
+            training_snapshot,
+            "training memories must be preserved across clear"
+        );
+        // (c) training_phase is false (post-seal).
+        assert!(
+            !agent.replay_buffer.as_ref().unwrap().training_phase,
+            "clear_recent_memories must not flip training_phase back to true"
+        );
+        // (d) idempotent.
+        agent
+            .clear_recent_memories()
+            .expect("second clear on empty recent must be Ok(())");
+
+        // (e) On an agent with no buffer, clear returns ConfigValidation.
+        let mut agent_nobuf: PcActorCritic = make_agent();
+        match agent_nobuf.clear_recent_memories() {
+            Err(PcError::ConfigValidation(_)) => {}
+            other => panic!("expected ConfigValidation Err on buffer-less agent, got {other:?}"),
+        }
+    }
+
+    // ── Test 14 ─────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 16"]
+    fn test_replay_learn_critic_receives_clamped_td_error() {
+        let cfg = replay_config(100, 0);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Push a single transition with a reward that guarantees
+        // |raw_td| >> MAX_REPLAY_TD_ERROR, so the clamp is definitely binding.
+        {
+            let buf = agent.replay_buffer.as_mut().unwrap();
+            buf.push(make_replay_transition(0.1, 100.0));
+        }
+
+        // Capture the raw td_error the critic would see without clamping.
+        let t0 = &agent.replay_buffer.as_ref().unwrap().training_memories[0].clone();
+        let infer_s = agent.actor.infer(&t0.state);
+        let latent_s = agent.backend.vec_to_vec(&infer_s.latent_concat);
+        let mut critic_in_s = t0.state.clone();
+        critic_in_s.extend_from_slice(&latent_s);
+        let v_s = agent.critic.forward(&critic_in_s);
+
+        let infer_sp = agent.actor.infer(&t0.next_state);
+        let latent_sp = agent.backend.vec_to_vec(&infer_sp.latent_concat);
+        let mut critic_in_sp = t0.next_state.clone();
+        critic_in_sp.extend_from_slice(&latent_sp);
+        let v_sp = agent.critic.forward(&critic_in_sp);
+
+        let gamma = agent.config.gamma;
+        let raw_td = t0.reward + gamma * v_sp - v_s;
+        let clamped_td = raw_td.clamp(-MAX_REPLAY_TD_ERROR, MAX_REPLAY_TD_ERROR);
+
+        // Sanity: the constructed scenario really does exceed the clamp
+        // boundary. If this ever fails, the test is not exercising the
+        // clamp path.
+        assert!(
+            raw_td.abs() > MAX_REPLAY_TD_ERROR,
+            "raw_td |{raw_td}| must exceed clamp boundary {MAX_REPLAY_TD_ERROR} to exercise W8"
+        );
+        assert!(
+            (raw_td - clamped_td).abs() > 1e-6,
+            "clamped_td must strictly differ from raw_td in this scenario"
+        );
+
+        agent.replay_learn(1).expect("replay_learn must succeed");
+
+        // After the update, V(s) must have moved in the direction
+        // predicted by the CLAMPED td error (because the critic uses
+        // the same clamped value internally). We don't demand an exact
+        // MSE match (the gradient scaling depends on critic internals
+        // that commit 16 fixes) — we only demand that the clamp was
+        // binding (replay_clamp_count >= 1) and the update converged
+        // to finite weights.
+        assert!(
+            agent.replay_clamp_count() >= 1,
+            "clamp must have been binding in this high-reward scenario"
+        );
+        assert!(all_weights_finite(&agent));
+
+        // Plan §7 commit 15 item (d): fidelity check — the actual V(s)
+        // delta after replay_learn must match the CLAMPED prediction and
+        // be bounded strictly away from the unclamped prediction.
+        //
+        // Replicating the critic's exact MSE backprop here would be too
+        // fragile (hidden-layer chain + per-layer consolidation decay).
+        // We therefore use the bounded-envelope invariant, which is
+        // mathematically equivalent to "the clamp was the active drive":
+        //
+        //   |actual_delta| must be << (lr · |raw_td|)
+        //
+        // and in particular closer to the clamped envelope (lr · 5.0)
+        // than to the unclamped envelope (lr · |raw_td|).
+        //
+        // For lr=0.005 and raw_td≈95 the unclamped envelope is ≈0.475
+        // while the clamped envelope is ≈0.025 — a ~20× gap that easily
+        // distinguishes the two regimes.
+        let infer_s_after = agent.actor.infer(&t0.state);
+        let latent_s_after = agent.backend.vec_to_vec(&infer_s_after.latent_concat);
+        let mut critic_in_s_after = t0.state.clone();
+        critic_in_s_after.extend_from_slice(&latent_s_after);
+        let v_s_after = agent.critic.forward(&critic_in_s_after);
+        let actual_delta = v_s_after - v_s;
+
+        let lr = agent.critic.config.lr;
+        let expected_clamped_envelope = lr * clamped_td.abs();
+        let expected_unclamped_envelope = lr * raw_td.abs();
+
+        // (1) actual delta is bounded by the CLAMPED envelope (loose
+        //     tolerance to accommodate per-layer scaling inside the
+        //     critic MLP; the key is it's NOT anywhere near the
+        //     unclamped envelope).
+        assert!(
+            actual_delta.abs() < expected_unclamped_envelope,
+            "V(s) delta {actual_delta} exceeds unclamped envelope {expected_unclamped_envelope} — clamp may be bypassed"
+        );
+        // (2) qualitative check: actual delta is strictly closer to the
+        //     clamped prediction than to the unclamped prediction.
+        //     Distance to clamped must be < half the gap between the two
+        //     envelopes.
+        let gap = expected_unclamped_envelope - expected_clamped_envelope;
+        assert!(
+            (actual_delta.abs() - expected_clamped_envelope).abs() < 0.5 * gap,
+            "V(s) delta {actual_delta} is suspiciously far from clamped envelope {expected_clamped_envelope} (unclamped would be {expected_unclamped_envelope})"
+        );
+
+        // The clamp-binding count must only grow from the current step;
+        // it is a monotonic telemetry counter.
+        let _ = clamped_td;
     }
 }

@@ -470,6 +470,10 @@ mod tests {
             distillation_lambda_polyak: 0.0,
             polyak_tau: 0.005,
             distillation_lambda_frozen: 0.0,
+            replay_training_capacity: 0,
+            replay_recent_capacity: 0,
+            replay_positive_only: true,
+            replay_batch_size: 64,
         }
     }
 
