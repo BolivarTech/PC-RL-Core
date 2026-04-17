@@ -42,6 +42,8 @@ pub mod trajectory;
 
 pub use trajectory::{ActivationCache, TrajectoryStep};
 
+pub mod replay;
+
 /// Default cooldown (in learning steps) between consecutive `rollback_hard()` calls.
 ///
 /// Prevents thrashing when the caller repeatedly reverts the actor to the
