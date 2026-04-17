@@ -49,6 +49,106 @@ pub use trajectory::{ActivationCache, TrajectoryStep};
 /// to disable the cooldown entirely.
 pub const DEFAULT_ROLLBACK_HARD_COOLDOWN: u64 = 100;
 
+/// Learning-path mode for [`PcActorCritic::learn_continuous_inner`].
+///
+/// Distinguishes on-policy updates (which must maintain GAE traces,
+/// TD-error buffers, cooldown counters and the EWC Fisher estimate)
+/// from replay-driven off-policy updates (which must NOT mutate
+/// online-only state so the replay batch does not contaminate the
+/// agent's view of its current trajectory).
+///
+/// Introduced in Phase 2 of the self-recovery plan to prepare the
+/// internal learn path for a future `replay_learn` caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LearnMode {
+    /// On-policy update: all bookkeeping side effects enabled.
+    Online,
+    /// Off-policy replay update: skip GAE trace update, td_error
+    /// buffer push, Fisher lifecycle and cooldown counter increments.
+    ///
+    /// Currently constructed only by the branch-coverage test. Will be
+    /// constructed by `replay_learn` in commit 16 of the self-recovery
+    /// plan; until then it is dead in lib-only compilation.
+    #[allow(dead_code)]
+    Replay,
+}
+
+/// Parameter bundle for [`PcActorCritic::learn_continuous_inner`].
+///
+/// Replaces an 11-positional-parameter signature with a single
+/// borrowed struct, reducing call-site noise and enabling per-mode
+/// gating of online-only side effects (see [`LearnMode`]).
+///
+/// `pre_td_error` is reserved for a future replay path and is NOT
+/// consumed by the current implementation.
+#[derive(Debug)]
+pub(crate) struct LearnStep<'a, L: LinAlg> {
+    /// Current state observation (flat row-major).
+    pub state: &'a [f64],
+    /// Inference result from `act` at the current state.
+    pub infer: &'a InferResult<L>,
+    /// Action taken at the current state.
+    pub action: usize,
+    /// Indices of valid actions at the current state.
+    pub valid_actions: &'a [usize],
+    /// Reward received after taking `action`.
+    pub reward: f64,
+    /// Next-state observation (flat row-major).
+    pub next_state: &'a [f64],
+    /// Inference result from `act` at the next state.
+    pub next_infer: &'a InferResult<L>,
+    /// Whether the episode ended at the next state.
+    pub done: bool,
+    /// Effective discount factor (`γ` for TD(0), `γⁿ` for TD(n) flush).
+    pub gamma: f64,
+    /// Pre-computed V(s). When `Some`, skips the critic forward pass
+    /// for the current state (used by TD(n) flush to avoid stale bias).
+    pub pre_v_s: Option<f64>,
+    /// Pre-computed TD error. Reserved for the replay path (commit 16)
+    /// and NOT consumed by the current inner implementation.
+    #[allow(dead_code)]
+    pub pre_td_error: Option<f64>,
+    /// Learning-path mode. Controls gating of online-only side effects.
+    pub mode: LearnMode,
+}
+
+impl<'a, L: LinAlg> LearnStep<'a, L> {
+    /// Builds a `LearnStep` for the on-policy online learning path.
+    ///
+    /// Sets `pre_v_s = None`, `pre_td_error = None`, and
+    /// `mode = LearnMode::Online`. Reduces boilerplate at the three
+    /// internal on-policy call sites (TD(0), TD(n) non-terminal,
+    /// TD(n) flush with externally supplied pre-V(s) — which overrides
+    /// `pre_v_s` via a struct-literal override if needed).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn online(
+        state: &'a [f64],
+        infer: &'a InferResult<L>,
+        action: usize,
+        valid_actions: &'a [usize],
+        reward: f64,
+        next_state: &'a [f64],
+        next_infer: &'a InferResult<L>,
+        done: bool,
+        gamma: f64,
+    ) -> Self {
+        Self {
+            state,
+            infer,
+            action,
+            valid_actions,
+            reward,
+            next_state,
+            next_infer,
+            done,
+            gamma,
+            pre_v_s: None,
+            pre_td_error: None,
+            mode: LearnMode::Online,
+        }
+    }
+}
+
 /// Integrated PC Actor-Critic agent.
 ///
 /// Combines a predictive coding actor with an MLP critic for
@@ -1493,8 +1593,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         next_infer: &InferResult<L>,
         terminal: bool,
     ) -> f64 {
-        self.steps_since_last_rollback_hard = self.steps_since_last_rollback_hard.saturating_add(1);
-        self.learn_continuous_inner(
+        let step = LearnStep::online(
             input,
             infer,
             action,
@@ -1504,70 +1603,88 @@ impl<L: LinAlg> PcActorCritic<L> {
             next_infer,
             terminal,
             self.config.gamma,
-            None,
-        )
+        );
+        // `learn_continuous_inner` only returns `Err` from paths introduced
+        // in later self-recovery commits. Today it is effectively infallible,
+        // so map any error to `0.0` to preserve the public `-> f64` contract.
+        self.learn_continuous_inner(&step).unwrap_or(0.0)
     }
 
     /// Inner implementation for single-step TD(0) continuous learning.
     ///
-    /// Called by `learn_continuous` and by TD(n) flush with custom
-    /// `gamma_power` and pre-computed V(s).
+    /// Called by [`Self::learn_continuous`] and by TD(n) flush with custom
+    /// `gamma` and pre-computed V(s). The caller packs all parameters into
+    /// a [`LearnStep`] borrow and selects [`LearnMode`] to control which
+    /// online-only side effects run.
+    ///
+    /// Replay mode skips online-state side effects because replay batches
+    /// are off-policy and must not contaminate GAE traces, the td_error
+    /// buffer, the cooldown counter, or the Fisher diagonal estimate
+    /// (MAGI R6 W1).
     ///
     /// # Arguments
     ///
-    /// * `input` - Current state.
-    /// * `infer` - Inference result from `act` at current state.
-    /// * `action` - Action taken.
-    /// * `valid_actions` - Valid actions at current state.
-    /// * `reward` - Reward received.
-    /// * `next_input` - Next state.
-    /// * `next_infer` - Inference result from `act` at next state.
-    /// * `terminal` - Whether the episode ended.
-    /// * `gamma_power` - Effective discount factor (`γⁿ` for TD(n) flush,
-    ///   `γ` for TD(0)).
-    /// * `pre_v_s` - Pre-computed V(s). When `Some`, skips the internal
-    ///   critic forward pass for the current state.
+    /// * `step` — bundled learning parameters. See [`LearnStep`].
     ///
     /// # Returns
     ///
-    /// Critic loss for this step.
-    #[allow(clippy::too_many_arguments)]
-    fn learn_continuous_inner(
-        &mut self,
-        input: &[f64],
-        infer: &InferResult<L>,
-        action: usize,
-        valid_actions: &[usize],
-        reward: f64,
-        next_input: &[f64],
-        next_infer: &InferResult<L>,
-        terminal: bool,
-        gamma_power: f64,
-        pre_v_s: Option<f64>,
-    ) -> f64 {
+    /// `Ok(critic_loss)` for a normal update, `Ok(0.0)` when the td_error
+    /// is non-finite (NaN guard), or `Err(PcError)` from validation paths
+    /// reserved for future self-recovery commits.
+    ///
+    /// Today the function never actually returns `Err`; the `Result`
+    /// wrapper is retained so replay-path validation added in a later
+    /// commit does not break the internal call sites. Callers that
+    /// don't care about the loss can bind via `let _ = inner(&step)?;`.
+    fn learn_continuous_inner(&mut self, step: &LearnStep<'_, L>) -> Result<f64, PcError> {
+        // Replay mode skips online-state side effects because replay batches
+        // are off-policy and must not contaminate GAE traces, the cooldown
+        // counter, the td_error buffer, or the Fisher diagonal estimate
+        // (MAGI R6 W1). This single flag is the authoritative place from
+        // which those gates branch.
+        let is_online = step.mode == LearnMode::Online;
+
+        // Cooldown counter: increment only on Online updates. This is the
+        // SINGLE authoritative site — no other code path may touch this
+        // counter in a learning step (MAGI R6 W3+W6).
+        //
+        // CRITICAL: this increment MUST run before the NaN guard below so
+        // that elapsed-time semantics match pre-refactor behavior — a step
+        // with a non-finite td_error still counts toward rollback_hard
+        // cooldown unlock. Moving this block below the early-return would
+        // silently stall the cooldown on every NaN step.
+        if is_online {
+            self.steps_since_last_rollback_hard =
+                self.steps_since_last_rollback_hard.saturating_add(1);
+        }
+
         // Build critic inputs
-        let latent_vec = self.backend.vec_to_vec(&infer.latent_concat);
-        let mut critic_input = input.to_vec();
+        let latent_vec = self.backend.vec_to_vec(&step.infer.latent_concat);
+        let mut critic_input = step.state.to_vec();
         critic_input.extend_from_slice(&latent_vec);
 
-        let next_latent_vec = self.backend.vec_to_vec(&next_infer.latent_concat);
-        let mut next_critic_input = next_input.to_vec();
+        let next_latent_vec = self.backend.vec_to_vec(&step.next_infer.latent_concat);
+        let mut next_critic_input = step.next_state.to_vec();
         next_critic_input.extend_from_slice(&next_latent_vec);
 
-        let v_s = pre_v_s.unwrap_or_else(|| self.critic.forward(&critic_input));
-        let v_next = if terminal {
+        let v_s = step
+            .pre_v_s
+            .unwrap_or_else(|| self.critic.forward(&critic_input));
+        let v_next = if step.done {
             0.0
         } else {
             self.critic.forward(&next_critic_input)
         };
 
-        let target = reward + if terminal { 0.0 } else { gamma_power * v_next };
+        let target = step.reward + if step.done { 0.0 } else { step.gamma * v_next };
         let td_error = target - v_s;
 
         // Guard: if td_error is non-finite (e.g. NaN reward), skip all updates
         // to prevent silent corruption of weights, Fisher, and buffers.
+        // Note: the cooldown counter has already been incremented above so
+        // NaN steps still tick elapsed time toward the next rollback_hard.
         if !td_error.is_finite() {
-            return 0.0;
+            return Ok(0.0);
         }
 
         // Update critic with per-layer consolidation decay
@@ -1580,13 +1697,13 @@ impl<L: LinAlg> PcActorCritic<L> {
         );
 
         // Policy gradient (same formula as learn, but scaled by td_error)
-        let y_conv_vec = self.backend.vec_to_vec(&infer.y_conv);
+        let y_conv_vec = self.backend.vec_to_vec(&step.infer.y_conv);
         let scaled: Vec<f64> = y_conv_vec
             .iter()
             .map(|&v| v / self.actor.config.temperature)
             .collect();
         let scaled_l = self.backend.vec_from_slice(&scaled);
-        let pi_l = self.backend.softmax_masked(&scaled_l, valid_actions);
+        let pi_l = self.backend.softmax_masked(&scaled_l, step.valid_actions);
         let pi = self.backend.vec_to_vec(&pi_l);
 
         // --- GAE(λ) eligibility trace path ---
@@ -1598,75 +1715,84 @@ impl<L: LinAlg> PcActorCritic<L> {
             );
             // Gradient direction WITHOUT td_error scaling
             let mut grad_direction = vec![0.0; pi.len()];
-            for &i in valid_actions {
+            for &i in step.valid_actions {
                 grad_direction[i] = pi[i];
             }
-            grad_direction[action] -= 1.0;
+            grad_direction[step.action] -= 1.0;
 
-            // Decay trace: trace = γλ * trace
-            let gamma_lambda = self.config.gamma * lambda;
-            for v in &mut self.actor_trace {
-                *v *= gamma_lambda;
-            }
-            // Accumulate: trace += gradient_direction
-            for (i, &g) in grad_direction.iter().enumerate() {
-                self.actor_trace[i] += g;
+            // Trace update: online-only. Replay batches must not pollute
+            // the on-policy eligibility trace.
+            if is_online {
+                let gamma_lambda = self.config.gamma * lambda;
+                for v in &mut self.actor_trace {
+                    *v *= gamma_lambda;
+                }
+                for (i, &g) in grad_direction.iter().enumerate() {
+                    self.actor_trace[i] += g;
+                }
+                for v in &mut self.actor_trace {
+                    *v = v.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
+                }
             }
 
-            // Clip trace to prevent overflow
-            for v in &mut self.actor_trace {
-                *v = v.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
-            }
-
-            // Effective delta = td_error * trace
-            let mut delta: Vec<f64> = self.actor_trace.iter().map(|&t| td_error * t).collect();
+            // Effective delta. For Online we scale the (just-updated) trace
+            // by td_error (standard GAE). For Replay we fall back to the
+            // plain policy-gradient direction so the off-policy update still
+            // improves the policy without touching the on-policy trace.
+            let mut delta: Vec<f64> = if is_online {
+                self.actor_trace.iter().map(|&t| td_error * t).collect()
+            } else {
+                grad_direction.iter().map(|&g| td_error * g).collect()
+            };
 
             // Entropy regularization per-step (not accumulated in trace)
-            for &i in valid_actions {
+            for &i in step.valid_actions {
                 let log_pi = (pi[i].max(1e-10)).ln();
                 delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
             }
 
             // Use shared bookkeeping
-            return self.apply_actor_update_and_bookkeeping(
+            return Ok(self.apply_actor_update_and_bookkeeping(
                 &delta,
-                infer,
-                input,
+                step.infer,
+                step.state,
                 &y_conv_vec,
-                valid_actions,
-                action,
+                step.valid_actions,
+                step.action,
                 td_error,
                 loss,
-            );
+                step.mode,
+            ));
         }
 
         // --- Standard TD(0)/TD(n) path continues below ---
         let mut delta = vec![0.0; pi.len()];
-        for &i in valid_actions {
+        for &i in step.valid_actions {
             delta[i] = pi[i];
         }
-        delta[action] -= 1.0;
+        delta[step.action] -= 1.0;
 
-        for &i in valid_actions {
+        for &i in step.valid_actions {
             delta[i] *= td_error;
         }
 
         // Entropy regularization
-        for &i in valid_actions {
+        for &i in step.valid_actions {
             let log_pi = (pi[i].max(1e-10)).ln();
             delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
         }
 
-        self.apply_actor_update_and_bookkeeping(
+        Ok(self.apply_actor_update_and_bookkeeping(
             &delta,
-            infer,
-            input,
+            step.infer,
+            step.state,
             &y_conv_vec,
-            valid_actions,
-            action,
+            step.valid_actions,
+            step.action,
             td_error,
             loss,
-        )
+            step.mode,
+        ))
     }
 
     /// Shared post-delta bookkeeping: scale/decay, EWC/Fisher, weight update,
@@ -1685,6 +1811,8 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// * `action` - Action taken.
     /// * `td_error` - Temporal difference error.
     /// * `loss` - Critic loss to return.
+    /// * `mode` - Learning mode. [`LearnMode::Replay`] skips the EWC Fisher
+    ///   lifecycle and the td_error buffer push (MAGI R6 W1).
     ///
     /// # Returns
     ///
@@ -1700,7 +1828,9 @@ impl<L: LinAlg> PcActorCritic<L> {
         action: usize,
         td_error: f64,
         loss: f64,
+        mode: LearnMode,
     ) -> f64 {
+        let is_online = mode == LearnMode::Online;
         let s_scale = self.effective_actor_scale(infer.surprise_score);
         let actor_decay = self.effective_actor_decay();
 
@@ -1740,8 +1870,11 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         let delta = &effective_delta;
 
-        // Fisher EMA accumulation and EWC correction (M4)
-        if self.config.ewc_lambda > 0.0 && !self.actor_fisher.is_empty() {
+        // Fisher EMA accumulation and EWC correction (M4). Gated on Online:
+        // off-policy replay batches must not contaminate the Fisher diagonal
+        // estimate (MAGI R6 W1). Replay mode falls through to the plain
+        // weight update with neither Fisher accumulation nor EWC correction.
+        if is_online && self.config.ewc_lambda > 0.0 && !self.actor_fisher.is_empty() {
             // Step 2: Extract per-layer gradients for Fisher EMA (read-only)
             let fisher_delta = if self.config.logits_reversal {
                 // Logits reversal: delta_fisher = softmax(-y_conv/T, valid) - one_hot(action)
@@ -1807,8 +1940,14 @@ impl<L: LinAlg> PcActorCritic<L> {
             self.push_surprise(infer.surprise_score);
         }
 
-        self.last_td_error = td_error;
-        self.push_td_error(td_error.abs());
+        // Online-only: last_td_error and the adaptive critic-scale buffer
+        // both feed on-policy telemetry (hysteresis, surprise->LR mapping).
+        // Off-policy replay batches must not overwrite or append to them
+        // (MAGI R6 W1).
+        if is_online {
+            self.last_td_error = td_error;
+            self.push_td_error(td_error.abs());
+        }
 
         loss
     }
@@ -2004,7 +2143,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                     let oldest_state_vec = self.backend.vec_to_vec(&oldest.state);
                     let oldest_surprise = oldest.infer.surprise_score;
 
-                    self.learn_continuous_inner(
+                    let step = LearnStep::online(
                         &oldest_state_vec,
                         &oldest.infer,
                         oldest.action,
@@ -2014,8 +2153,8 @@ impl<L: LinAlg> PcActorCritic<L> {
                         &current_infer,
                         false,
                         gamma_power,
-                        None,
                     );
+                    let _ = self.learn_continuous_inner(&step).unwrap_or(0.0);
 
                     if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
                         self.process_hysteresis(oldest_surprise, self.last_td_error.abs());
@@ -2102,18 +2241,21 @@ impl<L: LinAlg> PcActorCritic<L> {
             let surprise_score = transition.infer.surprise_score;
 
             // Pass pre-computed V(s) via Some() to bypass critic.forward()
-            self.learn_continuous_inner(
-                &state_vec,
-                &transition.infer,
-                transition.action,
-                &transition.valid_actions,
-                n_step_reward,
-                terminal_state,
-                terminal_infer,
-                true,
-                gamma_power,
-                Some(v_s_values[k]),
-            );
+            let step = LearnStep {
+                state: &state_vec,
+                infer: &transition.infer,
+                action: transition.action,
+                valid_actions: &transition.valid_actions,
+                reward: n_step_reward,
+                next_state: terminal_state,
+                next_infer: terminal_infer,
+                done: true,
+                gamma: gamma_power,
+                pre_v_s: Some(v_s_values[k]),
+                pre_td_error: None,
+                mode: LearnMode::Online,
+            };
+            let _ = self.learn_continuous_inner(&step).unwrap_or(0.0);
 
             // Process hysteresis after each flush step
             if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
@@ -10068,6 +10210,172 @@ mod tests {
         assert!(
             agent.rollback_hard().is_err(),
             "rollback_hard must be rejected after restoring cooldown"
+        );
+    }
+
+    /// Replay-mode branch coverage: `learn_continuous_inner` with
+    /// `LearnMode::Replay` MUST update actor weights while leaving the
+    /// on-policy side effects untouched (GAE trace, td_error buffer,
+    /// cooldown counter). This guards the gates added in commit 12
+    /// of the self-recovery plan (MAGI R6 W1 / W3 / W6 / W9).
+    #[test]
+    fn test_learn_continuous_inner_replay_mode_skips_online_side_effects() {
+        // Enable GAE so actor_trace is non-empty and we can observe
+        // whether replay mode leaves it untouched.
+        let mut cfg = default_config();
+        cfg.gae_lambda = Some(0.95);
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Pre-populate on-policy state that replay mode MUST NOT touch.
+        let trace_len = agent.actor_trace.len();
+        assert!(trace_len > 0, "GAE trace must have non-zero length");
+        for v in &mut agent.actor_trace {
+            *v = 0.5;
+        }
+        let trace_before: Vec<f64> = agent.actor_trace.clone();
+
+        agent.td_error_buffer.push_back(0.1);
+        let td_buffer_len_before = agent.td_error_buffer.len();
+
+        // Seed the cooldown counter to a distinctive non-zero value so
+        // we can distinguish "untouched" from "reset to zero".
+        agent.steps_since_last_rollback_hard = 42;
+        let cooldown_before = agent.steps_since_last_rollback_hard;
+
+        // Snapshot actor weights so we can assert the update DID happen.
+        let weights_before = agent.actor.layers[0].weights.data.clone();
+
+        // Run inference on a non-trivial state (must not be all-zero
+        // because PC inference on zero state can yield zero gradients).
+        let state = vec![1.0, -1.0, 0.5, -0.5, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let next_state = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let infer = agent.actor.infer(&state);
+        let next_infer = agent.actor.infer(&next_state);
+
+        let valid_actions: Vec<usize> = (0..agent.config.actor.output_size).collect();
+
+        let replay_step = LearnStep {
+            state: &state,
+            infer: &infer,
+            action: 0,
+            valid_actions: &valid_actions,
+            reward: 1.0,
+            next_state: &next_state,
+            next_infer: &next_infer,
+            done: false,
+            gamma: agent.config.gamma,
+            pre_v_s: None,
+            pre_td_error: None,
+            mode: LearnMode::Replay,
+        };
+
+        let _ = agent
+            .learn_continuous_inner(&replay_step)
+            .expect("replay inner learn must not error");
+
+        // (a) Actor trace is unchanged (on-policy eligibility not polluted).
+        assert_eq!(
+            agent.actor_trace, trace_before,
+            "Replay mode must not mutate actor_trace"
+        );
+        // (b) td_error buffer length is unchanged (no replay td's pushed).
+        assert_eq!(
+            agent.td_error_buffer.len(),
+            td_buffer_len_before,
+            "Replay mode must not push into td_error_buffer"
+        );
+        // (c) Cooldown counter is unchanged (R6 W3/W6 wiring).
+        assert_eq!(
+            agent.steps_since_last_rollback_hard, cooldown_before,
+            "Replay mode must not increment steps_since_last_rollback_hard"
+        );
+        // (d) Actor weights DID change (off-policy update still happens).
+        assert_ne!(
+            agent.actor.layers[0].weights.data, weights_before,
+            "Replay mode must still update actor weights"
+        );
+    }
+
+    /// Cooldown-wiring invariant: the `steps_since_last_rollback_hard`
+    /// counter MUST still tick forward on an Online step even when the
+    /// NaN-td_error guard short-circuits the rest of the update. This
+    /// locks the ordering of the cooldown increment relative to the NaN
+    /// guard inside `learn_continuous_inner` so a future refactor can't
+    /// silently stall the cooldown on NaN steps.
+    ///
+    /// Drives `learn_continuous_inner` directly with a hand-built
+    /// Online `LearnStep` carrying a NaN reward. This bypasses the
+    /// state-bootstrap dance of `step_masked` (which only learns once
+    /// it has a previous transition) and makes the single-call
+    /// increment behavior unambiguous.
+    #[test]
+    fn test_cooldown_counter_increments_on_nan_td_error_in_online_mode() {
+        let mut agent: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), default_config(), 42).unwrap();
+
+        // Snapshot actor weights so we can assert the NaN guard DID
+        // actually short-circuit the body (weights unchanged).
+        let weights_before = agent.actor.layers[0].weights.data.clone();
+
+        // Reset the counter to a known starting point, matching the
+        // direct-field-set idiom used by the replay-branch test above.
+        agent.steps_since_last_rollback_hard = 0;
+
+        // Run inference so we have valid InferResult<L> instances. The
+        // state vectors themselves are finite; the NaN enters via the
+        // reward, which drives target -> NaN -> td_error -> NaN.
+        let state = vec![1.0, -1.0, 0.5, -0.5, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let next_state = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        let infer = agent.actor.infer(&state);
+        let next_infer = agent.actor.infer(&next_state);
+        let valid_actions: Vec<usize> = (0..agent.config.actor.output_size).collect();
+
+        let nan_step = LearnStep {
+            state: &state,
+            infer: &infer,
+            action: 0,
+            valid_actions: &valid_actions,
+            reward: f64::NAN,
+            next_state: &next_state,
+            next_infer: &next_infer,
+            done: false,
+            gamma: agent.config.gamma,
+            pre_v_s: None,
+            pre_td_error: None,
+            mode: LearnMode::Online,
+        };
+
+        let loss = agent
+            .learn_continuous_inner(&nan_step)
+            .expect("NaN guard must return Ok(0.0), never Err");
+
+        // (a) NaN guard did short-circuit: loss is 0.0, weights unchanged.
+        assert_eq!(loss, 0.0, "NaN guard must short-circuit with Ok(0.0)");
+        assert_eq!(
+            agent.actor.layers[0].weights.data, weights_before,
+            "NaN guard must leave actor weights untouched"
+        );
+
+        // (b) The cooldown counter MUST have ticked exactly once — this
+        // is the invariant the amend is locking down. If a future
+        // refactor moves the increment below the NaN guard, this
+        // assertion fails.
+        assert_eq!(
+            agent.steps_since_last_rollback_hard, 1,
+            "Cooldown counter must increment on Online NaN step \
+             (increment must precede NaN guard in learn_continuous_inner)"
+        );
+
+        // A second NaN call must tick it to 2 — proves the increment is
+        // driven by every Online call, not a one-time init path.
+        let _ = agent
+            .learn_continuous_inner(&nan_step)
+            .expect("NaN guard must return Ok(0.0), never Err");
+        assert_eq!(
+            agent.steps_since_last_rollback_hard, 2,
+            "Cooldown counter must increment on every Online step, \
+             including NaN-guarded ones"
         );
     }
 }
