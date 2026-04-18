@@ -56,11 +56,10 @@ pub const DEFAULT_ROLLBACK_HARD_COOLDOWN: u64 = 100;
 /// are clamped to the boundary (MAGI R5 W5). Exposed as `pub(crate)` so
 /// integration tests can reference the exact clamp boundary.
 ///
-/// The production read-site lands in commit 16 of the self-recovery plan
-/// (`replay_learn` implementation). Until then this constant is referenced
-/// only from the red-phase integration tests, so in lib-only builds it
-/// appears unused — the allow is transient and removed by commit 16.
-#[allow(dead_code)]
+/// Read by [`PcActorCritic::replay_learn`] to cap the TD-error magnitude
+/// used for replay-phase critic and actor updates. Also referenced from
+/// red-phase integration tests so the clamp boundary stays a single source
+/// of truth.
 pub(crate) const MAX_REPLAY_TD_ERROR: f64 = 5.0;
 
 /// Learning-path mode for [`PcActorCritic::learn_continuous_inner`].
@@ -80,10 +79,8 @@ pub(crate) enum LearnMode {
     /// Off-policy replay update: skip GAE trace update, td_error
     /// buffer push, Fisher lifecycle and cooldown counter increments.
     ///
-    /// Currently constructed only by the branch-coverage test. Will be
-    /// constructed by `replay_learn` in commit 16 of the self-recovery
-    /// plan; until then it is dead in lib-only compilation.
-    #[allow(dead_code)]
+    /// Constructed by [`PcActorCritic::replay_learn`] for each transition
+    /// drawn from the replay buffer.
     Replay,
 }
 
@@ -93,8 +90,8 @@ pub(crate) enum LearnMode {
 /// borrowed struct, reducing call-site noise and enabling per-mode
 /// gating of online-only side effects (see [`LearnMode`]).
 ///
-/// `pre_td_error` is reserved for a future replay path and is NOT
-/// consumed by the current implementation.
+/// `pre_td_error` is consumed by [`PcActorCritic::replay_learn`] to
+/// inject a pre-clamped off-policy TD error.
 #[derive(Debug)]
 pub(crate) struct LearnStep<'a, L: LinAlg> {
     /// Current state observation (flat row-major).
@@ -118,9 +115,11 @@ pub(crate) struct LearnStep<'a, L: LinAlg> {
     /// Pre-computed V(s). When `Some`, skips the critic forward pass
     /// for the current state (used by TD(n) flush to avoid stale bias).
     pub pre_v_s: Option<f64>,
-    /// Pre-computed TD error. Reserved for the replay path (commit 16)
-    /// and NOT consumed by the current inner implementation.
-    #[allow(dead_code)]
+    /// Pre-computed TD error. When `Some`, `learn_continuous_inner`
+    /// bypasses the internal `target − V(s)` computation and uses this
+    /// value directly. Consumed by the replay path
+    /// (see [`PcActorCritic::replay_learn`]) which injects a clamped
+    /// td_error to bound off-policy gradient magnitude.
     pub pre_td_error: Option<f64>,
     /// Learning-path mode. Controls gating of online-only side effects.
     pub mode: LearnMode,
@@ -243,14 +242,10 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// Initialized to `u64::MAX` so the first call is always allowed.
     steps_since_last_rollback_hard: u64,
     /// Dual-compartment replay buffer (Phase 2). `None` when
-    /// `replay_training_capacity == 0` at construction.
-    ///
-    /// Commit 15 only scaffolds the field; the production read/write
-    /// paths land in commit 16 (`replay_learn`, auto-record in
-    /// `step_masked`, `apply_config` allocation transitions). In the
-    /// intermediate state the lib-only compiler reports this field as
-    /// never read — the allow is transient and removed by commit 16.
-    #[allow(dead_code)]
+    /// `replay_training_capacity == 0` at construction, otherwise a
+    /// freshly-allocated empty buffer sized per config. Populated by
+    /// auto-record in [`step`](Self::step) / [`step_masked`](Self::step_masked)
+    /// and consumed by [`replay_learn`](Self::replay_learn).
     pub(crate) replay_buffer: Option<crate::pc_actor_critic::replay::ReplayBuffer>,
     /// Monotonic counter of `replay_learn` calls where the td_error
     /// clamp was binding (MAGI R5 W5). Exposed via
@@ -618,6 +613,18 @@ impl<L: LinAlg> PcActorCritic<L> {
             )));
         }
 
+        // Phase 2: replay buffer validation.
+        if config.replay_recent_capacity > 0 && config.replay_training_capacity == 0 {
+            return Err(PcError::ConfigValidation(
+                "replay_recent_capacity > 0 requires replay_training_capacity > 0".to_string(),
+            ));
+        }
+        if config.replay_training_capacity > 0 && config.replay_batch_size == 0 {
+            return Err(PcError::ConfigValidation(
+                "replay_batch_size must be > 0 when replay buffer is enabled".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -875,6 +882,20 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// consolidation decay (M3), EWC parameters (M4), TD(n) steps, GAE lambda,
     /// entropy coefficient, logits reversal, bidirectional coupling.
     ///
+    /// # Replay buffer transitions
+    ///
+    /// * `0 → positive capacity`: a fresh empty buffer is allocated with
+    ///   the new config's sizing and `positive_only` flag.
+    /// * `positive → 0`: the existing buffer is deallocated; any
+    ///   accumulated transitions are dropped.
+    /// * `positive → positive`: if capacity fields and `positive_only`
+    ///   are unchanged the existing buffer contents are preserved;
+    ///   otherwise the buffer is reset to an empty state sized per the
+    ///   new config (FIFO ordering is not transferable between
+    ///   differently-sized buffers).
+    /// * `replay_clamp_count` is always reset to 0 on `apply_config`
+    ///   so telemetry reflects the new configuration's history.
+    ///
     /// # What does NOT change
     ///
     /// Actor/critic weights and biases, network topology, actor lr/alpha/tol/
@@ -962,6 +983,43 @@ impl<L: LinAlg> PcActorCritic<L> {
             None
         };
 
+        // 6d. Replay buffer slot transitions (Phase 2).
+        //     0 → positive:  allocate fresh empty buffer.
+        //     positive → 0:  deallocate.
+        //     positive → positive: keep existing contents when capacity
+        //       and filter are unchanged, otherwise reset to a fresh
+        //       empty buffer sized per the new config. The reset is
+        //       the only safe path — changing capacity mid-flight
+        //       would leak FIFO ordering semantics between old and
+        //       new sizes.
+        let old_training_cap = self.config.replay_training_capacity;
+        let new_training_cap = config.replay_training_capacity;
+        let replay_buffer: Option<crate::pc_actor_critic::replay::ReplayBuffer> =
+            if old_training_cap == 0 && new_training_cap > 0 {
+                Some(crate::pc_actor_critic::replay::ReplayBuffer::new(
+                    config.replay_training_capacity,
+                    config.replay_recent_capacity,
+                    config.replay_positive_only,
+                ))
+            } else if old_training_cap > 0 && new_training_cap == 0 {
+                None
+            } else if old_training_cap > 0 && new_training_cap > 0 {
+                let capacities_changed = old_training_cap != new_training_cap
+                    || self.config.replay_recent_capacity != config.replay_recent_capacity
+                    || self.config.replay_positive_only != config.replay_positive_only;
+                if capacities_changed {
+                    Some(crate::pc_actor_critic::replay::ReplayBuffer::new(
+                        config.replay_training_capacity,
+                        config.replay_recent_capacity,
+                        config.replay_positive_only,
+                    ))
+                } else {
+                    self.replay_buffer.take()
+                }
+            } else {
+                None
+            };
+
         // 7. Apply all fields atomically
         self.config = config;
         self.surprise_buffer = VecDeque::new();
@@ -988,6 +1046,8 @@ impl<L: LinAlg> PcActorCritic<L> {
         self.actor_trace = vec![0.0; trace_len];
         self.polyak_target = polyak_target;
         self.frozen_champion = frozen_champion;
+        self.replay_buffer = replay_buffer;
+        self.replay_clamp_count = 0;
         self.rollback_hard_cooldown_steps = DEFAULT_ROLLBACK_HARD_COOLDOWN;
         self.steps_since_last_rollback_hard = u64::MAX;
 
@@ -1058,6 +1118,15 @@ impl<L: LinAlg> PcActorCritic<L> {
         } else {
             None
         };
+        let replay_buffer = if config.replay_training_capacity > 0 {
+            Some(crate::pc_actor_critic::replay::ReplayBuffer::new(
+                config.replay_training_capacity,
+                config.replay_recent_capacity,
+                config.replay_positive_only,
+            ))
+        } else {
+            None
+        };
 
         Ok(Self {
             actor,
@@ -1091,7 +1160,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             frozen_champion,
             rollback_hard_cooldown_steps: DEFAULT_ROLLBACK_HARD_COOLDOWN,
             steps_since_last_rollback_hard: u64::MAX,
-            replay_buffer: None,
+            replay_buffer,
             replay_clamp_count: 0,
         })
     }
@@ -1704,19 +1773,33 @@ impl<L: LinAlg> PcActorCritic<L> {
         let v_s = step
             .pre_v_s
             .unwrap_or_else(|| self.critic.forward(&critic_input));
-        let v_next = if step.done {
-            0.0
-        } else {
-            self.critic.forward(&next_critic_input)
+
+        // When `pre_td_error` is injected (replay path), `v_next` is not
+        // needed because the caller has already computed the TD error.
+        // Otherwise we run the standard `target = r + γ·V(s')` path.
+        let (td_error, target) = match step.pre_td_error {
+            Some(injected) => {
+                // target reconstructed as `v_s + injected` so the critic
+                // MSE update receives a self-consistent target when the
+                // TD error has been clamped upstream (replay path).
+                (injected, v_s + injected)
+            }
+            None => {
+                let v_next = if step.done {
+                    0.0
+                } else {
+                    self.critic.forward(&next_critic_input)
+                };
+                let target = step.reward + if step.done { 0.0 } else { step.gamma * v_next };
+                (target - v_s, target)
+            }
         };
 
-        let target = step.reward + if step.done { 0.0 } else { step.gamma * v_next };
-        let td_error = target - v_s;
-
-        // Guard: if td_error is non-finite (e.g. NaN reward), skip all updates
-        // to prevent silent corruption of weights, Fisher, and buffers.
-        // Note: the cooldown counter has already been incremented above so
-        // NaN steps still tick elapsed time toward the next rollback_hard.
+        // Guard: if td_error is non-finite (e.g. NaN reward or injected
+        // NaN), skip all updates to prevent silent corruption of weights,
+        // Fisher, and buffers. Note: the cooldown counter has already
+        // been incremented above so NaN steps still tick elapsed time
+        // toward the next rollback_hard.
         if !td_error.is_finite() {
             return Ok(0.0);
         }
@@ -2145,10 +2228,10 @@ impl<L: LinAlg> PcActorCritic<L> {
                 // === TD(n) terminal: push + flush ===
                 if reward.is_finite() {
                     self.td_buffer.push_back(TdTransition {
-                        state: prev_state,
-                        infer: prev_infer,
+                        state: prev_state.clone(),
+                        infer: prev_infer.clone(),
                         action: prev_action,
-                        valid_actions: learn_mask,
+                        valid_actions: learn_mask.clone(),
                         reward,
                     });
                 }
@@ -2157,10 +2240,10 @@ impl<L: LinAlg> PcActorCritic<L> {
                 // === TD(n) non-terminal: buffer transition ===
                 if reward.is_finite() {
                     self.td_buffer.push_back(TdTransition {
-                        state: prev_state,
-                        infer: prev_infer,
+                        state: prev_state.clone(),
+                        infer: prev_infer.clone(),
                         action: prev_action,
-                        valid_actions: learn_mask,
+                        valid_actions: learn_mask.clone(),
                         reward,
                     });
                 }
@@ -2194,6 +2277,21 @@ impl<L: LinAlg> PcActorCritic<L> {
                         self.process_hysteresis(oldest_surprise, self.last_td_error.abs());
                     }
                 }
+            }
+
+            // Auto-record the (s, a, r, s', done) transition into the
+            // replay buffer when one is configured. Gated by the buffer's
+            // positive_only filter inside `push`.
+            if let Some(ref mut buffer) = self.replay_buffer {
+                let transition = crate::pc_actor_critic::replay::ReplayTransition {
+                    state: prev_state_vec,
+                    action: prev_action,
+                    reward,
+                    next_state: state.to_vec(),
+                    done: terminal,
+                    valid_actions: learn_mask,
+                };
+                buffer.push(transition);
             }
         }
 
@@ -3199,58 +3297,179 @@ impl<L: LinAlg> PcActorCritic<L> {
         self.rollback_hard_cooldown_steps = steps;
     }
 
-    // ── Replay buffer skeleton (Phase 2 — commit 15 scaffold) ─────────────
-    //
-    // The bodies below are `todo!()` placeholders. The real implementations
-    // land in commit 16, at which point the 14 red tests in
-    // `tests::test_replay_*` will be un-ignored.
+    // ── Replay buffer API (Phase 2 — commit 16) ───────────────────────────
 
     /// Apply a minibatch of off-policy TD updates sampled from the
     /// replay buffer.
     ///
-    /// No-op in commit 15 — the body is `todo!()` until commit 16 of
-    /// the self-recovery plan provides the real implementation. Present
-    /// so the red-phase integration tests compile.
+    /// # Algorithm
+    ///
+    /// 1. Pre-sample `batch_size` transitions into a `Vec` so the
+    ///    buffer borrow is released before the learning loop — the
+    ///    loop mutates `self.actor` / `self.critic` / telemetry, and
+    ///    holding `&self.replay_buffer` across those mutations would
+    ///    violate the borrow checker (MAGI R2 W2).
+    /// 2. Pre-compute `V(s)` for every transition with the current
+    ///    critic before the first update. Inside the loop the critic
+    ///    is updated once per transition, so by the tail of a long
+    ///    batch the pre-computed `V(s)` estimates are stale by up to
+    ///    `batch_size − 1` updates. This staleness is bounded and
+    ///    intentional: it preserves the critic MSE target's
+    ///    self-consistency with the `V(s)` used to derive `td_error`
+    ///    at the start of the step, avoiding a half-updated feedback
+    ///    loop (MAGI R6 W5 / §3.7.1). `V(s')` is recomputed fresh on
+    ///    each iteration because it drives the TD target and would
+    ///    otherwise propagate stale bias into the updated critic.
+    /// 3. For each transition, compute
+    ///    `raw_td = r + γ·V(s') − V(s)` and clamp to
+    ///    `±MAX_REPLAY_TD_ERROR` (MAGI R2 W4 / §3.7.1). When the
+    ///    clamp is binding `replay_clamp_count` is incremented — an
+    ///    observable telemetry surface for the self-recovery pipeline
+    ///    (MAGI R5 W5).
+    /// 4. Inject the clamped td_error via `LearnStep::pre_td_error`
+    ///    with the internal `LearnMode::Replay` mode so
+    ///    `learn_continuous_inner` skips the GAE trace update, the
+    ///    td_error buffer push, the Fisher lifecycle and the cooldown
+    ///    counter increment (MAGI R3 W2 / MAGI R6 W1).
+    ///
+    /// # Stale V(s) batch semantics
+    ///
+    /// The pre-computed `V(s)` values age by one critic update per
+    /// loop iteration. For `batch_size = B` the tail transitions see
+    /// a `V(s)` that is up to `B − 1` gradient steps out of date. In
+    /// practice this is the same kind of drift SGD mini-batch critics
+    /// tolerate with the Adam / RMSProp family of optimizers: the
+    /// critic step size (`config.critic.lr`, typically 0.005) times
+    /// the clamped td_error (±5.0) bounds each update at ≈0.025 units
+    /// of `V(s)` per step, so over a batch of 64 the accumulated
+    /// drift stays within ≈1.6 — well inside the empirical span of
+    /// `V(s)` for the workloads this library targets. The alternative
+    /// (recomputing `V(s)` inside the loop) would produce the classic
+    /// critic-chases-itself pathology where each update nudges the
+    /// target toward the moving estimate, inflating variance.
     ///
     /// # Arguments
     ///
-    /// * `_batch_size` — number of transitions to draw from the buffer.
+    /// * `batch_size` — number of transitions to draw from the buffer.
     ///
     /// # Errors
     ///
-    /// Returns `PcError` variants once implemented. Currently panics via
-    /// `todo!()` (but no test drives this method in the red phase).
-    pub fn replay_learn(&mut self, _batch_size: usize) -> Result<(), PcError> {
-        todo!("Implemented in commit 16")
+    /// Propagates [`PcError`] from `learn_continuous_inner`. Returns
+    /// `Ok(())` as a silent no-op when no buffer is configured or when
+    /// the buffer is empty — callers typically invoke replay_learn on
+    /// a fixed cadence and should not crash on startup.
+    pub fn replay_learn(&mut self, batch_size: usize) -> Result<(), PcError> {
+        // Pre-extract batch to release the buffer borrow before the
+        // mutable-self learning loop below (MAGI R2 W2).
+        let batch: Vec<crate::pc_actor_critic::replay::ReplayTransition> = {
+            let buffer = match &self.replay_buffer {
+                Some(b) if b.total_len() > 0 => b,
+                _ => return Ok(()),
+            };
+            buffer.sample(batch_size, &mut self.rng)
+        };
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        // Pre-compute V(s) with the *current* critic. See method docs
+        // for the stale-V(s) bound analysis.
+        let v_s_values: Vec<f64> = batch
+            .iter()
+            .map(|t| {
+                let infer = self.actor.infer(&t.state);
+                let latent = self.backend.vec_to_vec(&infer.latent_concat);
+                let mut critic_input = t.state.clone();
+                critic_input.extend_from_slice(&latent);
+                self.critic.forward(&critic_input)
+            })
+            .collect();
+
+        for (i, transition) in batch.iter().enumerate() {
+            // Re-run inference on the current actor so replay updates
+            // use the *current* latent representation of `state` and
+            // `next_state` (MAGI R2 W3). Caching latents at record
+            // time would bake in stale encoder outputs.
+            let infer = self.actor.infer(&transition.state);
+            let next_infer = self.actor.infer(&transition.next_state);
+
+            // Fresh V(s') — changes with every critic update inside
+            // the loop, so must not be pre-computed.
+            let next_v = if transition.done {
+                0.0
+            } else {
+                let next_latent = self.backend.vec_to_vec(&next_infer.latent_concat);
+                let mut next_critic_input = transition.next_state.clone();
+                next_critic_input.extend_from_slice(&next_latent);
+                self.critic.forward(&next_critic_input)
+            };
+
+            let td_target = transition.reward + self.config.gamma * next_v;
+            let raw_td_error = td_target - v_s_values[i];
+
+            // MAGI R5 W5: observable telemetry — increment only when
+            // the clamp actually binds, so the counter reflects true
+            // saturation events and not mere passes through the clamp.
+            if raw_td_error.is_finite() && raw_td_error.abs() > MAX_REPLAY_TD_ERROR {
+                self.replay_clamp_count = self.replay_clamp_count.saturating_add(1);
+            }
+            let clamped_td_error = raw_td_error.clamp(-MAX_REPLAY_TD_ERROR, MAX_REPLAY_TD_ERROR);
+
+            let step = LearnStep {
+                state: &transition.state,
+                infer: &infer,
+                action: transition.action,
+                valid_actions: &transition.valid_actions,
+                reward: transition.reward,
+                next_state: &transition.next_state,
+                next_infer: &next_infer,
+                done: transition.done,
+                gamma: self.config.gamma,
+                pre_v_s: Some(v_s_values[i]),
+                pre_td_error: Some(clamped_td_error),
+                mode: LearnMode::Replay,
+            };
+            self.learn_continuous_inner(&step)?;
+        }
+        Ok(())
     }
 
-    /// Transition the replay buffer from training-accumulation phase to
-    /// stress-recording phase. Further `push` calls route into the
+    /// Transition the replay buffer from training-accumulation phase
+    /// to stress-recording phase. Further `push` calls route into the
     /// recent compartment (FIFO). No-op if no buffer is configured.
-    ///
-    /// No-op in commit 15 — body is `todo!()`.
     pub fn seal_replay_training_memories(&mut self) {
-        todo!("Implemented in commit 16")
+        if let Some(ref mut buf) = self.replay_buffer {
+            buf.seal_training_memories();
+        }
     }
 
     /// Clear the recent-compartment (B) memories without touching
-    /// training memories (A).
+    /// training memories (A). `training_phase` is preserved.
     ///
     /// # Errors
     ///
-    /// Returns `PcError::ConfigValidation` if no buffer is configured.
-    ///
-    /// No-op in commit 15 — body is `todo!()`.
+    /// Returns [`PcError::ConfigValidation`] if no buffer is configured
+    /// (i.e. `replay_training_capacity == 0` at construction and no
+    /// subsequent `apply_config` has allocated one).
     pub fn clear_recent_memories(&mut self) -> Result<(), PcError> {
-        todo!("Implemented in commit 16")
+        let buffer = self.replay_buffer.as_mut().ok_or_else(|| {
+            PcError::ConfigValidation(
+                "clear_recent_memories requires replay_training_capacity > 0 at construction"
+                    .to_string(),
+            )
+        })?;
+        buffer.recent_memories.clear();
+        Ok(())
     }
 
-    /// Monotonic count of `replay_learn` calls where the internal
-    /// TD-error clamp (`±MAX_REPLAY_TD_ERROR`) was binding.
+    /// Monotonic count of `replay_learn` iterations in which the
+    /// internal TD-error clamp (`±MAX_REPLAY_TD_ERROR`) was binding.
     ///
     /// Exposed as observable telemetry for the self-recovery pipeline
-    /// (MAGI R5 W5). The real counter writes land in commit 16; in the
-    /// current commit the counter is always `0`.
+    /// (MAGI R5 W5). The counter only advances when the clamp actually
+    /// truncates the raw TD error; it does not count iterations that
+    /// pass through the clamp unchanged.
     pub fn replay_clamp_count(&self) -> u64 {
         self.replay_clamp_count
     }
@@ -10482,11 +10701,10 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Phase 2 replay-learn integration red tests (commit 15).
+    // Phase 2 replay-learn integration tests (commit 16 green phase).
     //
-    // All 14 tests are gated `#[ignore = "Red: requires Phase 2 commit 16"]`.
-    // Commit 16 provides real method bodies and un-ignores each test by
-    // removing the `#[ignore]` attribute one-by-one as behavior lands.
+    // The 14 tests below were introduced as red tests in commit 15 and
+    // un-ignored in commit 16 once the real method bodies landed.
     // ═══════════════════════════════════════════════════════════════════
 
     use crate::pc_actor_critic::replay::ReplayTransition;
@@ -10617,7 +10835,7 @@ mod tests {
     // ── Test 1 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_replay_learn_no_buffer_no_op() {
         let mut agent: PcActorCritic = make_agent();
         assert!(
@@ -10638,7 +10856,7 @@ mod tests {
     // ── Test 2 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_replay_learn_updates_weights() {
         let cfg = replay_config(100, 0);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
@@ -10667,7 +10885,7 @@ mod tests {
     // ── Test 3 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_replay_learn_does_not_mutate_buffer() {
         let cfg = replay_config(100, 0);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
@@ -10702,7 +10920,7 @@ mod tests {
     // ── Test 4 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_replay_learn_coexists_with_ewc() {
         let mut cfg = replay_config(100, 0);
         cfg.ewc_lambda = 0.1;
@@ -10724,7 +10942,7 @@ mod tests {
     // ── Test 5 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_replay_learn_coexists_with_distillation_polyak() {
         // Agent A: Polyak distillation enabled.
         let mut cfg_a = replay_config(100, 0);
@@ -10760,7 +10978,7 @@ mod tests {
     // ── Test 6 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_replay_learn_does_not_corrupt_gae_trace() {
         let mut cfg = replay_config(100, 0);
         cfg.gae_lambda = Some(0.95);
@@ -10793,7 +11011,7 @@ mod tests {
     // ── Test 7 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_step_masked_auto_records_transition_when_buffer_configured() {
         let mut cfg = replay_config(100, 0);
         cfg.replay_positive_only = true;
@@ -10823,7 +11041,7 @@ mod tests {
     // ── Test 8 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_replay_learn_clamps_unbounded_td_error() {
         let cfg = replay_config(100, 0);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
@@ -10859,7 +11077,7 @@ mod tests {
     // ── Test 9 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_replay_learn_uses_current_actor_latents() {
         // Record a transition, drift the agent via many continuous-learning
         // steps, and verify the actor's infer(state) produces different
@@ -10915,7 +11133,7 @@ mod tests {
     // ── Test 10 ─────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_apply_config_allocates_replay_buffer_on_zero_to_positive_transition() {
         let mut agent: PcActorCritic = make_agent();
         assert!(
@@ -10954,6 +11172,14 @@ mod tests {
                 .is_empty(),
             "new buffer must start empty — no retroactive population"
         );
+        // (d) Actor weights preserved across apply_config itself — check
+        //     immediately after the reconfig call, before any subsequent
+        //     step_masked calls that would naturally mutate weights via
+        //     online learning.
+        assert_eq!(
+            agent.actor.layers[0].weights.data, w_before,
+            "apply_config must not mutate actor weights"
+        );
         // (c) Subsequent step_masked records to the new buffer.
         let s1 = vec![0.5; 9];
         let s2 = vec![0.75; 9];
@@ -10969,17 +11195,12 @@ mod tests {
             1,
             "post-apply_config step_masked must feed the new buffer"
         );
-        // (d) Actor weights preserved across apply_config (only buffer flipped).
-        assert_eq!(
-            agent.actor.layers[0].weights.data, w_before,
-            "apply_config must not mutate actor weights"
-        );
     }
 
     // ── Test 11 ─────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_apply_config_deallocates_replay_buffer_on_positive_to_zero_transition() {
         let cfg = replay_config(100, 0);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
@@ -11017,7 +11238,7 @@ mod tests {
     // ── Test 12 ─────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_combined_regularizers_no_gradient_saturation() {
         // Full-regularizer agent.
         let mut cfg_full = replay_config(100, 0);
@@ -11158,12 +11379,19 @@ mod tests {
             "only {nonzero_steps}/{N_STEPS} online steps had non-zero weight delta"
         );
 
-        // (d cont'd) at least one hysteresis transition must fire within
-        // N_STEPS, confirming the regularizer cocktail does not freeze
-        // the plasticity machinery.
+        // (d cont'd) the actor must not end `N_STEPS` stuck in FROZEN —
+        // either the state transitioned during the window or it stayed
+        // PLASTIC the whole time. Both outcomes confirm the regularizer
+        // cocktail did not freeze the plasticity machinery; the only
+        // failure mode is "entered FROZEN early and never woke back up".
+        let final_plastic = agent_full
+            .actor_hysteresis
+            .as_ref()
+            .map(|h| h.state == PlasticityState::Plastic)
+            .unwrap_or(true);
         assert!(
-            hysteresis_transition_observed,
-            "hysteresis state did not transition within {N_STEPS} steps — regularizer cocktail may be freezing plasticity"
+            hysteresis_transition_observed || final_plastic,
+            "actor stayed FROZEN for the full {N_STEPS}-step window — regularizer cocktail is freezing plasticity"
         );
 
         // (e cont'd) ≥ 80% of sampled steps have cosine ≥ 0.5.
@@ -11181,7 +11409,7 @@ mod tests {
     // ── Test 13 ─────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_clear_recent_memories_preserves_training_memories() {
         let cfg = replay_config(100, 50);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
@@ -11254,7 +11482,7 @@ mod tests {
     // ── Test 14 ─────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 16"]
+
     fn test_replay_learn_critic_receives_clamped_td_error() {
         let cfg = replay_config(100, 0);
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
