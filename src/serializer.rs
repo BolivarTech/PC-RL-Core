@@ -1370,4 +1370,201 @@ mod tests {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&resave_path);
     }
+
+    // ── Phase 2 Section: Replay buffer serialization ───────────────
+
+    /// Red test — commit 18 must persist both replay compartments plus the
+    /// `training_phase` flag across a save/load round-trip.
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 18"]
+    fn test_save_load_preserves_replay_buffer() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::pc_actor_critic::replay::ReplayTransition;
+
+        // Agent configured with a replay buffer of both compartments.
+        let mut config = default_config();
+        config.replay_training_capacity = 100;
+        config.replay_recent_capacity = 50;
+        // Disable positive_only so synthetic transitions with reward=0.0 are retained
+        // (content equality is what we care about, not reward filtering).
+        config.replay_positive_only = false;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        assert!(
+            agent.replay_buffer.is_some(),
+            "replay_training_capacity > 0 must allocate a buffer at construction"
+        );
+
+        // Build 30 deterministic training transitions and push them directly
+        // into the buffer (bypasses step_masked — serde layer is the subject
+        // under test, push/seal semantics are already covered by replay.rs).
+        let make_tx = |marker: f64, reward: f64| -> ReplayTransition {
+            let mut state = vec![0.0; 9];
+            state[0] = marker;
+            let mut next_state = vec![0.0; 9];
+            next_state[1] = marker;
+            ReplayTransition {
+                state,
+                action: (marker as usize) % 9,
+                reward,
+                next_state,
+                done: false,
+                valid_actions: (0..9).collect(),
+            }
+        };
+
+        let mut training_originals: Vec<ReplayTransition> = Vec::with_capacity(30);
+        {
+            let buf = agent.replay_buffer.as_mut().unwrap();
+            for i in 0..30 {
+                let tx = make_tx(i as f64, 1.0);
+                training_originals.push(tx.clone());
+                buf.push(tx);
+            }
+        }
+        assert_eq!(
+            agent
+                .replay_buffer
+                .as_ref()
+                .unwrap()
+                .training_memories
+                .len(),
+            30
+        );
+
+        // Seal — subsequent pushes must route to the recent compartment.
+        agent.seal_replay_training_memories();
+        assert!(!agent.replay_buffer.as_ref().unwrap().training_phase);
+
+        let mut recent_originals: Vec<ReplayTransition> = Vec::with_capacity(20);
+        {
+            let buf = agent.replay_buffer.as_mut().unwrap();
+            for i in 0..20 {
+                let tx = make_tx(100.0 + i as f64, 0.5);
+                recent_originals.push(tx.clone());
+                buf.push(tx);
+            }
+        }
+        assert_eq!(
+            agent.replay_buffer.as_ref().unwrap().recent_memories.len(),
+            20
+        );
+
+        // Save and reload.
+        let path = temp_path("test_save_load_preserves_replay_buffer.json");
+        save_agent(&agent, &path, 123, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        // Buffer must be present on the loaded agent.
+        let loaded_buf = loaded
+            .replay_buffer
+            .as_ref()
+            .expect("loaded agent must have a replay buffer after round-trip");
+
+        // Compartment lengths must match exactly.
+        assert_eq!(
+            loaded_buf.training_memories.len(),
+            30,
+            "training compartment size must survive round-trip"
+        );
+        assert_eq!(
+            loaded_buf.recent_memories.len(),
+            20,
+            "recent compartment size must survive round-trip"
+        );
+
+        // Seal flag must survive.
+        assert!(
+            !loaded_buf.training_phase,
+            "training_phase must remain false after round-trip (seal was called before save)"
+        );
+
+        // Content equality for each compartment, element-wise.
+        for (i, (expected, actual)) in training_originals
+            .iter()
+            .zip(loaded_buf.training_memories.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                expected, actual,
+                "training_memories[{i}] must match original after round-trip"
+            );
+        }
+        for (i, (expected, actual)) in recent_originals
+            .iter()
+            .zip(loaded_buf.recent_memories.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                expected, actual,
+                "recent_memories[{i}] must match original after round-trip"
+            );
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Red test — a pre-Phase-2 save file (no `replay_buffer` field in the
+    /// JSON) must load as a freshly-allocated empty buffer when the loaded
+    /// config has `replay_training_capacity > 0`. This preserves the
+    /// invariant established by `PcActorCritic::new`: capacity > 0 ⇒
+    /// `replay_buffer.is_some()`.
+    #[test]
+    #[ignore = "Red: requires Phase 2 commit 18"]
+    fn test_legacy_save_file_replay_buffer_none() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        // Build an agent with a configured (but empty) replay buffer, save
+        // it with the current code, strip any `replay_buffer` key to mimic
+        // a pre-Phase-2 save file, then load and verify the buffer was
+        // allocated fresh from the config.
+        let mut config = default_config();
+        config.replay_training_capacity = 100;
+        config.replay_recent_capacity = 50;
+
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        assert!(
+            agent.replay_buffer.is_some(),
+            "construction must allocate a buffer when capacity > 0"
+        );
+        assert_eq!(
+            agent.replay_buffer.as_ref().unwrap().total_len(),
+            0,
+            "newly-constructed buffer must be empty"
+        );
+
+        let path = temp_path("test_legacy_save_file_replay_buffer_none.json");
+        save_agent(&agent, &path, 0, None).unwrap();
+
+        // Strip any `replay_buffer` key at the top level so the file looks
+        // exactly like a Phase-1 save (no replay_buffer field at all).
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        if let Some(obj) = json.as_object_mut() {
+            obj.remove("replay_buffer");
+        }
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        // Load — the deserializer must tolerate the missing field (legacy
+        // compat) and `load_agent` must allocate a fresh empty buffer from
+        // the config's replay_training_capacity > 0.
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        assert!(
+            loaded.replay_buffer.is_some(),
+            "legacy save file must still yield a buffer when config has replay_training_capacity > 0"
+        );
+        let buf = loaded.replay_buffer.as_ref().unwrap();
+        assert_eq!(
+            buf.total_len(),
+            0,
+            "legacy load must produce an empty buffer (no transitions in file)"
+        );
+        assert!(
+            buf.training_phase,
+            "fresh buffer must start in training_phase = true"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
 }
