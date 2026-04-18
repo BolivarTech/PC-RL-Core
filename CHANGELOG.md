@@ -49,6 +49,47 @@
     are independently useful for GA crossover and teacher-student setups.
 - Backward-compatible serialization: legacy save files without the new anchor
   weights load cleanly with anchors auto-initialized from the live actor.
+- Dual-compartment replay buffer for off-policy learning from stored positive-reward
+  trajectories.
+  - Two FIFO ring buffers: training memories (compartment A, immutable after
+    `seal_replay_training_memories()`) and recent stress successes (compartment B,
+    FIFO eviction).
+  - New method `replay_learn(batch_size)` samples 50/50 from both compartments and
+    applies off-policy TD updates via `learn_continuous_inner` with `replay_mode = true`.
+  - Auto-records transitions in `step_masked()` when buffer is configured.
+  - EWC, Polyak/Frozen distillation regularizers all apply to replay updates
+    automatically (single update path, controlled by `replay_mode` flag).
+  - Replay updates do NOT contaminate online state: GAE trace, hysteresis counters,
+    and `td_error_buffer` are preserved unchanged.
+  - New method `clear_recent_memories()` discards compartment B without
+    touching compartment A. Use during cascade-recovery in self-play setups
+    where compartment B may be contaminated by transitions from a degraded
+    policy.
+
+### Refactored
+
+- `learn_continuous_inner` gains two new parameters to support off-policy
+  replay without code duplication: `mode: LearnMode` (commit 12) and
+  `pre_td_error: Option<f64>` (commit 16). All existing online callers pass
+  `LearnMode::Online` and `pre_td_error: None`; zero behavior change to
+  non-replay paths.
+
+### Note on tuning
+
+The self-recovery mechanism shipped in this release is a **toolkit, not a
+pre-tuned solution** (MAGI R3 W5). The dual-anchor distillation
+(`distillation_lambda_polyak`, `distillation_lambda_frozen`, `polyak_tau`),
+the replay buffer capacities (`replay_training_capacity`,
+`replay_recent_capacity`), the EWC strength (`ewc_lambda`), and the
+hysteresis thresholds form a 7+ dimensional hyperparameter surface whose
+optimal values depend strongly on the consumer's environment dynamics,
+reward sparsity, and drift profile. The defaults shipped in
+`PcActorCriticConfig` (e.g., `polyak_tau = 0.005`, `lambda = 0.0` for both
+distillation terms) are **conservative starting points**, not validated
+recommendations. Downstream consumers MUST conduct their own empirical
+tuning sweeps and should expect 50-200 episodes of evaluation per
+configuration to get a meaningful signal. The library does not (and
+cannot) provide auto-tuning; that responsibility lives in the consumer.
 
 ### Fixed
 - Cross-wake couplings in `PcActorCritic::process_hysteresis` now fire on
