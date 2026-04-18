@@ -3247,12 +3247,38 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// tolerate with the Adam / RMSProp family of optimizers: the
     /// critic step size (`config.critic.lr`, typically 0.005) times
     /// the clamped td_error (±5.0) bounds each update at ≈0.025 units
-    /// of `V(s)` per step, so over a batch of 64 the accumulated
-    /// drift stays within ≈1.6 — well inside the empirical span of
-    /// `V(s)` for the workloads this library targets. The alternative
-    /// (recomputing `V(s)` inside the loop) would produce the classic
+    /// of `V(s)` per step, so a single batch of 64 stays within ≈1.6
+    /// units of accumulated drift. The alternative (recomputing `V(s)`
+    /// inside the loop) would produce the classic
     /// critic-chases-itself pathology where each update nudges the
     /// target toward the moving estimate, inflating variance.
+    ///
+    /// # Cross-call drift in warmup loops
+    ///
+    /// The per-batch bound (≈1.6 units) composes across consecutive
+    /// `replay_learn` invocations. A warmup loop of `N` calls — such
+    /// as the recommended post-`rollback_hard` critic warmup — can
+    /// accumulate up to `N · 1.6` units of `V(s)` drift under
+    /// adversarial conditions: a stale critic, a narrow training
+    /// distribution in compartment A, and an actor whose rolled-back
+    /// weights disagree with the critic's current `V` estimates. Under
+    /// the synthetic single-state stress scenario in
+    /// `tests/phase2_smoke.rs::phase2_stress_scenario_rollback_recovery`,
+    /// a 50-call warmup on out-of-distribution evaluation states has
+    /// been observed to push `|V(s)|` to ≈60-70 — legitimate critic
+    /// extrapolation on OOD inputs after a narrow training pattern,
+    /// not a correctness bug.
+    ///
+    /// The theoretical ceiling under default config (`γ = 0.99`,
+    /// `|reward| ≤ 1`) is `1 / (1 − γ) = 100`; the warmup window
+    /// should be sized so the projected cumulative drift stays well
+    /// inside that bound. If your workload uses larger rewards or
+    /// smaller `γ`, rescale accordingly. The
+    /// [`replay_clamp_count`](Self::replay_clamp_count) telemetry
+    /// counter surfaces sustained clamp-binding during warmup — a
+    /// leading indicator that the cross-call drift is close to its
+    /// envelope and the warmup should be shortened or re-seeded with
+    /// a broader transition distribution.
     ///
     /// # Arguments
     ///
