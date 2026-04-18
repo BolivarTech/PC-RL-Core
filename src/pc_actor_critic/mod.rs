@@ -380,6 +380,36 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
     }
 
+    /// Allocates the Polyak + Frozen distillation anchor slots based on the
+    /// configured distillation lambdas.
+    ///
+    /// Returns `(polyak_target, frozen_champion)`. Each slot is
+    /// `Some(actor.clone())` when its corresponding `distillation_lambda_*`
+    /// is strictly positive, `None` otherwise. A lambda of exactly `0.0`
+    /// disables the slot entirely — no `PcActor` clone is allocated.
+    ///
+    /// This is the single authoritative allocation site for both anchors:
+    /// every `PcActorCritic` constructor (`new`, `crossover`, `from_parts`)
+    /// and `apply_config` delegates here so the lambda-based slot-presence
+    /// invariant is guaranteed by construction. Centralising this logic
+    /// resolves the DRY concern raised by MAGI Gate A W2.
+    fn allocate_anchor_slots(
+        config: &PcActorCriticConfig,
+        actor: &PcActor<L>,
+    ) -> (Option<PcActor<L>>, Option<PcActor<L>>) {
+        let polyak_target = if config.distillation_lambda_polyak > 0.0 {
+            Some(actor.clone())
+        } else {
+            None
+        };
+        let frozen_champion = if config.distillation_lambda_frozen > 0.0 {
+            Some(actor.clone())
+        } else {
+            None
+        };
+        (polyak_target, frozen_champion)
+    }
+
     /// Validates a [`PcActorCriticConfig`] for internal consistency.
     ///
     /// Checks gamma range, surprise buffer size, scale floor/ceil ordering,
@@ -969,19 +999,11 @@ impl<L: LinAlg> PcActorCritic<L> {
         let critic_fisher =
             Self::build_fisher_for_layers(&self.backend, &self.critic.layers, config.ewc_lambda);
 
-        // 6b. Reallocate Polyak target on lambda transition
-        let polyak_target = if config.distillation_lambda_polyak > 0.0 {
-            Some(self.actor.clone())
-        } else {
-            None
-        };
-
-        // 6c. Reallocate frozen champion on lambda transition
-        let frozen_champion = if config.distillation_lambda_frozen > 0.0 {
-            Some(self.actor.clone())
-        } else {
-            None
-        };
+        // 6b. Reallocate Polyak + Frozen anchor slots on lambda transition.
+        // Delegates to the single authoritative allocation site
+        // (`allocate_anchor_slots`) so the lambda-based slot-presence
+        // invariant matches every other constructor.
+        let (polyak_target, frozen_champion) = Self::allocate_anchor_slots(&config, &self.actor);
 
         // 6d. Replay buffer slot transitions (Phase 2).
         //     0 → positive:  allocate fresh empty buffer.
@@ -1108,16 +1130,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         let critic_fisher =
             Self::build_fisher_for_layers(&backend, &critic.layers, config.ewc_lambda);
         let new_trace_len = Self::gae_trace_len(&config);
-        let polyak_target = if config.distillation_lambda_polyak > 0.0 {
-            Some(actor.clone())
-        } else {
-            None
-        };
-        let frozen_champion = if config.distillation_lambda_frozen > 0.0 {
-            Some(actor.clone())
-        } else {
-            None
-        };
+        let (polyak_target, frozen_champion) = Self::allocate_anchor_slots(&config, &actor);
         let replay_buffer = if config.replay_training_capacity > 0 {
             Some(crate::pc_actor_critic::replay::ReplayBuffer::new(
                 config.replay_training_capacity,
@@ -1247,16 +1260,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         let (child_actor_decay, child_critic_decay, child_layer_error_ema) =
             Self::compute_decay_factors(&child_config);
         let child_trace_len = Self::gae_trace_len(&child_config);
-        let polyak_target = if child_config.distillation_lambda_polyak > 0.0 {
-            Some(actor.clone())
-        } else {
-            None
-        };
-        let frozen_champion = if child_config.distillation_lambda_frozen > 0.0 {
-            Some(actor.clone())
-        } else {
-            None
-        };
+        let (polyak_target, frozen_champion) = Self::allocate_anchor_slots(&child_config, &actor);
 
         Ok(Self {
             actor,
@@ -1313,16 +1317,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         let (actor_decay_factors, critic_decay_factors, layer_error_ema) =
             Self::compute_decay_factors(&config);
         let parts_trace_len = Self::gae_trace_len(&config);
-        let polyak_target = if config.distillation_lambda_polyak > 0.0 {
-            Some(actor.clone())
-        } else {
-            None
-        };
-        let frozen_champion = if config.distillation_lambda_frozen > 0.0 {
-            Some(actor.clone())
-        } else {
-            None
-        };
+        let (polyak_target, frozen_champion) = Self::allocate_anchor_slots(&config, &actor);
         Self {
             actor,
             critic,
@@ -2664,7 +2659,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             .backend
             .apply_derivative(output_output, self.actor.layers[n_layers - 1].activation);
         let mut grad = self.backend.vec_hadamard(&output_delta_vec, &deriv);
-        self.backend.clip_vec(&mut grad, 5.0); // GRAD_CLIP
+        self.backend.clip_vec(&mut grad, crate::matrix::GRAD_CLIP);
 
         // Update F_ema for output layer
         self.update_fisher_ema_layer(n_layers - 1, &grad, true);
@@ -2715,7 +2710,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                 .backend
                 .apply_derivative(layer_output, self.actor.layers[i].activation);
             let mut grad_h = self.backend.vec_hadamard(&scaled_delta, &deriv_h);
-            self.backend.clip_vec(&mut grad_h, 5.0);
+            self.backend.clip_vec(&mut grad_h, crate::matrix::GRAD_CLIP);
 
             self.update_fisher_ema_layer(i, &grad_h, true);
 
