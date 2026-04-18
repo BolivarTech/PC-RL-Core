@@ -184,6 +184,10 @@ pub struct SaveFile {
     /// Frozen champion actor weights (None when lambda == 0 or legacy file).
     #[serde(default)]
     pub frozen_champion_weights: Option<PcActorWeights>,
+    /// Dual-compartment replay buffer state (None when
+    /// `replay_training_capacity == 0` or legacy file).
+    #[serde(default)]
+    pub replay_buffer: Option<crate::pc_actor_critic::replay::ReplayBuffer>,
 }
 
 /// Saves the agent's full state to a JSON file.
@@ -222,6 +226,7 @@ pub fn save_agent<L: LinAlg>(
         cl_state: agent.to_cl_state(),
         polyak_target_weights: agent.polyak_target.as_ref().map(|a| a.to_weights()),
         frozen_champion_weights: agent.frozen_champion.as_ref().map(|a| a.to_weights()),
+        replay_buffer: agent.replay_buffer.clone(),
     };
 
     let json = serde_json::to_string_pretty(&save_file)?;
@@ -338,6 +343,24 @@ pub fn load_agent_generic<L: LinAlg>(
     if let Some(cl_state) = save_file.cl_state {
         agent.restore_cl_state(cl_state);
     }
+
+    // Restore replay buffer:
+    //   * If the SaveFile carries a `Some(buf)`, use it directly.
+    //   * Else if the effective config's `replay_training_capacity > 0`, allocate
+    //     a fresh empty buffer (legacy save-file compat — Phase 1 files lack the
+    //     `replay_buffer` key).
+    //   * Else, no buffer.
+    agent.replay_buffer = if let Some(buf) = save_file.replay_buffer {
+        Some(buf)
+    } else if save_file.config.replay_training_capacity > 0 {
+        Some(crate::pc_actor_critic::replay::ReplayBuffer::new(
+            save_file.config.replay_training_capacity,
+            save_file.config.replay_recent_capacity,
+            save_file.config.replay_positive_only,
+        ))
+    } else {
+        None
+    };
 
     Ok((agent, save_file.metadata))
 }
@@ -1376,7 +1399,6 @@ mod tests {
     /// Red test — commit 18 must persist both replay compartments plus the
     /// `training_phase` flag across a save/load round-trip.
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 18"]
     fn test_save_load_preserves_replay_buffer() {
         use crate::linalg::cpu::CpuLinAlg;
         use crate::pc_actor_critic::replay::ReplayTransition;
@@ -1510,7 +1532,6 @@ mod tests {
     /// invariant established by `PcActorCritic::new`: capacity > 0 ⇒
     /// `replay_buffer.is_some()`.
     #[test]
-    #[ignore = "Red: requires Phase 2 commit 18"]
     fn test_legacy_save_file_replay_buffer_none() {
         use crate::linalg::cpu::CpuLinAlg;
 
