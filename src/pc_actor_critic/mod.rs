@@ -44,6 +44,8 @@ pub use trajectory::{ActivationCache, TrajectoryStep};
 
 pub mod replay;
 
+mod control;
+
 /// Default cooldown (in learning steps) between consecutive `rollback_hard()` calls.
 ///
 /// Prevents thrashing when the caller repeatedly reverts the actor to the
@@ -237,10 +239,10 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     pub(crate) frozen_champion: Option<PcActor<L>>,
     /// Cooldown window (learning steps) between consecutive `rollback_hard()` calls.
     /// 0 disables the cooldown entirely.
-    rollback_hard_cooldown_steps: u64,
+    pub(crate) rollback_hard_cooldown_steps: u64,
     /// Steps since the last successful `rollback_hard()` call.
     /// Initialized to `u64::MAX` so the first call is always allowed.
-    steps_since_last_rollback_hard: u64,
+    pub(crate) steps_since_last_rollback_hard: u64,
     /// Dual-compartment replay buffer (Phase 2). `None` when
     /// `replay_training_capacity == 0` at construction, otherwise a
     /// freshly-allocated empty buffer sized per config. Populated by
@@ -3167,129 +3169,38 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
     }
 
-    /// Rolls back the live actor to the Polyak-averaged target weights.
-    ///
-    /// Copies all weights (layers, biases, ReZero alphas, skip projections)
-    /// from the Polyak target into the live actor. Also resets transient
-    /// actor state (eligibility trace, plastic step counter, frozen steps,
-    /// TD error buffer).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PcError::ConfigValidation`] if the Polyak target is not
-    /// allocated (`distillation_lambda_polyak == 0.0`).
-    pub fn rollback_soft(&mut self) -> Result<(), PcError> {
-        let polyak = self.polyak_target.as_ref().ok_or_else(|| {
-            PcError::ConfigValidation(
-                "rollback_soft requires distillation_lambda_polyak > 0".into(),
-            )
-        })?;
-        self.actor.copy_weights_from(polyak)?;
+    /// Reset actor-only transient state that accumulates during
+    /// learning (eligibility trace, plasticity counters, TD-error
+    /// buffer, last TD error). Shared by
+    /// [`rollback_soft`](Self::rollback_soft) and
+    /// [`rollback_hard`](Self::rollback_hard) — neither of them should
+    /// inherit the old live actor's learning bookkeeping after a
+    /// weight rewrite.
+    pub(crate) fn reset_actor_transient_state(&mut self) {
         self.actor_trace.fill(0.0);
         self.actor_plastic_step_counter = 0;
         self.actor_frozen_steps = 0;
         self.td_error_buffer.clear();
         self.last_td_error = 0.0;
-        Ok(())
     }
 
-    /// Rolls back the live actor (and Polyak target, if present) to the
-    /// frozen champion weights.
-    ///
-    /// Restores actor weights from the frozen champion. If a Polyak target
-    /// exists, it is also reset to the frozen champion. EWC Fisher running
-    /// EMA (`f_ema`) is zeroed while `f_total` and `theta_snapshot` are
-    /// preserved. The critic is explicitly NOT touched.
-    ///
-    /// Subject to a cooldown gate: if fewer than `rollback_hard_cooldown_steps`
-    /// learning steps have elapsed since the last successful call, the
-    /// method returns an error and performs no mutation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PcError::ConfigValidation`] if the frozen champion is not
-    /// allocated (`distillation_lambda_frozen == 0.0`) or if the cooldown
-    /// window has not elapsed.
-    pub fn rollback_hard(&mut self) -> Result<(), PcError> {
-        // Cooldown gate — reject entirely (no mutation) if within window
-        if self.rollback_hard_cooldown_steps > 0
-            && self.steps_since_last_rollback_hard < self.rollback_hard_cooldown_steps
-        {
-            return Err(PcError::ConfigValidation(format!(
-                "rollback_hard rejected: cooldown active ({} of {} steps)",
-                self.steps_since_last_rollback_hard, self.rollback_hard_cooldown_steps,
-            )));
+    /// Zero the Fisher EMA (short-horizon running estimate) for every
+    /// actor layer. `f_total` and `theta_snapshot` are preserved —
+    /// they encode long-horizon parameter importance and the quadratic
+    /// penalty anchor, both of which must survive a rollback so EWC
+    /// continues to penalise drift from the restored weights. No-op
+    /// when EWC is disabled (`ewc_lambda == 0.0`).
+    pub(crate) fn clear_actor_fisher_ema(&mut self) {
+        if self.config.ewc_lambda <= 0.0 {
+            return;
         }
-        let frozen = self.frozen_champion.as_ref().ok_or_else(|| {
-            PcError::ConfigValidation(
-                "rollback_hard requires distillation_lambda_frozen > 0".into(),
-            )
-        })?;
-        let frozen_clone = frozen.clone();
-
-        // 1. Actor weights <- frozen
-        self.actor.copy_weights_from(&frozen_clone)?;
-
-        // 2. Polyak <- frozen (if allocated)
-        if let Some(ref mut polyak) = self.polyak_target {
-            polyak.copy_weights_from(&frozen_clone)?;
+        for fisher in self.actor_fisher.iter_mut() {
+            let rows = self.backend.mat_rows(&fisher.f_ema_weights);
+            let cols = self.backend.mat_cols(&fisher.f_ema_weights);
+            fisher.f_ema_weights = self.backend.zeros_mat(rows, cols);
+            let bias_len = self.backend.vec_len(&fisher.f_ema_bias);
+            fisher.f_ema_bias = self.backend.zeros_vec(bias_len);
         }
-
-        // 3. EWC Fisher: clear f_ema, preserve f_total and theta_snapshot
-        if self.config.ewc_lambda > 0.0 {
-            for fisher in self.actor_fisher.iter_mut() {
-                let rows = self.backend.mat_rows(&fisher.f_ema_weights);
-                let cols = self.backend.mat_cols(&fisher.f_ema_weights);
-                fisher.f_ema_weights = self.backend.zeros_mat(rows, cols);
-                let bias_len = self.backend.vec_len(&fisher.f_ema_bias);
-                fisher.f_ema_bias = self.backend.zeros_vec(bias_len);
-            }
-        }
-
-        // 4. Actor transient state reset
-        self.actor_trace.fill(0.0);
-        self.actor_plastic_step_counter = 0;
-        self.actor_frozen_steps = 0;
-        self.td_error_buffer.clear();
-        self.last_td_error = 0.0;
-
-        // 5. Cooldown reset
-        self.steps_since_last_rollback_hard = 0;
-
-        // Critic is EXPLICITLY NOT TOUCHED
-        Ok(())
-    }
-
-    /// Promotes the current live actor weights into the frozen champion slot.
-    ///
-    /// Copies all weights from the live actor into the frozen champion.
-    /// The Polyak target and all learning state are left untouched.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PcError::ConfigValidation`] if the frozen champion is not
-    /// allocated (`distillation_lambda_frozen == 0.0`).
-    pub fn champion_update(&mut self) -> Result<(), PcError> {
-        let frozen = self.frozen_champion.as_mut().ok_or_else(|| {
-            PcError::ConfigValidation(
-                "champion_update requires distillation_lambda_frozen > 0".into(),
-            )
-        })?;
-        frozen.copy_weights_from(&self.actor)?;
-        Ok(())
-    }
-
-    /// Sets the cooldown window (in learning steps) between consecutive
-    /// `rollback_hard()` calls.
-    ///
-    /// Pass `0` to disable the cooldown entirely.
-    ///
-    /// # Arguments
-    ///
-    /// * `steps` - Number of learning steps that must elapse before a
-    ///   subsequent `rollback_hard()` is allowed.
-    pub fn set_rollback_hard_cooldown(&mut self, steps: u64) {
-        self.rollback_hard_cooldown_steps = steps;
     }
 
     // ── Replay buffer API (Phase 2 — commit 16) ───────────────────────────
@@ -3403,10 +3314,18 @@ impl<L: LinAlg> PcActorCritic<L> {
             let td_target = transition.reward + self.config.gamma * next_v;
             let raw_td_error = td_target - v_s_values[i];
 
-            // MAGI R5 W5: observable telemetry — increment only when
-            // the clamp actually binds, so the counter reflects true
-            // saturation events and not mere passes through the clamp.
-            if raw_td_error.is_finite() && raw_td_error.abs() > MAX_REPLAY_TD_ERROR {
+            // Observable clamp telemetry: count every saturation event
+            // so monitoring dashboards can flag sustained clamp binding
+            // as an early-warning signal of off-policy drift. Both the
+            // "finite magnitude exceeds envelope" case and the
+            // "non-finite raw td_error" case bind the clamp —
+            // `f64::clamp` saturates ±Inf to ±MAX_REPLAY_TD_ERROR — so
+            // both count. The NaN guard inside `learn_continuous_inner`
+            // will still short-circuit injected NaN values, but the
+            // saturation event is surfaced here first so a NaN- or
+            // Inf-producing critic is visible via the counter instead
+            // of being silently swallowed downstream.
+            if !raw_td_error.is_finite() || raw_td_error.abs() > MAX_REPLAY_TD_ERROR {
                 self.replay_clamp_count = self.replay_clamp_count.saturating_add(1);
             }
             let clamped_td_error = raw_td_error.clamp(-MAX_REPLAY_TD_ERROR, MAX_REPLAY_TD_ERROR);
@@ -3432,11 +3351,26 @@ impl<L: LinAlg> PcActorCritic<L> {
 
     /// Transition the replay buffer from training-accumulation phase
     /// to stress-recording phase. Further `push` calls route into the
-    /// recent compartment (FIFO). No-op if no buffer is configured.
-    pub fn seal_replay_training_memories(&mut self) {
-        if let Some(ref mut buf) = self.replay_buffer {
-            buf.seal_training_memories();
-        }
+    /// recent compartment (FIFO).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcError::ConfigValidation`] if no buffer is configured
+    /// (i.e. `replay_training_capacity == 0` at construction and no
+    /// subsequent `apply_config` has allocated one). The symmetric
+    /// behaviour to [`clear_recent_memories`](Self::clear_recent_memories)
+    /// surfaces the misconfiguration explicitly instead of silently
+    /// succeeding — sealing a non-existent buffer is almost always a
+    /// pipeline wiring bug that a consumer wants to observe.
+    pub fn seal_replay_training_memories(&mut self) -> Result<(), PcError> {
+        let buffer = self.replay_buffer.as_mut().ok_or_else(|| {
+            PcError::ConfigValidation(
+                "seal_replay_training_memories requires replay_training_capacity > 0 at construction"
+                    .to_string(),
+            )
+        })?;
+        buffer.seal_training_memories();
+        Ok(())
     }
 
     /// Clear the recent-compartment (B) memories without touching
@@ -11069,6 +11003,45 @@ mod tests {
         );
     }
 
+    // ── Test 8b ─ non-finite raw td_error counts as binding clamp ──
+
+    #[test]
+    fn test_replay_learn_nonfinite_td_error_increments_clamp_counter() {
+        // Locks MAGI Caspar review finding: ±Inf raw_td_error silently
+        // saturates `clamp(-5.0, 5.0)` to ±5.0 without previously
+        // incrementing `replay_clamp_count`. After the fix, both
+        // finite-over-envelope AND non-finite raw TD errors must tick
+        // the counter so a monitoring dashboard never misses the most
+        // catastrophic saturation events.
+        let cfg = replay_config(100, 0);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // A reward of +Inf produces an +Inf td_target and hence an
+        // +Inf raw_td_error. The `learn_continuous_inner` NaN guard
+        // will still short-circuit the actual weight update, but the
+        // saturation event must be surfaced to the telemetry counter
+        // BEFORE the guard fires.
+        {
+            let buf = agent.replay_buffer.as_mut().unwrap();
+            for i in 0..4 {
+                buf.push(make_replay_transition((i as f64) * 0.1, f64::INFINITY));
+            }
+        }
+
+        let before = agent.replay_clamp_count();
+        agent.replay_learn(4).expect("replay_learn must succeed");
+        let after = agent.replay_clamp_count();
+
+        assert!(
+            all_weights_finite(&agent),
+            "weights must remain finite — NaN/Inf guard should short-circuit the update"
+        );
+        assert!(
+            after > before,
+            "replay_clamp_count must increment on non-finite raw TD error (before={before}, after={after})"
+        );
+    }
+
     // ── Test 9 ──────────────────────────────────────────────────────────
 
     #[test]
@@ -11416,7 +11389,7 @@ mod tests {
                 buf.push(make_replay_transition(-(i as f64) * 0.01, 1.0));
             }
         }
-        agent.seal_replay_training_memories();
+        agent.seal_replay_training_memories().unwrap();
         // Push 25 recent transitions.
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
@@ -11472,6 +11445,34 @@ mod tests {
             Err(PcError::ConfigValidation(_)) => {}
             other => panic!("expected ConfigValidation Err on buffer-less agent, got {other:?}"),
         }
+    }
+
+    // ── Test 13b ─ seal/clear API parity on buffer-less agent ──────────
+
+    #[test]
+    fn test_seal_replay_training_memories_errs_when_no_buffer() {
+        // Locks the API-symmetry fix from MAGI Balthasar review:
+        // `seal_replay_training_memories` must return
+        // `Err(PcError::ConfigValidation)` on a buffer-less agent,
+        // matching `clear_recent_memories`. Silent no-op was the
+        // pre-fix footgun — a consumer wiring the two methods into
+        // the same recovery pipeline should see the same error shape
+        // from both.
+        let mut agent_nobuf: PcActorCritic = make_agent();
+        match agent_nobuf.seal_replay_training_memories() {
+            Err(PcError::ConfigValidation(_)) => {}
+            other => panic!("expected ConfigValidation Err on buffer-less agent, got {other:?}"),
+        }
+
+        // Sanity: on an agent WITH a buffer, seal still succeeds and
+        // flips training_phase — legacy behaviour preserved.
+        let cfg = replay_config(100, 50);
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        assert!(agent.replay_buffer.as_ref().unwrap().training_phase);
+        agent
+            .seal_replay_training_memories()
+            .expect("seal on configured buffer must succeed");
+        assert!(!agent.replay_buffer.as_ref().unwrap().training_phase);
     }
 
     // ── Test 14 ─────────────────────────────────────────────────────────

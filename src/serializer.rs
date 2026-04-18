@@ -188,6 +188,32 @@ pub struct SaveFile {
     /// `replay_training_capacity == 0` or legacy file).
     #[serde(default)]
     pub replay_buffer: Option<crate::pc_actor_critic::replay::ReplayBuffer>,
+    /// Monotonic count of replay_learn saturation events (legacy files
+    /// default to 0).
+    #[serde(default)]
+    pub replay_clamp_count: u64,
+    /// Number of learn steps elapsed since the last `rollback_hard()`.
+    /// Legacy files default to `u64::MAX` (the "unlocked" bootstrap
+    /// sentinel), which preserves the pre-W2-fix behaviour where a
+    /// freshly-loaded agent can always invoke `rollback_hard()` at
+    /// least once. New files persist the actual counter so a
+    /// save-reload cycle cannot silently bypass the cooldown.
+    #[serde(default = "default_steps_since_last_rollback_hard")]
+    pub steps_since_last_rollback_hard: u64,
+    /// User-configurable cooldown window (defaults to
+    /// [`DEFAULT_ROLLBACK_HARD_COOLDOWN`](crate::pc_actor_critic::DEFAULT_ROLLBACK_HARD_COOLDOWN)
+    /// when absent, so legacy files and any user override via
+    /// `set_rollback_hard_cooldown` both round-trip cleanly).
+    #[serde(default = "default_rollback_hard_cooldown_steps")]
+    pub rollback_hard_cooldown_steps: u64,
+}
+
+fn default_steps_since_last_rollback_hard() -> u64 {
+    u64::MAX
+}
+
+fn default_rollback_hard_cooldown_steps() -> u64 {
+    crate::pc_actor_critic::DEFAULT_ROLLBACK_HARD_COOLDOWN
 }
 
 /// Saves the agent's full state to a JSON file.
@@ -227,6 +253,9 @@ pub fn save_agent<L: LinAlg>(
         polyak_target_weights: agent.polyak_target.as_ref().map(|a| a.to_weights()),
         frozen_champion_weights: agent.frozen_champion.as_ref().map(|a| a.to_weights()),
         replay_buffer: agent.replay_buffer.clone(),
+        replay_clamp_count: agent.replay_clamp_count,
+        steps_since_last_rollback_hard: agent.steps_since_last_rollback_hard,
+        rollback_hard_cooldown_steps: agent.rollback_hard_cooldown_steps,
     };
 
     let json = serde_json::to_string_pretty(&save_file)?;
@@ -361,6 +390,16 @@ pub fn load_agent_generic<L: LinAlg>(
     } else {
         None
     };
+
+    // Restore replay telemetry and rollback cooldown state so dashboards
+    // and the cooldown gate survive save/load cycles. Legacy files that
+    // pre-date these fields deserialize with sensible defaults via
+    // `#[serde(default = ...)]`: 0 for the clamp counter, `u64::MAX`
+    // (unlocked bootstrap) for the elapsed counter, and
+    // `DEFAULT_ROLLBACK_HARD_COOLDOWN` for the cooldown window.
+    agent.replay_clamp_count = save_file.replay_clamp_count;
+    agent.steps_since_last_rollback_hard = save_file.steps_since_last_rollback_hard;
+    agent.rollback_hard_cooldown_steps = save_file.rollback_hard_cooldown_steps;
 
     Ok((agent, save_file.metadata))
 }
@@ -1455,7 +1494,7 @@ mod tests {
         );
 
         // Seal — subsequent pushes must route to the recent compartment.
-        agent.seal_replay_training_memories();
+        agent.seal_replay_training_memories().unwrap();
         assert!(!agent.replay_buffer.as_ref().unwrap().training_phase);
 
         let mut recent_originals: Vec<ReplayTransition> = Vec::with_capacity(20);
@@ -1584,6 +1623,88 @@ mod tests {
         assert!(
             buf.training_phase,
             "fresh buffer must start in training_phase = true"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Locks the MAGI Caspar fix for serialized telemetry + cooldown
+    /// state. A save/load cycle must preserve `replay_clamp_count`,
+    /// `steps_since_last_rollback_hard`, and `rollback_hard_cooldown_steps`
+    /// exactly — dashboards cannot see an artificial counter reset and
+    /// the cooldown gate cannot be silently bypassed by reloading a file
+    /// taken mid-window.
+    #[test]
+    fn test_save_load_preserves_clamp_count_and_cooldown_state() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        let mut config = default_config();
+        config.replay_training_capacity = 100;
+        config.replay_recent_capacity = 0;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Set a custom cooldown window, consume most of it, and tick
+        // the clamp counter so none of the three fields match their
+        // construction defaults (u64::MAX, 100, 0).
+        agent.rollback_hard_cooldown_steps = 777;
+        agent.steps_since_last_rollback_hard = 42;
+        agent.replay_clamp_count = 9;
+
+        let path = temp_path("test_save_load_preserves_clamp_count_and_cooldown_state.json");
+        save_agent(&agent, &path, 0, None).unwrap();
+
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        assert_eq!(
+            loaded.replay_clamp_count, 9,
+            "replay_clamp_count must survive save/load"
+        );
+        assert_eq!(
+            loaded.steps_since_last_rollback_hard, 42,
+            "steps_since_last_rollback_hard must survive save/load — \
+             otherwise a mid-cooldown save/reload silently bypasses the gate"
+        );
+        assert_eq!(
+            loaded.rollback_hard_cooldown_steps, 777,
+            "rollback_hard_cooldown_steps must survive save/load — \
+             otherwise set_rollback_hard_cooldown is silently reverted"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Legacy compat for the three newly-persisted fields: a save file
+    /// lacking any of them must still load with the pre-W2-fix
+    /// bootstrap defaults (clamp_count = 0, cooldown unlocked via
+    /// `u64::MAX`, window = `DEFAULT_ROLLBACK_HARD_COOLDOWN`).
+    #[test]
+    fn test_legacy_save_file_defaults_clamp_count_and_cooldown_state() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        let config = default_config();
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        let path = temp_path("test_legacy_save_file_defaults_clamp_count_and_cooldown_state.json");
+        save_agent(&agent, &path, 0, None).unwrap();
+
+        // Strip the three newly-added fields to mimic a pre-W2-fix save.
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        if let Some(obj) = json.as_object_mut() {
+            obj.remove("replay_clamp_count");
+            obj.remove("steps_since_last_rollback_hard");
+            obj.remove("rollback_hard_cooldown_steps");
+        }
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        assert_eq!(loaded.replay_clamp_count, 0);
+        assert_eq!(loaded.steps_since_last_rollback_hard, u64::MAX);
+        assert_eq!(
+            loaded.rollback_hard_cooldown_steps,
+            crate::pc_actor_critic::DEFAULT_ROLLBACK_HARD_COOLDOWN
         );
 
         let _ = fs::remove_file(&path);

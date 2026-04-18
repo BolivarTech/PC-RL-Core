@@ -180,7 +180,9 @@ fn phase2_replay_end_to_end() {
     }
 
     // Seal the training compartment — further pushes route to recent (B).
-    agent.seal_replay_training_memories();
+    agent
+        .seal_replay_training_memories()
+        .expect("seal after Phase A");
 
     // Phase B: 50 more steps — populate recent compartment.
     for i in 0..50 {
@@ -256,7 +258,9 @@ fn phase2_stress_scenario_rollback_recovery() {
     agent
         .champion_update()
         .expect("champion_update after Phase A");
-    agent.seal_replay_training_memories();
+    agent
+        .seal_replay_training_memories()
+        .expect("seal after Phase A");
 
     // -- Phase B: deliberate degradation ---------------------------------
     // 1000 step_masked calls with negative reward to push weights away.
