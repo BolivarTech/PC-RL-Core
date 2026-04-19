@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `PcActorCritic::seal_replay_training_memories()` now returns
+  `Result<(), PcError>` instead of `()`. The method surfaces a
+  `PcError::ConfigValidation` on a buffer-less agent
+  (`replay_training_capacity == 0` at construction and no subsequent
+  `apply_config` allocation) so it matches the symmetric signature of
+  `clear_recent_memories()`. Previously it was a silent no-op on
+  misconfiguration, which made pipeline-wiring bugs invisible.
+  Migration: `agent.seal_replay_training_memories();` →
+  `agent.seal_replay_training_memories()?;` (or `.unwrap()` in tests).
+
 ### Added
 
 - Self-distillation with dual anchors for self-recovery during continuous learning.
@@ -65,14 +77,36 @@
     touching compartment A. Use during cascade-recovery in self-play setups
     where compartment B may be contaminated by transitions from a degraded
     policy.
+  - New accessor `replay_clamp_count() -> u64` — monotonic telemetry for
+    the number of `replay_learn` updates where the td_error clamp
+    bound. Sustained incrementing is the leading indicator that
+    off-policy drift is approaching its envelope. The counter also
+    increments on non-finite raw td_error (±Inf), so monitoring
+    dashboards surface catastrophic saturation events.
+  - Save/load now persists `replay_clamp_count`,
+    `steps_since_last_rollback_hard`, and `rollback_hard_cooldown_steps`
+    so monitoring and the cooldown gate survive save/load cycles.
+    Legacy pre-Phase-2 files deserialize with bootstrap defaults.
 
 ### Refactored
 
 - `learn_continuous_inner` gains two new parameters to support off-policy
-  replay without code duplication: `mode: LearnMode` (commit 12) and
-  `pre_td_error: Option<f64>` (commit 16). All existing online callers pass
+  replay without code duplication: `mode: LearnMode` and
+  `pre_td_error: Option<f64>`. All existing online callers pass
   `LearnMode::Online` and `pre_td_error: None`; zero behavior change to
   non-replay paths.
+- Rollback/champion control methods (`rollback_soft`, `rollback_hard`,
+  `champion_update`, `set_rollback_hard_cooldown`) extracted into a
+  dedicated `src/pc_actor_critic/control.rs` submodule. Shared helpers
+  `reset_actor_transient_state` and `clear_actor_fisher_ema` live in
+  the parent module. Public API unchanged; internal reorganisation
+  improves maintainability of the ~11k-line `mod.rs`.
+- Anchor slot allocation (Polyak + Frozen) centralised in a single
+  `Self::allocate_anchor_slots` helper applied at every constructor
+  and `apply_config` site. Closes the MAGI Gate A DRY warning.
+- Fisher-EMA gradient clip in `accumulate_actor_fisher_ema` now
+  references `crate::matrix::GRAD_CLIP` instead of a hardcoded 5.0
+  literal, matching the rest of the crate.
 
 ### Note on tuning
 

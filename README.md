@@ -88,6 +88,111 @@ let avg_loss = agent.learn(&trajectory);
 let (action, _) = agent.act(&state, &valid_actions, SelectionMode::Play);
 ```
 
+## Self-Recovery Workflow
+
+Self-recovery is the library's answer to catastrophic forgetting and
+policy cascades during continuous learning. It exposes three
+complementary mechanisms:
+
+- **Polyak-tracked target** (noise smoothing, `~1/polyak_tau` step lag).
+- **Frozen champion anchor** (cascade recovery, immutable between
+  explicit promotions).
+- **Dual-compartment replay buffer** (off-policy TD updates from stored
+  positive-reward trajectories).
+
+All three are **opt-in** (`lambda = 0` and `capacity = 0` defaults make
+them no-ops). The consumer drives the recovery pipeline — the library
+never calls `rollback_*` or `champion_update` on its own.
+
+### Enabling
+
+```rust
+use pc_rl_core::{CpuLinAlg, PcActorCritic, PcActorCriticConfig};
+
+let config = PcActorCriticConfig {
+    // ... existing actor/critic/gamma/... fields ...
+
+    // Phase 1: dual anchors
+    distillation_lambda_polyak: 0.05,   // KL weight toward Polyak target
+    polyak_tau:                 0.005,  // EMA rate (~200-step lag)
+    distillation_lambda_frozen: 0.05,   // KL weight toward frozen champion
+
+    // Phase 2: replay buffer
+    replay_training_capacity:   200,    // compartment A size (0 disables)
+    replay_recent_capacity:     100,    // compartment B size
+    replay_positive_only:       true,   // drop reward <= 0.0 transitions
+    replay_batch_size:          64,     // sample size per replay_learn call
+
+    // EWC regularization composes naturally with the anchors
+    ewc_lambda: 0.1,
+
+    ..Default::default()
+};
+
+let mut agent = PcActorCritic::new(CpuLinAlg::new(), config, 42)?;
+```
+
+### Typical consumer pipeline
+
+```rust
+// 1) Train normally — transitions auto-record into compartment A.
+for step in 0..n_warmup {
+    let action = agent.step_masked(&state, &valid, reward, terminal)?;
+    // ... environment step ...
+}
+
+// 2) Lock in a champion once fitness is acceptable. `champion_update`
+//    promotes the live actor into the frozen slot; `seal_replay...`
+//    freezes compartment A and routes further pushes to compartment B.
+agent.champion_update()?;
+agent.seal_replay_training_memories()?;
+
+// 3) Continue learning. Compartment B now collects recent successes.
+for step in 0..n_stress {
+    let action = agent.step_masked(&state, &valid, reward, terminal)?;
+}
+
+// 4) If a fitness regression is detected (consumer-side check):
+if consumer_detects_cascade(&agent) {
+    agent.clear_recent_memories()?;   // drop contaminated compartment B
+    agent.rollback_hard()?;           // live actor <- frozen champion
+    for _ in 0..50 {                  // critic warmup from stored A transitions
+        agent.replay_learn(64)?;
+    }
+}
+
+// 5) For short-horizon noise smoothing (NOT cascade recovery), use:
+agent.rollback_soft()?;               // live actor <- Polyak target
+```
+
+### When to use each method
+
+| Symptom observed by consumer | Recommended response |
+|---|---|
+| Policy oscillating around a local minimum | `rollback_soft` (undoes ~`1/polyak_tau` steps of noise) |
+| Fitness regression sustained over hundreds of steps | `clear_recent_memories` + `rollback_hard` + warmup |
+| Starting fresh recovery cycle with a new champion | `champion_update` + `seal_replay_training_memories` |
+| Monitoring off-policy stability | `agent.replay_clamp_count()` (monotonic counter) |
+
+`rollback_hard` enforces a cooldown window (default 100 steps) — calling
+it in a tight loop returns `Err(PcError::ConfigValidation)` without
+mutating state. Override via `set_rollback_hard_cooldown(n)`.
+
+### Observability
+
+- `replay_clamp_count() -> u64` — monotonic counter of replay updates
+  where the TD-error clamp bound (±5.0). Sustained incrementing is the
+  leading indicator that off-policy drift is close to its envelope; the
+  consumer can size warmup windows from the growth rate.
+- Save/load persists all self-recovery state: anchor weights, replay
+  buffer contents, clamp counter, and cooldown timers. Legacy
+  pre-Phase-1 save files load cleanly with anchors auto-initialized
+  from the live actor.
+
+See the `# When to use` sections on `rollback_soft` / `rollback_hard`
+and the "Stale V(s) batch semantics" rustdoc on `replay_learn` for the
+full design rationale and parameter-tuning guidance.
+
 ## Architecture
 
 ### Core Components
