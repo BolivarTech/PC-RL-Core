@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [2.2.0] - 2026-04-19
+
+This release bundles everything since the v2.0.0 tag: the Continuous
+Learning feature set (originally planned as v2.1.0 but never tagged)
+plus the full Phase 1 + Phase 2 Self-Recovery toolkit.
 
 ### Breaking Changes
 
