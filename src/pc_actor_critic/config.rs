@@ -183,6 +183,22 @@ fn default_gae_lambda() -> Option<f64> {
     None
 }
 
+/// Default Polyak averaging rate for soft target network updates.
+/// Standard SAC/DQN value. Must be in (0.0, 1.0].
+pub fn default_polyak_tau() -> f64 {
+    0.005
+}
+
+/// Default positive-reward-only filter flag for the replay buffer.
+fn default_replay_positive_only() -> bool {
+    true
+}
+
+/// Default batch size for each `replay_learn()` call.
+fn default_replay_batch_size() -> usize {
+    64
+}
+
 /// Configuration for the integrated PC Actor-Critic agent.
 ///
 /// # Examples
@@ -246,6 +262,13 @@ fn default_gae_lambda() -> Option<f64> {
 ///     logits_reversal: false,
 ///     td_steps: 0,
 ///     gae_lambda: None,
+///     distillation_lambda_polyak: 0.0,
+///     polyak_tau: 0.005,
+///     distillation_lambda_frozen: 0.0,
+///     replay_training_capacity: 0,
+///     replay_recent_capacity: 0,
+///     replay_positive_only: true,
+///     replay_batch_size: 64,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,4 +424,188 @@ pub struct PcActorCriticConfig {
     /// Default: `None` (backward compatible). Recommended: `Some(0.95)` for short episodes.
     #[serde(default = "default_gae_lambda")]
     pub gae_lambda: Option<f64>,
+    /// Strength of KL divergence distillation toward the Polyak-averaged
+    /// target actor. 0.0 (default) disables Polyak distillation entirely
+    /// — no target is allocated. When > 0.0, a slow-moving copy of the actor
+    /// is maintained and its distribution regularizes the live policy gradient.
+    #[serde(default)]
+    pub distillation_lambda_polyak: f64,
+    /// Polyak averaging rate for soft target network updates.
+    /// `target = (1 - tau) * target + tau * live` after each actor weight update.
+    /// Must be in (0.0, 1.0] when `distillation_lambda_polyak > 0`.
+    /// Default: 0.005.
+    #[serde(default = "default_polyak_tau")]
+    pub polyak_tau: f64,
+    /// Strength of KL divergence distillation toward a frozen snapshot actor.
+    /// 0.0 (default) disables frozen distillation entirely.
+    /// Allocated/deallocated by Task 3 (Phase 1 commit 5-6).
+    #[serde(default)]
+    pub distillation_lambda_frozen: f64,
+    /// Capacity of the training-phase replay compartment.
+    /// 0 disables the replay buffer entirely. Default: 0.
+    #[serde(default)]
+    pub replay_training_capacity: usize,
+    /// Capacity of the recent-stress replay compartment.
+    /// 0 disables stress-phase recording. Default: 0.
+    #[serde(default)]
+    pub replay_recent_capacity: usize,
+    /// If true, only transitions with reward > 0 are stored. Default: true.
+    #[serde(default = "default_replay_positive_only")]
+    pub replay_positive_only: bool,
+    /// Batch size for each `replay_learn()` call. Default: 64.
+    #[serde(default = "default_replay_batch_size")]
+    pub replay_batch_size: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::activation::Activation;
+    use crate::error::PcError;
+    use crate::layer::LayerDef;
+    use crate::linalg::cpu::CpuLinAlg;
+    use crate::mlp_critic::MlpCriticConfig;
+    use crate::pc_actor::PcActorConfig;
+    use crate::pc_actor_critic::PcActorCritic;
+
+    /// Minimal valid config for distillation validation tests.
+    fn base_config() -> PcActorCriticConfig {
+        PcActorCriticConfig {
+            actor: PcActorConfig {
+                input_size: 4,
+                hidden_layers: vec![LayerDef {
+                    size: 8,
+                    activation: Activation::Tanh,
+                }],
+                output_size: 4,
+                output_activation: Activation::Linear,
+                alpha: 0.1,
+                tol: 0.01,
+                min_steps: 1,
+                max_steps: 5,
+                lr_weights: 0.01,
+                synchronous: true,
+                temperature: 1.0,
+                local_lambda: 1.0,
+                residual: false,
+                rezero_init: 0.001,
+            },
+            critic: MlpCriticConfig {
+                input_size: 12,
+                hidden_layers: vec![LayerDef {
+                    size: 16,
+                    activation: Activation::Tanh,
+                }],
+                output_activation: Activation::Linear,
+                lr: 0.005,
+            },
+            gamma: 0.95,
+            surprise_low: 0.02,
+            surprise_high: 0.15,
+            adaptive_surprise: false,
+            surprise_buffer_size: 100,
+            entropy_coeff: 0.0,
+            scale_floor: 0.1,
+            scale_ceil: 2.0,
+            actor_hysteresis: false,
+            actor_fast_window: 20,
+            actor_slow_window: 100,
+            actor_wake_fraction: 0.5,
+            actor_sleep_fraction: 0.3,
+            critic_hysteresis: false,
+            critic_fast_window: 20,
+            critic_slow_window: 100,
+            critic_wake_fraction: 0.5,
+            critic_sleep_fraction: 0.3,
+            actor_wakes_critic: true,
+            actor_wakes_critic_threshold: 1000,
+            critic_wakes_actor: true,
+            critic_wakes_actor_threshold: 1000,
+            consolidation_decay: 1.0,
+            critic_consolidation_decay: 1.0,
+            adaptive_consolidation: false,
+            consolidation_ema_beta: 0.99,
+            consolidation_sigmoid_k: 10.0,
+            consolidation_error_threshold: 0.05,
+            ewc_lambda: 0.0,
+            fisher_decay: 0.9,
+            fisher_ema_beta: 0.99,
+            logits_reversal: false,
+            td_steps: 0,
+            gae_lambda: None,
+            distillation_lambda_polyak: 0.0,
+            polyak_tau: 0.005,
+            distillation_lambda_frozen: 0.0,
+            replay_training_capacity: 0,
+            replay_recent_capacity: 0,
+            replay_positive_only: true,
+            replay_batch_size: 64,
+        }
+    }
+
+    #[test]
+    fn test_default_polyak_tau_is_005() {
+        assert!(
+            (default_polyak_tau() - 0.005).abs() < 1e-12,
+            "default_polyak_tau must be 0.005"
+        );
+    }
+
+    #[test]
+    fn test_validate_distillation_lambda_polyak_negative_rejected() {
+        let mut cfg = base_config();
+        cfg.distillation_lambda_polyak = -0.1;
+        let result = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            result.is_err(),
+            "negative distillation_lambda_polyak must be rejected"
+        );
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => {
+                assert!(
+                    msg.contains("distillation_lambda_polyak"),
+                    "error must mention field name: {msg}"
+                );
+            }
+            other => panic!("expected ConfigValidation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_polyak_tau_out_of_range_rejected() {
+        let mut cfg = base_config();
+        cfg.polyak_tau = 1.5;
+        let result = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_err(), "polyak_tau=1.5 must be rejected");
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => {
+                assert!(
+                    msg.contains("polyak_tau"),
+                    "error must mention field name: {msg}"
+                );
+            }
+            other => panic!("expected ConfigValidation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_polyak_tau_zero_with_lambda_positive_rejected() {
+        let mut cfg = base_config();
+        cfg.distillation_lambda_polyak = 0.1;
+        cfg.polyak_tau = 0.0;
+        let result = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            result.is_err(),
+            "polyak_tau=0 with lambda>0 must be rejected"
+        );
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => {
+                assert!(
+                    msg.contains("polyak_tau"),
+                    "error must mention field name: {msg}"
+                );
+            }
+            other => panic!("expected ConfigValidation, got {other:?}"),
+        }
+    }
 }

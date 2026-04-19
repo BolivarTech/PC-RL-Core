@@ -230,7 +230,7 @@ pub enum SelectionMode {
 /// let result = actor.infer(&[0.0; 9]);
 /// assert_eq!(result.y_conv.len(), 9);
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PcActor<L: LinAlg = CpuLinAlg> {
     /// Network layers: hidden_layers.len() + 1 (output layer).
     pub(crate) layers: Vec<Layer<L>>,
@@ -958,6 +958,245 @@ impl<L: LinAlg> PcActor<L> {
                 );
             }
         }
+    }
+
+    /// In-place soft (Polyak) update toward another actor.
+    ///
+    /// Updates each layer's weights and biases via:
+    ///     `self.weights <- tau * other.weights + (1 - tau) * self.weights`
+    ///     `self.bias    <- tau * other.bias    + (1 - tau) * self.bias`
+    ///
+    /// Includes residual ReZero scaling factors and skip projection weights
+    /// when present.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - Source actor whose weights provide the target.
+    /// * `tau` - Mixing rate in `[0.0, 1.0]`. Special cases: `0.0` is no-op,
+    ///   `1.0` is equivalent to `copy_weights_from`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::DimensionMismatch` if topologies differ.
+    pub fn polyak_update_from(&mut self, other: &PcActor<L>, tau: f64) -> Result<(), PcError> {
+        Self::validate_topology_match(self, other)?;
+
+        if tau == 0.0 {
+            return Ok(());
+        }
+
+        let one_minus_tau = 1.0 - tau;
+
+        // Update layer weights and biases
+        for (self_layer, other_layer) in self.layers.iter_mut().zip(other.layers.iter()) {
+            let rows = self.backend.mat_rows(&self_layer.weights);
+            let cols = self.backend.mat_cols(&self_layer.weights);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let s = self.backend.mat_get(&self_layer.weights, r, c);
+                    let o = self.backend.mat_get(&other_layer.weights, r, c);
+                    self.backend.mat_set(
+                        &mut self_layer.weights,
+                        r,
+                        c,
+                        tau * o + one_minus_tau * s,
+                    );
+                }
+            }
+            let len = self.backend.vec_len(&self_layer.bias);
+            for i in 0..len {
+                let s = self.backend.vec_get(&self_layer.bias, i);
+                let o = self.backend.vec_get(&other_layer.bias, i);
+                self.backend
+                    .vec_set(&mut self_layer.bias, i, tau * o + one_minus_tau * s);
+            }
+        }
+
+        // Update ReZero scaling factors
+        for (sa, oa) in self.rezero_alpha.iter_mut().zip(other.rezero_alpha.iter()) {
+            *sa = tau * oa + one_minus_tau * (*sa);
+        }
+
+        // Update skip projection matrices
+        for (sp, op) in self
+            .skip_projections
+            .iter_mut()
+            .zip(other.skip_projections.iter())
+        {
+            if let (Some(sm), Some(om)) = (sp, op) {
+                let rows = self.backend.mat_rows(sm);
+                let cols = self.backend.mat_cols(sm);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let s = self.backend.mat_get(sm, r, c);
+                        let o = self.backend.mat_get(om, r, c);
+                        self.backend.mat_set(sm, r, c, tau * o + one_minus_tau * s);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// In-place hard copy of weights and biases from another actor.
+    ///
+    /// Copies all weights, biases, ReZero scaling factors, and skip
+    /// projection matrices directly without arithmetic interpolation.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - Source actor whose weights are copied.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::DimensionMismatch` if topologies differ.
+    pub fn copy_weights_from(&mut self, other: &PcActor<L>) -> Result<(), PcError> {
+        Self::validate_topology_match(self, other)?;
+
+        // Copy layer weights and biases
+        for (self_layer, other_layer) in self.layers.iter_mut().zip(other.layers.iter()) {
+            let rows = self.backend.mat_rows(&self_layer.weights);
+            let cols = self.backend.mat_cols(&self_layer.weights);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let val = self.backend.mat_get(&other_layer.weights, r, c);
+                    self.backend.mat_set(&mut self_layer.weights, r, c, val);
+                }
+            }
+            let len = self.backend.vec_len(&self_layer.bias);
+            for i in 0..len {
+                let val = self.backend.vec_get(&other_layer.bias, i);
+                self.backend.vec_set(&mut self_layer.bias, i, val);
+            }
+        }
+
+        // Copy ReZero scaling factors
+        for (sa, oa) in self.rezero_alpha.iter_mut().zip(other.rezero_alpha.iter()) {
+            *sa = *oa;
+        }
+
+        // Copy skip projection matrices
+        for (sp, op) in self
+            .skip_projections
+            .iter_mut()
+            .zip(other.skip_projections.iter())
+        {
+            if let (Some(sm), Some(om)) = (sp, op) {
+                let rows = self.backend.mat_rows(sm);
+                let cols = self.backend.mat_cols(sm);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let val = self.backend.mat_get(om, r, c);
+                        self.backend.mat_set(sm, r, c, val);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates that two actors have matching topologies.
+    ///
+    /// Checks layer count, per-layer weight/bias dimensions, residual
+    /// component counts, per-slot skip projection presence agreement,
+    /// and skip projection matrix dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PcError::DimensionMismatch` if any topology element differs.
+    fn validate_topology_match(a: &PcActor<L>, b: &PcActor<L>) -> Result<(), PcError> {
+        if a.layers.len() != b.layers.len() {
+            return Err(PcError::DimensionMismatch {
+                expected: a.layers.len(),
+                got: b.layers.len(),
+                context: "polyak actor layer count",
+            });
+        }
+        for (i, (la, lb)) in a.layers.iter().zip(b.layers.iter()).enumerate() {
+            let ra = a.backend.mat_rows(&la.weights);
+            let rb = b.backend.mat_rows(&lb.weights);
+            if ra != rb {
+                return Err(PcError::DimensionMismatch {
+                    expected: ra,
+                    got: rb,
+                    context: if i < a.layers.len() - 1 {
+                        "polyak actor hidden layer rows"
+                    } else {
+                        "polyak actor output layer rows"
+                    },
+                });
+            }
+            let ca = a.backend.mat_cols(&la.weights);
+            let cb = b.backend.mat_cols(&lb.weights);
+            if ca != cb {
+                return Err(PcError::DimensionMismatch {
+                    expected: ca,
+                    got: cb,
+                    context: if i < a.layers.len() - 1 {
+                        "polyak actor hidden layer cols"
+                    } else {
+                        "polyak actor output layer cols"
+                    },
+                });
+            }
+        }
+        if a.rezero_alpha.len() != b.rezero_alpha.len() {
+            return Err(PcError::DimensionMismatch {
+                expected: a.rezero_alpha.len(),
+                got: b.rezero_alpha.len(),
+                context: "polyak actor rezero_alpha count",
+            });
+        }
+        if a.skip_projections.len() != b.skip_projections.len() {
+            return Err(PcError::DimensionMismatch {
+                expected: a.skip_projections.len(),
+                got: b.skip_projections.len(),
+                context: "polyak actor skip_projections count",
+            });
+        }
+        // Per-slot skip projection presence agreement and dimension check
+        for (sa, sb) in a.skip_projections.iter().zip(b.skip_projections.iter()) {
+            match (sa, sb) {
+                (Some(ma), Some(mb)) => {
+                    let ra = a.backend.mat_rows(ma);
+                    let rb = b.backend.mat_rows(mb);
+                    if ra != rb {
+                        return Err(PcError::DimensionMismatch {
+                            expected: ra,
+                            got: rb,
+                            context: "polyak actor skip_projection rows",
+                        });
+                    }
+                    let ca = a.backend.mat_cols(ma);
+                    let cb = b.backend.mat_cols(mb);
+                    if ca != cb {
+                        return Err(PcError::DimensionMismatch {
+                            expected: ca,
+                            got: cb,
+                            context: "polyak actor skip_projection cols",
+                        });
+                    }
+                }
+                (None, None) => {}
+                (Some(_), None) => {
+                    return Err(PcError::DimensionMismatch {
+                        expected: 1,
+                        got: 0,
+                        context: "polyak actor skip_projection presence at slot",
+                    });
+                }
+                (None, Some(_)) => {
+                    return Err(PcError::DimensionMismatch {
+                        expected: 0,
+                        got: 1,
+                        context: "polyak actor skip_projection presence at slot",
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Extracts a serializable snapshot of current weights.
@@ -3577,6 +3816,237 @@ mod tests {
         assert!(
             matches!(err, PcError::DimensionMismatch { .. }),
             "Expected DimensionMismatch, got: {err}"
+        );
+    }
+
+    // ── Polyak Update Tests ─────────────────────────────────────────
+
+    /// Helper: creates two actors with the same config but different seeds.
+    fn make_two_actors(config: &PcActorConfig) -> (PcActor, PcActor) {
+        let mut rng_a = StdRng::seed_from_u64(42);
+        let mut rng_b = StdRng::seed_from_u64(99);
+        let a = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
+        let b = PcActor::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
+        (a, b)
+    }
+
+    /// Helper: collects all weight and bias values from an actor into a flat vector.
+    fn snapshot_weights(actor: &PcActor) -> Vec<f64> {
+        let b = &actor.backend;
+        let mut vals = Vec::new();
+        for layer in &actor.layers {
+            let rows = b.mat_rows(&layer.weights);
+            let cols = b.mat_cols(&layer.weights);
+            for r in 0..rows {
+                for c in 0..cols {
+                    vals.push(b.mat_get(&layer.weights, r, c));
+                }
+            }
+            let len = b.vec_len(&layer.bias);
+            for i in 0..len {
+                vals.push(b.vec_get(&layer.bias, i));
+            }
+        }
+        for &alpha in &actor.rezero_alpha {
+            vals.push(alpha);
+        }
+        for m in actor.skip_projections.iter().flatten() {
+            let rows = b.mat_rows(m);
+            let cols = b.mat_cols(m);
+            for r in 0..rows {
+                for c in 0..cols {
+                    vals.push(b.mat_get(m, r, c));
+                }
+            }
+        }
+        vals
+    }
+
+    #[test]
+    fn test_polyak_update_tau_zero_no_change() {
+        let (mut delayed, other) = make_two_actors(&default_config());
+        let before = snapshot_weights(&delayed);
+        delayed.polyak_update_from(&other, 0.0).unwrap();
+        let after = snapshot_weights(&delayed);
+        assert_eq!(before, after, "tau=0 must leave weights unchanged");
+    }
+
+    #[test]
+    fn test_polyak_update_tau_one_full_copy() {
+        let (mut delayed, other) = make_two_actors(&default_config());
+        delayed.polyak_update_from(&other, 1.0).unwrap();
+        let delayed_snap = snapshot_weights(&delayed);
+        let other_snap = snapshot_weights(&other);
+        assert_eq!(
+            delayed_snap, other_snap,
+            "tau=1 must produce weights identical to other"
+        );
+    }
+
+    #[test]
+    fn test_polyak_update_partial_interpolation() {
+        let config = default_config();
+        let (mut delayed, other) = make_two_actors(&config);
+        let before = snapshot_weights(&delayed);
+        let other_snap = snapshot_weights(&other);
+        let tau = 0.5;
+        delayed.polyak_update_from(&other, tau).unwrap();
+        let after = snapshot_weights(&delayed);
+        for (i, (&a, (&b, &o))) in after
+            .iter()
+            .zip(before.iter().zip(other_snap.iter()))
+            .enumerate()
+        {
+            let expected = tau * o + (1.0 - tau) * b;
+            assert!(
+                (a - expected).abs() < 1e-12,
+                "tau=0.5 mismatch at index {i}: got {a}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_polyak_update_rejects_topology_mismatch() {
+        let (mut actor_a, _) = make_two_actors(&default_config());
+        let mut rng = StdRng::seed_from_u64(77);
+        let actor_b = PcActor::new(CpuLinAlg::new(), two_hidden_config(), &mut rng).unwrap();
+        let result = actor_a.polyak_update_from(&actor_b, 0.5);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch for topology mismatch"
+        );
+    }
+
+    #[test]
+    fn test_copy_weights_from_exact() {
+        let (mut delayed, other) = make_two_actors(&default_config());
+        delayed.copy_weights_from(&other).unwrap();
+        let delayed_snap = snapshot_weights(&delayed);
+        let other_snap = snapshot_weights(&other);
+        assert_eq!(
+            delayed_snap, other_snap,
+            "copy_weights_from must produce byte-exact equality"
+        );
+    }
+
+    #[test]
+    fn test_copy_weights_from_rejects_topology_mismatch() {
+        let (mut actor_a, _) = make_two_actors(&default_config());
+        let mut rng = StdRng::seed_from_u64(77);
+        let actor_b = PcActor::new(CpuLinAlg::new(), two_hidden_config(), &mut rng).unwrap();
+        let result = actor_a.copy_weights_from(&actor_b);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), PcError::DimensionMismatch { .. }),
+            "Expected DimensionMismatch for topology mismatch"
+        );
+    }
+
+    fn residual_hetero_config() -> PcActorConfig {
+        PcActorConfig {
+            residual: true,
+            hidden_layers: vec![
+                LayerDef {
+                    size: 18,
+                    activation: Activation::Softsign,
+                },
+                LayerDef {
+                    size: 12,
+                    activation: Activation::Softsign,
+                },
+            ],
+            ..default_config()
+        }
+    }
+
+    /// Drifts all layer weights, biases, rezero alphas, and skip projections
+    /// by a fixed offset to create a measurable difference between actors.
+    fn drift_actor_weights(actor: &mut PcActor, offset: f64) {
+        let b = &actor.backend;
+        for layer in &mut actor.layers {
+            let rows = b.mat_rows(&layer.weights);
+            let cols = b.mat_cols(&layer.weights);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let v = b.mat_get(&layer.weights, r, c);
+                    b.mat_set(&mut layer.weights, r, c, v + offset);
+                }
+            }
+            let len = b.vec_len(&layer.bias);
+            for i in 0..len {
+                let v = b.vec_get(&layer.bias, i);
+                b.vec_set(&mut layer.bias, i, v + offset);
+            }
+        }
+        for alpha in &mut actor.rezero_alpha {
+            *alpha += offset;
+        }
+        for m in actor.skip_projections.iter_mut().flatten() {
+            let rows = b.mat_rows(m);
+            let cols = b.mat_cols(m);
+            for r in 0..rows {
+                for c in 0..cols {
+                    let v = b.mat_get(m, r, c);
+                    b.mat_set(m, r, c, v + offset);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_polyak_update_with_residual_actors() {
+        let config = residual_hetero_config();
+        let (mut target, mut source) = make_two_actors(&config);
+
+        // Verify skip projections are allocated (heterogeneous sizes)
+        assert_eq!(target.skip_projections.len(), 1);
+        assert!(target.skip_projections[0].is_some());
+
+        // Drift source weights so target and source differ measurably
+        drift_actor_weights(&mut source, 1.0);
+
+        let before = snapshot_weights(&target);
+        let source_snap = snapshot_weights(&source);
+        let tau = 0.5;
+
+        target.polyak_update_from(&source, tau).unwrap();
+
+        let after = snapshot_weights(&target);
+        // snapshot_weights includes layers, rezero_alpha, AND skip_projections
+        assert_eq!(before.len(), after.len(), "snapshot length must not change");
+        for (i, (&a, (&b, &o))) in after
+            .iter()
+            .zip(before.iter().zip(source_snap.iter()))
+            .enumerate()
+        {
+            let expected = tau * o + (1.0 - tau) * b;
+            assert!(
+                (a - expected).abs() < 1e-12,
+                "residual polyak mismatch at index {i}: got {a}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_copy_weights_from_with_residual_actors() {
+        let config = residual_hetero_config();
+        let (mut target, mut source) = make_two_actors(&config);
+
+        // Verify skip projections are allocated (heterogeneous sizes)
+        assert_eq!(target.skip_projections.len(), 1);
+        assert!(target.skip_projections[0].is_some());
+
+        // Drift source weights so target and source differ
+        drift_actor_weights(&mut source, 1.0);
+
+        target.copy_weights_from(&source).unwrap();
+
+        let target_snap = snapshot_weights(&target);
+        let source_snap = snapshot_weights(&source);
+        assert_eq!(
+            target_snap, source_snap,
+            "copy_weights_from must produce byte-exact equality for residual actors"
         );
     }
 }

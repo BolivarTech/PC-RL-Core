@@ -178,6 +178,42 @@ pub struct SaveFile {
     /// Continuous learning state (None for legacy/v2.0.0 files).
     #[serde(default)]
     pub cl_state: Option<ClState>,
+    /// Polyak-averaged target actor weights (None when lambda == 0 or legacy file).
+    #[serde(default)]
+    pub polyak_target_weights: Option<PcActorWeights>,
+    /// Frozen champion actor weights (None when lambda == 0 or legacy file).
+    #[serde(default)]
+    pub frozen_champion_weights: Option<PcActorWeights>,
+    /// Dual-compartment replay buffer state (None when
+    /// `replay_training_capacity == 0` or legacy file).
+    #[serde(default)]
+    pub replay_buffer: Option<crate::pc_actor_critic::replay::ReplayBuffer>,
+    /// Monotonic count of replay_learn saturation events (legacy files
+    /// default to 0).
+    #[serde(default)]
+    pub replay_clamp_count: u64,
+    /// Number of learn steps elapsed since the last `rollback_hard()`.
+    /// Legacy files default to `u64::MAX` (the "unlocked" bootstrap
+    /// sentinel), which preserves the pre-W2-fix behaviour where a
+    /// freshly-loaded agent can always invoke `rollback_hard()` at
+    /// least once. New files persist the actual counter so a
+    /// save-reload cycle cannot silently bypass the cooldown.
+    #[serde(default = "default_steps_since_last_rollback_hard")]
+    pub steps_since_last_rollback_hard: u64,
+    /// User-configurable cooldown window (defaults to
+    /// [`DEFAULT_ROLLBACK_HARD_COOLDOWN`](crate::pc_actor_critic::DEFAULT_ROLLBACK_HARD_COOLDOWN)
+    /// when absent, so legacy files and any user override via
+    /// `set_rollback_hard_cooldown` both round-trip cleanly).
+    #[serde(default = "default_rollback_hard_cooldown_steps")]
+    pub rollback_hard_cooldown_steps: u64,
+}
+
+fn default_steps_since_last_rollback_hard() -> u64 {
+    u64::MAX
+}
+
+fn default_rollback_hard_cooldown_steps() -> u64 {
+    crate::pc_actor_critic::DEFAULT_ROLLBACK_HARD_COOLDOWN
 }
 
 /// Saves the agent's full state to a JSON file.
@@ -214,6 +250,12 @@ pub fn save_agent<L: LinAlg>(
         actor_weights: agent.actor.to_weights(),
         critic_weights: agent.critic.to_weights(),
         cl_state: agent.to_cl_state(),
+        polyak_target_weights: agent.polyak_target.as_ref().map(|a| a.to_weights()),
+        frozen_champion_weights: agent.frozen_champion.as_ref().map(|a| a.to_weights()),
+        replay_buffer: agent.replay_buffer.clone(),
+        replay_clamp_count: agent.replay_clamp_count,
+        steps_since_last_rollback_hard: agent.steps_since_last_rollback_hard,
+        rollback_hard_cooldown_steps: agent.rollback_hard_cooldown_steps,
     };
 
     let json = serde_json::to_string_pretty(&save_file)?;
@@ -289,11 +331,75 @@ pub fn load_agent_generic<L: LinAlg>(
     use rand::SeedableRng;
     let rng = rand::rngs::StdRng::from_entropy();
 
-    let mut agent = PcActorCritic::from_parts(save_file.config, actor, critic, rng, backend);
+    let mut agent = PcActorCritic::from_parts(
+        save_file.config.clone(),
+        actor,
+        critic,
+        rng,
+        backend.clone(),
+    );
+
+    // Restore Polyak target: saved weights > legacy clone > None
+    if save_file.config.distillation_lambda_polyak > 0.0 {
+        if let Some(polyak_weights) = save_file.polyak_target_weights {
+            let polyak = PcActor::<L>::from_weights(
+                backend.clone(),
+                save_file.config.actor.clone(),
+                polyak_weights,
+            )?;
+            agent.polyak_target = Some(polyak);
+        }
+        // else: from_parts already cloned actor (legacy compat)
+    } else {
+        agent.polyak_target = None;
+    }
+
+    // Restore frozen champion: saved weights > legacy clone > None
+    if save_file.config.distillation_lambda_frozen > 0.0 {
+        if let Some(frozen_weights) = save_file.frozen_champion_weights {
+            let frozen = PcActor::<L>::from_weights(
+                backend,
+                save_file.config.actor.clone(),
+                frozen_weights,
+            )?;
+            agent.frozen_champion = Some(frozen);
+        }
+        // else: from_parts already cloned actor (legacy compat)
+    } else {
+        agent.frozen_champion = None;
+    }
 
     if let Some(cl_state) = save_file.cl_state {
         agent.restore_cl_state(cl_state);
     }
+
+    // Restore replay buffer:
+    //   * If the SaveFile carries a `Some(buf)`, use it directly.
+    //   * Else if the effective config's `replay_training_capacity > 0`, allocate
+    //     a fresh empty buffer (legacy save-file compat — Phase 1 files lack the
+    //     `replay_buffer` key).
+    //   * Else, no buffer.
+    agent.replay_buffer = if let Some(buf) = save_file.replay_buffer {
+        Some(buf)
+    } else if save_file.config.replay_training_capacity > 0 {
+        Some(crate::pc_actor_critic::replay::ReplayBuffer::new(
+            save_file.config.replay_training_capacity,
+            save_file.config.replay_recent_capacity,
+            save_file.config.replay_positive_only,
+        ))
+    } else {
+        None
+    };
+
+    // Restore replay telemetry and rollback cooldown state so dashboards
+    // and the cooldown gate survive save/load cycles. Legacy files that
+    // pre-date these fields deserialize with sensible defaults via
+    // `#[serde(default = ...)]`: 0 for the clamp counter, `u64::MAX`
+    // (unlocked bootstrap) for the elapsed counter, and
+    // `DEFAULT_ROLLBACK_HARD_COOLDOWN` for the cooldown window.
+    agent.replay_clamp_count = save_file.replay_clamp_count;
+    agent.steps_since_last_rollback_hard = save_file.steps_since_last_rollback_hard;
+    agent.rollback_hard_cooldown_steps = save_file.rollback_hard_cooldown_steps;
 
     Ok((agent, save_file.metadata))
 }
@@ -423,6 +529,13 @@ mod tests {
             logits_reversal: false,
             td_steps: 0,
             gae_lambda: None,
+            distillation_lambda_polyak: 0.0,
+            polyak_tau: 0.005,
+            distillation_lambda_frozen: 0.0,
+            replay_training_capacity: 0,
+            replay_recent_capacity: 0,
+            replay_positive_only: true,
+            replay_batch_size: 64,
         }
     }
 
@@ -1114,5 +1227,486 @@ mod tests {
         }
 
         let _ = fs::remove_file(&rt_path);
+    }
+
+    // ── Section 08: Distillation anchor serialization ──────────────
+
+    #[test]
+
+    fn test_save_load_preserves_polyak_target() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        let mut config = default_config();
+        config.distillation_lambda_polyak = 0.1;
+        config.polyak_tau = 0.005;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Drift live actor for 100 steps so Polyak diverges from live
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for _ in 0..50 {
+            agent.step(&s1, 0.0, false);
+            agent.step(&s2, 1.0, true);
+        }
+
+        // Polyak target should have diverged from live actor
+        let polyak_w = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+        let live_w = agent.actor.layers[0].weights.data.clone();
+        assert_ne!(
+            polyak_w, live_w,
+            "Polyak must differ from live after training"
+        );
+
+        let path = temp_path("test_polyak_roundtrip.json");
+        save_agent(&agent, &path, 100, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        // Loaded polyak_target must be byte-equal to the saved state
+        let loaded_polyak = loaded
+            .polyak_target
+            .as_ref()
+            .expect("polyak_target must be Some");
+        for (i, (a, b)) in polyak_w
+            .iter()
+            .zip(loaded_polyak.layers[0].weights.data.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-15,
+                "polyak_target weight[{i}] differs: {a} vs {b}"
+            );
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+
+    fn test_save_load_preserves_frozen_champion_after_update() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        let mut config = default_config();
+        config.distillation_lambda_frozen = 0.1;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Drift live actor so frozen will differ from initial
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for _ in 0..30 {
+            agent.step(&s1, 0.0, false);
+            agent.step(&s2, 1.0, true);
+        }
+
+        // Call champion_update to snapshot the trained live actor
+        agent.champion_update().unwrap();
+
+        let frozen_w = agent.frozen_champion.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+
+        let path = temp_path("test_frozen_champion_roundtrip.json");
+        save_agent(&agent, &path, 200, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        // Loaded frozen_champion must match the post-update state
+        let loaded_frozen = loaded
+            .frozen_champion
+            .as_ref()
+            .expect("frozen_champion must be Some");
+        for (i, (a, b)) in frozen_w
+            .iter()
+            .zip(loaded_frozen.layers[0].weights.data.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-15,
+                "frozen_champion weight[{i}] differs: {a} vs {b}"
+            );
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+
+    fn test_legacy_save_file_initializes_anchors_from_loaded_actor() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        // Create an agent without distillation, save it (mimics pre-distillation save)
+        let agent = make_agent();
+        let path = temp_path("test_legacy_anchor_init.json");
+        save_agent(&agent, &path, 50, None).unwrap();
+
+        // Tamper: set both lambdas > 0 in the saved config
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut save_file: SaveFile = serde_json::from_str(&json_str).unwrap();
+        save_file.config.distillation_lambda_polyak = 0.05;
+        save_file.config.distillation_lambda_frozen = 0.05;
+        let tampered = serde_json::to_string_pretty(&save_file).unwrap();
+        fs::write(&path, tampered).unwrap();
+
+        // Load — anchors must auto-initialize from the loaded actor
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        let loaded_actor_w = &loaded.actor.layers[0].weights.data;
+        let polyak = loaded
+            .polyak_target
+            .as_ref()
+            .expect("polyak_target must be Some for lambda > 0");
+        let frozen = loaded
+            .frozen_champion
+            .as_ref()
+            .expect("frozen_champion must be Some for lambda > 0");
+
+        // Both anchors must be copies of the loaded actor
+        assert_vecs_approx_eq(loaded_actor_w, &polyak.layers[0].weights.data);
+        assert_vecs_approx_eq(loaded_actor_w, &frozen.layers[0].weights.data);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+
+    fn test_load_drops_orphan_anchor_weights_when_lambda_zero() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        // Create agent with both lambdas > 0, train to populate non-trivial anchors
+        let mut config = default_config();
+        config.distillation_lambda_polyak = 0.1;
+        config.polyak_tau = 0.005;
+        config.distillation_lambda_frozen = 0.1;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        let s1 = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
+        let s2 = vec![0.5, 0.5, -0.5, 0.0, 1.0, -1.0, 0.5, -0.5, 0.0];
+        for _ in 0..50 {
+            agent.step(&s1, 0.0, false);
+            agent.step(&s2, 1.0, true);
+        }
+
+        // Save with anchors populated
+        let path = temp_path("test_orphan_anchor_drop.json");
+        save_agent(&agent, &path, 300, None).unwrap();
+
+        // Tamper: set both lambdas to 0 in the saved JSON
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        json["config"]["distillation_lambda_polyak"] = serde_json::json!(0.0);
+        json["config"]["distillation_lambda_frozen"] = serde_json::json!(0.0);
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        // Load — anchors must be None despite anchor weights in file
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+        assert!(
+            loaded.polyak_target.is_none(),
+            "polyak_target must be None when lambda == 0"
+        );
+        assert!(
+            loaded.frozen_champion.is_none(),
+            "frozen_champion must be None when lambda == 0"
+        );
+
+        // Re-save and verify no anchor weights are serialized
+        let resave_path = temp_path("test_orphan_anchor_resave.json");
+        save_agent(&loaded, &resave_path, 301, None).unwrap();
+        let resave_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&resave_path).unwrap()).unwrap();
+        assert!(
+            resave_json.get("polyak_target_weights").is_none()
+                || resave_json["polyak_target_weights"].is_null(),
+            "Re-saved file must not contain polyak_target_weights"
+        );
+        assert!(
+            resave_json.get("frozen_champion_weights").is_none()
+                || resave_json["frozen_champion_weights"].is_null(),
+            "Re-saved file must not contain frozen_champion_weights"
+        );
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&resave_path);
+    }
+
+    // ── Phase 2 Section: Replay buffer serialization ───────────────
+
+    /// Red test — commit 18 must persist both replay compartments plus the
+    /// `training_phase` flag across a save/load round-trip.
+    #[test]
+    fn test_save_load_preserves_replay_buffer() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::pc_actor_critic::replay::ReplayTransition;
+
+        // Agent configured with a replay buffer of both compartments.
+        let mut config = default_config();
+        config.replay_training_capacity = 100;
+        config.replay_recent_capacity = 50;
+        // Disable positive_only so synthetic transitions with reward=0.0 are retained
+        // (content equality is what we care about, not reward filtering).
+        config.replay_positive_only = false;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        assert!(
+            agent.replay_buffer.is_some(),
+            "replay_training_capacity > 0 must allocate a buffer at construction"
+        );
+
+        // Build 30 deterministic training transitions and push them directly
+        // into the buffer (bypasses step_masked — serde layer is the subject
+        // under test, push/seal semantics are already covered by replay.rs).
+        let make_tx = |marker: f64, reward: f64| -> ReplayTransition {
+            let mut state = vec![0.0; 9];
+            state[0] = marker;
+            let mut next_state = vec![0.0; 9];
+            next_state[1] = marker;
+            ReplayTransition {
+                state,
+                action: (marker as usize) % 9,
+                reward,
+                next_state,
+                done: false,
+                valid_actions: (0..9).collect(),
+            }
+        };
+
+        let mut training_originals: Vec<ReplayTransition> = Vec::with_capacity(30);
+        {
+            let buf = agent.replay_buffer.as_mut().unwrap();
+            for i in 0..30 {
+                let tx = make_tx(i as f64, 1.0);
+                training_originals.push(tx.clone());
+                buf.push(tx);
+            }
+        }
+        assert_eq!(
+            agent
+                .replay_buffer
+                .as_ref()
+                .unwrap()
+                .training_memories
+                .len(),
+            30
+        );
+
+        // Seal — subsequent pushes must route to the recent compartment.
+        agent.seal_replay_training_memories().unwrap();
+        assert!(!agent.replay_buffer.as_ref().unwrap().training_phase);
+
+        let mut recent_originals: Vec<ReplayTransition> = Vec::with_capacity(20);
+        {
+            let buf = agent.replay_buffer.as_mut().unwrap();
+            for i in 0..20 {
+                let tx = make_tx(100.0 + i as f64, 0.5);
+                recent_originals.push(tx.clone());
+                buf.push(tx);
+            }
+        }
+        assert_eq!(
+            agent.replay_buffer.as_ref().unwrap().recent_memories.len(),
+            20
+        );
+
+        // Save and reload.
+        let path = temp_path("test_save_load_preserves_replay_buffer.json");
+        save_agent(&agent, &path, 123, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        // Buffer must be present on the loaded agent.
+        let loaded_buf = loaded
+            .replay_buffer
+            .as_ref()
+            .expect("loaded agent must have a replay buffer after round-trip");
+
+        // Compartment lengths must match exactly.
+        assert_eq!(
+            loaded_buf.training_memories.len(),
+            30,
+            "training compartment size must survive round-trip"
+        );
+        assert_eq!(
+            loaded_buf.recent_memories.len(),
+            20,
+            "recent compartment size must survive round-trip"
+        );
+
+        // Seal flag must survive.
+        assert!(
+            !loaded_buf.training_phase,
+            "training_phase must remain false after round-trip (seal was called before save)"
+        );
+
+        // Content equality for each compartment, element-wise.
+        for (i, (expected, actual)) in training_originals
+            .iter()
+            .zip(loaded_buf.training_memories.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                expected, actual,
+                "training_memories[{i}] must match original after round-trip"
+            );
+        }
+        for (i, (expected, actual)) in recent_originals
+            .iter()
+            .zip(loaded_buf.recent_memories.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                expected, actual,
+                "recent_memories[{i}] must match original after round-trip"
+            );
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Red test — a pre-Phase-2 save file (no `replay_buffer` field in the
+    /// JSON) must load as a freshly-allocated empty buffer when the loaded
+    /// config has `replay_training_capacity > 0`. This preserves the
+    /// invariant established by `PcActorCritic::new`: capacity > 0 ⇒
+    /// `replay_buffer.is_some()`.
+    #[test]
+    fn test_legacy_save_file_replay_buffer_none() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        // Build an agent with a configured (but empty) replay buffer, save
+        // it with the current code, strip any `replay_buffer` key to mimic
+        // a pre-Phase-2 save file, then load and verify the buffer was
+        // allocated fresh from the config.
+        let mut config = default_config();
+        config.replay_training_capacity = 100;
+        config.replay_recent_capacity = 50;
+
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+        assert!(
+            agent.replay_buffer.is_some(),
+            "construction must allocate a buffer when capacity > 0"
+        );
+        assert_eq!(
+            agent.replay_buffer.as_ref().unwrap().total_len(),
+            0,
+            "newly-constructed buffer must be empty"
+        );
+
+        let path = temp_path("test_legacy_save_file_replay_buffer_none.json");
+        save_agent(&agent, &path, 0, None).unwrap();
+
+        // Strip any `replay_buffer` key at the top level so the file looks
+        // exactly like a Phase-1 save (no replay_buffer field at all).
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        if let Some(obj) = json.as_object_mut() {
+            obj.remove("replay_buffer");
+        }
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        // Load — the deserializer must tolerate the missing field (legacy
+        // compat) and `load_agent` must allocate a fresh empty buffer from
+        // the config's replay_training_capacity > 0.
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        assert!(
+            loaded.replay_buffer.is_some(),
+            "legacy save file must still yield a buffer when config has replay_training_capacity > 0"
+        );
+        let buf = loaded.replay_buffer.as_ref().unwrap();
+        assert_eq!(
+            buf.total_len(),
+            0,
+            "legacy load must produce an empty buffer (no transitions in file)"
+        );
+        assert!(
+            buf.training_phase,
+            "fresh buffer must start in training_phase = true"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Locks the MAGI Caspar fix for serialized telemetry + cooldown
+    /// state. A save/load cycle must preserve `replay_clamp_count`,
+    /// `steps_since_last_rollback_hard`, and `rollback_hard_cooldown_steps`
+    /// exactly — dashboards cannot see an artificial counter reset and
+    /// the cooldown gate cannot be silently bypassed by reloading a file
+    /// taken mid-window.
+    #[test]
+    fn test_save_load_preserves_clamp_count_and_cooldown_state() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        let mut config = default_config();
+        config.replay_training_capacity = 100;
+        config.replay_recent_capacity = 0;
+
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        // Set a custom cooldown window, consume most of it, and tick
+        // the clamp counter so none of the three fields match their
+        // construction defaults (u64::MAX, 100, 0).
+        agent.rollback_hard_cooldown_steps = 777;
+        agent.steps_since_last_rollback_hard = 42;
+        agent.replay_clamp_count = 9;
+
+        let path = temp_path("test_save_load_preserves_clamp_count_and_cooldown_state.json");
+        save_agent(&agent, &path, 0, None).unwrap();
+
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        assert_eq!(
+            loaded.replay_clamp_count, 9,
+            "replay_clamp_count must survive save/load"
+        );
+        assert_eq!(
+            loaded.steps_since_last_rollback_hard, 42,
+            "steps_since_last_rollback_hard must survive save/load — \
+             otherwise a mid-cooldown save/reload silently bypasses the gate"
+        );
+        assert_eq!(
+            loaded.rollback_hard_cooldown_steps, 777,
+            "rollback_hard_cooldown_steps must survive save/load — \
+             otherwise set_rollback_hard_cooldown is silently reverted"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Legacy compat for the three newly-persisted fields: a save file
+    /// lacking any of them must still load with the pre-W2-fix
+    /// bootstrap defaults (clamp_count = 0, cooldown unlocked via
+    /// `u64::MAX`, window = `DEFAULT_ROLLBACK_HARD_COOLDOWN`).
+    #[test]
+    fn test_legacy_save_file_defaults_clamp_count_and_cooldown_state() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        let config = default_config();
+        let agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
+
+        let path = temp_path("test_legacy_save_file_defaults_clamp_count_and_cooldown_state.json");
+        save_agent(&agent, &path, 0, None).unwrap();
+
+        // Strip the three newly-added fields to mimic a pre-W2-fix save.
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        if let Some(obj) = json.as_object_mut() {
+            obj.remove("replay_clamp_count");
+            obj.remove("steps_since_last_rollback_hard");
+            obj.remove("rollback_hard_cooldown_steps");
+        }
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        assert_eq!(loaded.replay_clamp_count, 0);
+        assert_eq!(loaded.steps_since_last_rollback_hard, u64::MAX);
+        assert_eq!(
+            loaded.rollback_hard_cooldown_steps,
+            crate::pc_actor_critic::DEFAULT_ROLLBACK_HARD_COOLDOWN
+        );
+
+        let _ = fs::remove_file(&path);
     }
 }
