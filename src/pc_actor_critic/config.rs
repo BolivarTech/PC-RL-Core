@@ -12,6 +12,18 @@ use serde::{Deserialize, Serialize};
 use crate::mlp_critic::MlpCriticConfig;
 use crate::pc_actor::PcActorConfig;
 
+/// Tolerance for detecting the `-1.0` sentinel value in
+/// `scale_floor_replay` after JSON round-trip. Exactly `-1.0` is
+/// representable in f64 and should round-trip bit-perfectly, but
+/// defensive tolerance prevents misdetection if a future serde
+/// backend introduces any ULP-level noise.
+//
+// Production consumers arrive in commit 4 (`effective_actor_scale_for_mode`).
+// `#[allow(dead_code)]` is scoped to bridge the commit-3 scaffold to the
+// commit-4 implementation without disabling the lint repo-wide.
+#[allow(dead_code)]
+pub(crate) const SENTINEL_EPSILON: f64 = 1e-9;
+
 /// Default discount factor.
 fn default_gamma() -> f64 {
     0.95
@@ -199,6 +211,16 @@ fn default_replay_batch_size() -> usize {
     64
 }
 
+/// Default `scale_floor_replay` sentinel.
+///
+/// Returns `-1.0` to signal "opt-in not provided" — replay-under-FROZEN
+/// inherits the conservative no-op semantics. Set to a value in
+/// `[0.0, 10*scale_ceil]` to opt in: that value becomes the actor's
+/// effective scale during `replay_learn()` regardless of hysteresis state.
+fn default_scale_floor_replay() -> f64 {
+    -1.0
+}
+
 /// Configuration for the integrated PC Actor-Critic agent.
 ///
 /// # Examples
@@ -269,6 +291,7 @@ fn default_replay_batch_size() -> usize {
 ///     replay_recent_capacity: 0,
 ///     replay_positive_only: true,
 ///     replay_batch_size: 64,
+///     scale_floor_replay: -1.0,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -455,6 +478,24 @@ pub struct PcActorCriticConfig {
     /// Batch size for each `replay_learn()` call. Default: 64.
     #[serde(default = "default_replay_batch_size")]
     pub replay_batch_size: usize,
+    /// Replay-only scale floor: opt-in override of the actor's effective
+    /// scale during `replay_learn()`.
+    ///
+    /// `-1.0` (default) acts as a sentinel meaning "opt-in not provided" —
+    /// replay-under-FROZEN inherits the conservative no-op semantics
+    /// (actor weights frozen for replay, only critic updates). Any value
+    /// in `[0.0, 10 * scale_ceil]` opts in: that value becomes the
+    /// effective actor scale during replay regardless of hysteresis
+    /// state, allowing controlled actor learning from positive-reward
+    /// memories even while FROZEN. Values in `(-1.0, 0.0)`, non-finite
+    /// values, and values above `10 * scale_ceil` are rejected by
+    /// `validate_config`.
+    ///
+    /// Detection uses `SENTINEL_EPSILON` (crate-private constant)
+    /// tolerance so future serde backends with ULP-level round-trip
+    /// noise still match the sentinel.
+    #[serde(default = "default_scale_floor_replay")]
+    pub scale_floor_replay: f64,
 }
 
 #[cfg(test)]
@@ -540,7 +581,31 @@ mod tests {
             replay_recent_capacity: 0,
             replay_positive_only: true,
             replay_batch_size: 64,
+            scale_floor_replay: -1.0,
         }
+    }
+
+    #[test]
+    #[ignore = "Red: requires v2.2.1 commit 4"]
+    fn test_scale_floor_replay_default_is_minus_one_sentinel() {
+        // The default sentinel `-1.0` signals "opt-in not provided".
+        // Replay-under-FROZEN preserves the conservative no-op semantics
+        // unless the user explicitly opts in by setting this field to a
+        // value in `[0.0, 10 * scale_ceil]`. The struct exists at this
+        // point (commit 3 scaffold), but `validate_config` and the gate
+        // logic in `effective_actor_scale_for_mode` arrive in commit 4.
+        let cfg = base_config();
+        // `base_config` mirrors the user-facing default for this field.
+        assert!(
+            (cfg.scale_floor_replay - (-1.0)).abs() < SENTINEL_EPSILON,
+            "default scale_floor_replay must be -1.0 sentinel, got {}",
+            cfg.scale_floor_replay
+        );
+        // The serde-default helper must agree with the struct literal.
+        assert!(
+            (default_scale_floor_replay() - (-1.0)).abs() < SENTINEL_EPSILON,
+            "default_scale_floor_replay() must return -1.0 sentinel"
+        );
     }
 
     #[test]

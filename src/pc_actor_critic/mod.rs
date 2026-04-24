@@ -3530,6 +3530,7 @@ mod tests {
             replay_recent_capacity: 0,
             replay_positive_only: true,
             replay_batch_size: 64,
+            scale_floor_replay: -1.0,
         }
     }
 
@@ -4026,6 +4027,7 @@ mod tests {
             replay_recent_capacity: 0,
             replay_positive_only: true,
             replay_batch_size: 64,
+            scale_floor_replay: -1.0,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -5228,6 +5230,7 @@ mod tests {
             replay_recent_capacity: 0,
             replay_positive_only: true,
             replay_batch_size: 64,
+            scale_floor_replay: -1.0,
         }
     }
 
@@ -11849,6 +11852,410 @@ mod tests {
         assert!(
             drift > 1e-9,
             "Polyak target must advance under FROZEN actor with scale_floor>0, drift={drift}"
+        );
+    }
+
+    // ── v2.2.1 — scale_floor_replay opt-in (Red phase) ───────────────────
+    //
+    // Six tests pin down the contract for the new `scale_floor_replay`
+    // opt-in field. Together with the config-module Test 1 they form a
+    // 7-test Red set:
+    //
+    //   * Test 2: validation REJECTS invalid values
+    //     (negative-but-not-sentinel, NaN, ±Inf, > 10×scale_ceil).
+    //   * Test 3: validation ACCEPTS the sentinel and any value in
+    //     `[0.0, 10×scale_ceil]`.
+    //   * Test 4: replay-under-FROZEN with the default sentinel (or
+    //     explicit 0.0) leaves the actor unchanged but still updates
+    //     the critic — the conservative no-op semantic.
+    //   * Test 5: replay-under-FROZEN with `scale_floor_replay = 0.5`
+    //     opts the actor into learning from positive-reward memories.
+    //   * Test 6: KL distillation gradient applies under opt-in (the
+    //     `skip_kl` bypass must be lifted when replay opts in).
+    //   * Test 7: full regularizer stack (EWC + Polyak + Frozen) under
+    //     opt-in stays finite, Fisher untouched, Polyak bounded.
+    //
+    // All seven are gated `#[ignore = "Red: requires v2.2.1 commit 4"]`.
+    // Commit 4 will land:
+    //   * `validate_config` rule for the new field
+    //   * `effective_actor_scale_for_mode` returning a per-mode scale
+    //   * `replay_bypasses_hysteresis` predicate gating Polyak/Fisher
+    //   * Body changes in `apply_actor_update_and_bookkeeping`
+    //
+    // All tests use seed 42 to keep `StdRng` behaviour deterministic
+    // across CI runs (MAGI R2/R3 requirement).
+
+    /// Helper: build a positive-reward 9-dim ReplayTransition compatible
+    /// with the agents constructed by `default_config()` /
+    /// `replay_config()`. Distinct from `make_replay_transition` so the
+    /// red tests use a guaranteed-positive reward without re-specifying
+    /// the marker arithmetic.
+    fn make_positive_transition(state_dim: usize) -> ReplayTransition {
+        let mut state = vec![0.0; state_dim];
+        state[0] = 0.5;
+        let mut next_state = vec![0.0; state_dim];
+        next_state[1] = 0.5;
+        ReplayTransition {
+            state,
+            action: 0,
+            reward: 1.0,
+            next_state,
+            done: false,
+            valid_actions: (0..state_dim).collect(),
+        }
+    }
+
+    /// Push `n` identical positive-reward transitions into the agent's
+    /// replay buffer. Panics if no buffer is configured. State dim is
+    /// fixed at 9 to match `default_config()`.
+    fn populate_positive_replay_buffer(agent: &mut PcActorCritic, n: usize) {
+        let buf = agent
+            .replay_buffer
+            .as_mut()
+            .expect("populate_positive_replay_buffer: buffer must be configured");
+        for _ in 0..n {
+            buf.push(make_positive_transition(9));
+        }
+    }
+
+    /// Snapshot every entry of a `Matrix` into a flat `Vec<f64>` for
+    /// later L2-delta / equality comparison.
+    fn snapshot_mat(m: &crate::matrix::Matrix) -> Vec<f64> {
+        m.data.clone()
+    }
+
+    /// Snapshot every entry of a CpuLinAlg `Vector` (i.e. `Vec<f64>`)
+    /// into an owned vector. Slice-typed for clippy::ptr_arg.
+    fn snapshot_vec(v: &[f64]) -> Vec<f64> {
+        v.to_owned()
+    }
+
+    // ── Test 2 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires v2.2.1 commit 4"]
+    fn test_scale_floor_replay_validation_rejects_invalid_values() {
+        // Commit 4's validation rule (per plan §3.5) must reject:
+        //   * values in (-1.0, 0.0) — these are NOT the sentinel and
+        //     opt-in is undefined for negative scales.
+        //   * non-finite values (NaN / ±Inf).
+        //   * values > 10 × scale_ceil — outside the documented opt-in
+        //     range; allowing them would let a typo silently scale the
+        //     actor into divergence.
+        let scale_ceil_default = PcActorCriticConfig { ..default_config() }.scale_ceil;
+
+        let invalid_values = [
+            -0.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            100.1 * scale_ceil_default,
+        ];
+
+        for &bad in &invalid_values {
+            let mut cfg = default_config();
+            cfg.scale_floor_replay = bad;
+            let result: Result<PcActorCritic, PcError> =
+                PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+            assert!(
+                result.is_err(),
+                "scale_floor_replay = {bad} must be rejected"
+            );
+            match result.unwrap_err() {
+                PcError::ConfigValidation(msg) => {
+                    assert!(
+                        msg.contains("scale_floor_replay"),
+                        "error must mention field name for value {bad}: {msg}"
+                    );
+                }
+                other => panic!("expected ConfigValidation for {bad}, got {other:?}",),
+            }
+        }
+    }
+
+    // ── Test 3 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires v2.2.1 commit 4"]
+    fn test_scale_floor_replay_validation_accepts_valid_values() {
+        // Commit 4's validation rule must ACCEPT:
+        //   * `-1.0` exactly — the sentinel meaning "opt-in not provided".
+        //   * Any finite value in `[0.0, 10 × scale_ceil]`.
+        let valid_values = [-1.0_f64, 0.0, 0.1, 0.5, 1.0, 5.0];
+
+        for &good in &valid_values {
+            let mut cfg = default_config();
+            cfg.scale_floor_replay = good;
+            let result: Result<PcActorCritic, PcError> =
+                PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+            assert!(
+                result.is_ok(),
+                "scale_floor_replay = {good} must be accepted, got {:?}",
+                result.err()
+            );
+        }
+    }
+
+    // ── Test 4 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires v2.2.1 commit 4"]
+    fn test_replay_learn_no_op_under_frozen_with_default_sentinel() {
+        // Two parameterized scenarios, each must produce identical
+        // behaviour:
+        //   (4a) `scale_floor_replay = -1.0` (default sentinel — no opt-in).
+        //   (4b) `scale_floor_replay =  0.0` (explicit acknowledgement).
+        //
+        // Under a FROZEN actor with no opt-in, replay_learn must:
+        //   * leave actor weights bit-identical (L2 < 1e-12).
+        //   * STILL update critic weights (replay batch executed; the
+        //     critic always learns regardless of opt-in).
+        for &sfr in &[-1.0_f64, 0.0] {
+            let mut cfg = replay_config(100, 0);
+            cfg.actor_hysteresis = true;
+            cfg.scale_floor = 0.0;
+            cfg.scale_floor_replay = sfr;
+            let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+            // Force actor FROZEN before populating the buffer so the
+            // replay path executes in the FROZEN regime end-to-end.
+            agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+            populate_positive_replay_buffer(&mut agent, 8);
+
+            let actor_w_before = agent.actor.layers[0].weights.data.clone();
+            let critic_w_before = agent.critic.layers[0].weights.data.clone();
+
+            agent.replay_learn(8).expect("replay_learn must succeed");
+
+            let actor_delta = l2_delta(&agent.actor.layers[0].weights.data, &actor_w_before);
+            let critic_delta = l2_delta(&agent.critic.layers[0].weights.data, &critic_w_before);
+
+            assert!(
+                actor_delta < 1e-12,
+                "actor must NOT update under FROZEN with scale_floor_replay={sfr}, delta={actor_delta}"
+            );
+            assert!(
+                critic_delta > 1e-6,
+                "critic MUST update under FROZEN replay (always learns), delta={critic_delta}, sfr={sfr}"
+            );
+        }
+    }
+
+    // ── Test 5 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires v2.2.1 commit 4"]
+    fn test_replay_learn_updates_actor_under_frozen_with_opt_in() {
+        // Under a FROZEN actor, opting in via `scale_floor_replay = 0.5`
+        // must let the actor learn from positive-reward memories. The
+        // gate logic in `effective_actor_scale_for_mode` (commit 4) must
+        // return 0.5 during replay, overriding the FROZEN scale floor.
+        let mut cfg = replay_config(100, 0);
+        cfg.actor_hysteresis = true;
+        cfg.scale_floor = 0.0;
+        cfg.scale_floor_replay = 0.5;
+        cfg.distillation_lambda_frozen = 0.05;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        populate_positive_replay_buffer(&mut agent, 16);
+
+        let actor_w_before = agent.actor.layers[0].weights.data.clone();
+        let critic_w_before = agent.critic.layers[0].weights.data.clone();
+
+        agent.replay_learn(16).expect("replay_learn must succeed");
+
+        let actor_delta = l2_delta(&agent.actor.layers[0].weights.data, &actor_w_before);
+        let critic_delta = l2_delta(&agent.critic.layers[0].weights.data, &critic_w_before);
+
+        assert!(
+            actor_delta > 1e-6,
+            "actor MUST update under FROZEN replay opt-in, delta={actor_delta}"
+        );
+        assert!(
+            critic_delta > 1e-6,
+            "critic MUST update under replay opt-in, delta={critic_delta}"
+        );
+    }
+
+    // ── Test 6 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires v2.2.1 commit 4"]
+    fn test_replay_learn_applies_kl_gradient_under_frozen_with_opt_in() {
+        // Two parallel agents with identical seeds and identical
+        // configs EXCEPT `distillation_lambda_frozen`:
+        //   * agent_no_kl  : distillation_lambda_frozen = 0.0
+        //   * agent_with_kl: distillation_lambda_frozen = 0.05
+        //
+        // Both opt in via `scale_floor_replay = 0.5` and force FROZEN.
+        // Under opt-in the `skip_kl` bypass in
+        // `apply_actor_update_and_bookkeeping` must be lifted, so the
+        // KL gradient term contributes a measurable extra delta.
+        // Expectation: L2(actor_delta_with_kl − actor_delta_no_kl) > 1e-6.
+        let build = |lambda_frozen: f64| -> PcActorCritic {
+            let mut cfg = replay_config(100, 0);
+            cfg.actor_hysteresis = true;
+            cfg.scale_floor = 0.0;
+            cfg.scale_floor_replay = 0.5;
+            cfg.distillation_lambda_frozen = lambda_frozen;
+            let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+            agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+            populate_positive_replay_buffer(&mut agent, 16);
+            agent
+        };
+
+        let mut agent_no_kl = build(0.0);
+        let mut agent_with_kl = build(0.05);
+
+        let w_no_kl_before = agent_no_kl.actor.layers[0].weights.data.clone();
+        let w_with_kl_before = agent_with_kl.actor.layers[0].weights.data.clone();
+
+        agent_no_kl
+            .replay_learn(16)
+            .expect("replay_learn (no kl) must succeed");
+        agent_with_kl
+            .replay_learn(16)
+            .expect("replay_learn (with kl) must succeed");
+
+        // Per-element delta vectors so we can compare the KL contribution
+        // directly rather than just scalar L2 norms (which can coincide
+        // by accident even when the gradient direction differs).
+        let delta_no_kl: Vec<f64> = agent_no_kl.actor.layers[0]
+            .weights
+            .data
+            .iter()
+            .zip(w_no_kl_before.iter())
+            .map(|(a, b)| a - b)
+            .collect();
+        let delta_with_kl: Vec<f64> = agent_with_kl.actor.layers[0]
+            .weights
+            .data
+            .iter()
+            .zip(w_with_kl_before.iter())
+            .map(|(a, b)| a - b)
+            .collect();
+
+        let diff_norm = l2_delta(&delta_with_kl, &delta_no_kl);
+        assert!(
+            diff_norm > 1e-6,
+            "KL gradient contribution must be measurable under opt-in, diff_norm={diff_norm}"
+        );
+    }
+
+    // ── Test 7 ──────────────────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "Red: requires v2.2.1 commit 4"]
+    fn test_combined_regularizers_under_frozen_replay_opt_in() {
+        // Saturation test. Configure the FULL regularizer stack:
+        //   * EWC               (ewc_lambda = 0.1)
+        //   * Polyak distill    (distillation_lambda_polyak = 0.05)
+        //   * Frozen distill    (distillation_lambda_frozen = 0.05)
+        //   * Replay opt-in     (scale_floor_replay = 0.5)
+        // and verify replay-under-FROZEN behaves as specified:
+        //   (a) actor weights remain finite
+        //   (b) critic weights remain finite
+        //   (c) Fisher diagonal entries finite AND `f_ema_*` UNCHANGED
+        //       — Fisher is `is_online`-gated per R6 W1; replay must
+        //       not contaminate the EMA.
+        //   (d) Polyak target finite AND L2-distance from snapshot < 0.5
+        //       — bound rationale: per-batch worst case is
+        //       `batch_size × lr × MAX_REPLAY_TD_ERROR = 32 × 0.005 × 5
+        //       = 0.8` in extreme; typical is well below 0.5. The 0.5
+        //       threshold catches catastrophic EMA drift while allowing
+        //       legitimate target tracking.
+        //   (e) Actor L2 delta > 1e-6 — actor still learns despite full
+        //       regularizer stack.
+        let mut cfg = replay_config(100, 0);
+        cfg.actor_hysteresis = true;
+        cfg.scale_floor = 0.0;
+        cfg.scale_floor_replay = 0.5;
+        cfg.ewc_lambda = 0.1;
+        cfg.distillation_lambda_polyak = 0.05;
+        cfg.polyak_tau = 0.005;
+        cfg.distillation_lambda_frozen = 0.05;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Force FROZEN via direct mutation.
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.actor_frozen_steps = 100;
+
+        populate_positive_replay_buffer(&mut agent, 32);
+
+        // Snapshot anchors and Fisher EMAs BEFORE the replay batch so
+        // we can check the no-contamination and bounded-drift contracts.
+        let polyak_snap: Vec<f64> = snapshot_mat(
+            &agent
+                .polyak_target
+                .as_ref()
+                .expect("polyak target must exist when distillation_lambda_polyak > 0")
+                .layers[0]
+                .weights,
+        );
+
+        // Fisher EMA snapshots, one per actor layer.
+        let fisher_ema_w_snaps: Vec<Vec<f64>> = agent
+            .actor_fisher
+            .iter()
+            .map(|f| snapshot_mat(&f.f_ema_weights))
+            .collect();
+        let fisher_ema_b_snaps: Vec<Vec<f64>> = agent
+            .actor_fisher
+            .iter()
+            .map(|f| snapshot_vec(&f.f_ema_bias))
+            .collect();
+
+        let actor_w_before = agent.actor.layers[0].weights.data.clone();
+
+        agent.replay_learn(32).expect("replay_learn must succeed");
+
+        // (a) + (b) finite weights everywhere.
+        assert!(
+            all_weights_finite(&agent),
+            "actor + critic weights must remain finite"
+        );
+
+        // (c) Fisher diagonal: every entry finite AND f_ema unchanged.
+        assert!(
+            !fisher_any_non_finite(&agent),
+            "Fisher diagonal must remain finite"
+        );
+        for (i, fs) in agent.actor_fisher.iter().enumerate() {
+            assert_eq!(
+                fs.f_ema_weights.data, fisher_ema_w_snaps[i],
+                "actor Fisher f_ema_weights[{i}] must be unchanged by replay (R6 W1)"
+            );
+            assert_eq!(
+                fs.f_ema_bias, fisher_ema_b_snaps[i],
+                "actor Fisher f_ema_bias[{i}] must be unchanged by replay (R6 W1)"
+            );
+        }
+
+        // (d) Polyak target finite + bounded drift.
+        let polyak_after = snapshot_mat(
+            &agent
+                .polyak_target
+                .as_ref()
+                .expect("polyak target must remain allocated")
+                .layers[0]
+                .weights,
+        );
+        assert!(
+            polyak_after.iter().all(|x| x.is_finite()),
+            "polyak target must remain finite"
+        );
+        let polyak_drift = l2_delta(&polyak_snap, &polyak_after);
+        assert!(
+            polyak_drift < 0.5,
+            "polyak drift under replay opt-in must stay bounded, drift={polyak_drift}"
+        );
+
+        // (e) Actor learned despite the full regularizer stack.
+        let actor_delta = l2_delta(&agent.actor.layers[0].weights.data, &actor_w_before);
+        assert!(
+            actor_delta > 1e-6,
+            "actor must learn under full regularizer stack + opt-in, delta={actor_delta}"
         );
     }
 }
