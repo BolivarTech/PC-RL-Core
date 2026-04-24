@@ -11611,4 +11611,226 @@ mod tests {
         // it is a monotonic telemetry counter.
         let _ = clamped_td;
     }
+
+    // ── v2.2.1 — Polyak preservation under FROZEN-replay (Red phase) ───
+    //
+    // These four tests pin down the semantic that the Polyak EMA must
+    // track ACTOR CHANGES, not the raw plasticity label. They are
+    // gated `#[ignore]` until commit 2 introduces the
+    // `if s_scale > 0.0` gate around the Polyak update at
+    // `mod.rs:2031-2035`. All four use `seed = 42` for determinism
+    // (MAGI iteration 2/3 requirement).
+    //
+    // Tests 1 and 3 are RED: they currently fail because the Polyak
+    // EMA advances unconditionally — even when the actor is FROZEN
+    // with `scale_floor = 0`, or PLASTIC with surprise driving the
+    // organic `s_scale` to 0. Commit 2 will fix this by gating the
+    // Polyak update on `s_scale > 0.0`.
+    //
+    // Tests 2 and 4 are regression guards: they should already pass
+    // today (Polyak does advance under PLASTIC, and under FROZEN with
+    // `scale_floor > 0`). The `#[ignore]` keeps the four-test set
+    // coherent — they all unignore together in commit 2.
+
+    #[test]
+    #[ignore = "Red: requires v2.2.1 commit 2"]
+    fn test_polyak_target_does_not_drift_under_frozen_actor() {
+        // Construct an agent with Polyak distillation enabled and the
+        // actor hysteresis state machine available so we can force the
+        // FROZEN state via direct mutation. With `scale_floor = 0.0`
+        // the FROZEN actor receives `s_scale = 0` from
+        // `effective_actor_scale`, so commit 2's `s_scale > 0` gate
+        // must short-circuit the Polyak update.
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.05;
+        cfg.polyak_tau = 0.005;
+        cfg.actor_hysteresis = true;
+        cfg.scale_floor = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Drive 50 PLASTIC step_masked calls with a non-trivial reward
+        // signal so the Polyak target moves away from its initial
+        // (identical-to-actor) state.
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..50 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+
+        // Force the actor into FROZEN. With `scale_floor = 0` this
+        // makes `effective_actor_scale` return 0, so the actor itself
+        // also stops updating — the Polyak EMA must therefore freeze
+        // alongside it.
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        let polyak_snapshot = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+
+        // 500 more steps under FROZEN. Each invocation tries to call
+        // `polyak_update_from`; commit 2 must short-circuit it because
+        // `s_scale == 0`.
+        for _ in 0..500 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+
+        let polyak_after = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+        let drift = l2_delta(&polyak_snapshot, &polyak_after);
+        assert!(
+            drift < 1e-12,
+            "Polyak target must not drift under FROZEN actor with scale_floor=0, drift={drift}"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires v2.2.1 commit 2"]
+    fn test_polyak_target_advances_when_actor_plastic() {
+        // Regression guard: a PLASTIC actor with non-zero reward and
+        // surprise above `surprise_low` must still advance the Polyak
+        // target. After commit 2 lands, this confirms the gate did
+        // not over-fire and silently freeze the EMA in normal use.
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.05;
+        cfg.polyak_tau = 0.005;
+        // Default config already keeps actor PLASTIC (hysteresis off
+        // and `scale_floor = 0.1`), so any non-trivial step yields
+        // `s_scale >= 0.1 > 0` and the Polyak gate must open.
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let polyak_init = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..100 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+
+        let polyak_after = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+        let drift = l2_delta(&polyak_init, &polyak_after);
+        assert!(
+            drift > 1e-6,
+            "Polyak target must drift under PLASTIC actor with non-zero reward, drift={drift}"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires v2.2.1 commit 2"]
+    fn test_polyak_does_not_advance_under_plastic_zero_surprise() {
+        // MAGI iter 2/3 edge case. The semantic the gate locks in is:
+        // "Polyak tracks ACTOR CHANGES, not the plasticity label".
+        // When the actor is PLASTIC but its effective scale collapses
+        // to zero, the actor stops updating and so must the Polyak EMA.
+        //
+        // Construction strategy (two-phase, no LearnStep mocking):
+        //
+        //  Phase A — warm-up under PLASTIC with `s_scale > 0`. Uses
+        //   a non-stationary state and reward 1.0 so surprise sits in
+        //   the linear-interp band (above the low default
+        //   `surprise_low=0.02`). The actor moves AWAY from initial
+        //   weights, and the Polyak EMA lags behind it.
+        //
+        //  Phase B — same agent, mutate the (public) config to force
+        //   `s_scale = 0.0` for any further steps:
+        //     * `scale_floor   = 0.0`  — value returned when
+        //                                surprise <= surprise_low.
+        //     * `surprise_low  = 10.0` — guaranteed to exceed any
+        //                                realistic PC RMS error.
+        //   Drive 100 more PLASTIC steps. Today (unconditional Polyak
+        //   update at mod.rs:2031–2035) the lagging EMA still closes
+        //   toward the now-static actor, so drift > 0 — RED. After
+        //   commit 2 gates the update on `s_scale > 0`, drift must be
+        //   bit-exact zero (well within 1e-12).
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.05;
+        cfg.polyak_tau = 0.05; // amplifies any lag→advance leakage in Phase B
+                               // actor_hysteresis stays false — actor remains PLASTIC throughout.
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Phase A: PLASTIC, non-zero surprise, actor moves and Polyak lags.
+        let warm_state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..50 {
+            let _ = agent.step_masked(&warm_state, &valid, 1.0, false).unwrap();
+        }
+
+        // Sanity: actor really is PLASTIC (no hysteresis machine).
+        assert!(agent.actor_hysteresis.is_none());
+
+        let polyak_snapshot = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+
+        // Phase B: collapse s_scale to 0 by raising surprise_low above any
+        // realistic surprise and dropping the floor. Live config is
+        // intentionally `pub` for runtime steering, so this is a supported
+        // mutation.
+        agent.config.scale_floor = 0.0;
+        agent.config.surprise_low = 10.0;
+        agent.config.surprise_high = 20.0;
+
+        let cold_state = vec![0.0; 9];
+        for _ in 0..100 {
+            let _ = agent.step_masked(&cold_state, &valid, 0.0, false).unwrap();
+        }
+
+        let polyak_after = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+        let drift = l2_delta(&polyak_snapshot, &polyak_after);
+        assert!(
+            drift < 1e-12,
+            "Polyak target must not drift under PLASTIC actor when s_scale=0, drift={drift}"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires v2.2.1 commit 2"]
+    fn test_polyak_advances_with_positive_scale_floor_under_frozen() {
+        // MAGI iter 2/3 edge case. Documents the symmetric semantic:
+        // when `scale_floor > 0` and the actor is FROZEN,
+        // `effective_actor_scale` still returns `scale_floor`, so the
+        // actor's weights still update at that reduced rate. The
+        // Polyak gate must open and the EMA must advance — Polyak
+        // follows the actor's effective MOVEMENT, not its label.
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.05;
+        cfg.polyak_tau = 0.005;
+        cfg.actor_hysteresis = true;
+        cfg.scale_floor = 0.1;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Force FROZEN immediately. Actor still updates at `0.1×` rate.
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        let polyak_before = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..100 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+
+        let polyak_after = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+        let drift = l2_delta(&polyak_before, &polyak_after);
+        assert!(
+            drift > 1e-9,
+            "Polyak target must advance under FROZEN actor with scale_floor>0, drift={drift}"
+        );
+    }
 }
