@@ -2029,9 +2029,31 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         // Polyak target update: AFTER actor weights are updated.
         if let Some(ref mut polyak) = self.polyak_target {
-            // polyak_update_from cannot fail here — topology is guaranteed identical
-            // because polyak_target is always cloned from self.actor.
-            let _ = polyak.polyak_update_from(&self.actor, self.config.polyak_tau);
+            // Gate Polyak EMA on "actor weights actually changed this step"
+            // (`s_scale > 0`). Semantically: Polyak tracks the live actor's
+            // trajectory, so it should only advance when the actor advances.
+            //
+            // This gate captures TWO distinct no-update scenarios:
+            //   (a) Hysteresis clamp: actor FROZEN → effective_actor_scale
+            //       returns scale_floor. When scale_floor == 0.0 (default),
+            //       s_scale == 0.0 → gate closes → Polyak preserved.
+            //   (b) Organic zero: actor PLASTIC but surprise below surprise_low
+            //       → surprise_scale returns scale_floor → s_scale == 0.0 →
+            //       gate closes → Polyak preserved.
+            //
+            // Both are correct: the actor's weight update is `lr * s_scale *
+            // delta`, which is zero when s_scale == 0.0 in either scenario.
+            // Polyak tracks changes in actor weights, so no change → no
+            // tracking needed.
+            //
+            // Edge case when consumer overrides scale_floor to a positive
+            // value (e.g. scale_floor = 0.1): then s_scale >= 0.1 always,
+            // gate is always open, Polyak tracks even under FROZEN — this
+            // is the consistent behavior (actor is partially updating at
+            // 0.1× rate, Polyak follows at its EMA lag).
+            if s_scale > 0.0 {
+                let _ = polyak.polyak_update_from(&self.actor, self.config.polyak_tau);
+            }
         }
 
         // Update per-layer prediction error EMA for adaptive consolidation (M3b)
@@ -11633,7 +11655,6 @@ mod tests {
     // coherent — they all unignore together in commit 2.
 
     #[test]
-    #[ignore = "Red: requires v2.2.1 commit 2"]
     fn test_polyak_target_does_not_drift_under_frozen_actor() {
         // Construct an agent with Polyak distillation enabled and the
         // actor hysteresis state machine available so we can force the
@@ -11686,7 +11707,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v2.2.1 commit 2"]
     fn test_polyak_target_advances_when_actor_plastic() {
         // Regression guard: a PLASTIC actor with non-zero reward and
         // surprise above `surprise_low` must still advance the Polyak
@@ -11723,7 +11743,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v2.2.1 commit 2"]
     fn test_polyak_does_not_advance_under_plastic_zero_surprise() {
         // MAGI iter 2/3 edge case. The semantic the gate locks in is:
         // "Polyak tracks ACTOR CHANGES, not the plasticity label".
@@ -11795,7 +11814,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v2.2.1 commit 2"]
     fn test_polyak_advances_with_positive_scale_floor_under_frozen() {
         // MAGI iter 2/3 edge case. Documents the symmetric semantic:
         // when `scale_floor > 0` and the actor is FROZEN,
