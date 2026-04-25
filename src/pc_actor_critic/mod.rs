@@ -1837,8 +1837,15 @@ impl<L: LinAlg> PcActorCritic<L> {
             return Ok(0.0);
         }
 
-        // Update critic with per-layer consolidation decay
-        let critic_scale = self.critic_surprise_scale(td_error.abs());
+        // Update critic with per-layer consolidation decay.
+        //
+        // v3.0.0: route the scale resolution through the new mode-aware
+        // gate so `critic_hysteresis.state == Frozen` actually clamps the
+        // critic update (BREAKING change vs v2.2.x; see CHANGELOG and
+        // `effective_critic_scale_for_mode` rustdoc for the migration
+        // path). Online mode clamps to `scale_floor` when FROZEN; replay
+        // mode consults `critic_floor_replay` to allow optional opt-in.
+        let critic_scale = self.effective_critic_scale_for_mode(td_error.abs(), step.mode);
         let loss = self.critic.update_with_decay(
             &critic_input,
             target,
@@ -2591,6 +2598,64 @@ impl<L: LinAlg> PcActorCritic<L> {
     #[inline]
     fn replay_bypasses_hysteresis(&self) -> bool {
         self.config.scale_floor_replay > 0.0
+    }
+
+    /// Effective critic learning-rate scale for a given `LearnMode`,
+    /// honouring `critic_hysteresis.state` (v3.0.0).
+    ///
+    /// Mirror of [`effective_actor_scale_for_mode`](Self::effective_actor_scale_for_mode)
+    /// for the critic. Prior to v3.0.0, `critic_hysteresis.state` was
+    /// tracked but never enforced on critic weight updates — the critic
+    /// kept learning regardless of plasticity label. This method closes
+    /// that asymmetry.
+    ///
+    /// - **Not FROZEN** (PLASTIC, or `critic_hysteresis = None`): the
+    ///   gate is a no-op pass-through to
+    ///   [`critic_surprise_scale`](Self::critic_surprise_scale) — same
+    ///   behaviour as v2.2.x.
+    /// - **FROZEN + Online**: clamps to `scale_floor`. With the default
+    ///   `scale_floor = 0.0` the critic stops updating; with
+    ///   `scale_floor > 0` it updates at the reduced rate.
+    /// - **FROZEN + Replay**: consults `critic_floor_replay`. Sentinel
+    ///   `-1.0` (default) clamps to `scale_floor` (same as Online);
+    ///   any value in `[0.0, 10 * scale_ceil]` becomes the effective
+    ///   critic scale during replay regardless of FROZEN. Strict
+    ///   positive (`> 0.0`) constitutes a real opt-in.
+    pub(crate) fn effective_critic_scale_for_mode(
+        &self,
+        td_error_abs: f64,
+        mode: LearnMode,
+    ) -> f64 {
+        // Runtime-mutation NaN/Inf escape guard, mirror of the actor-side
+        // guard. `config.critic_floor_replay` is `pub`, so a consumer can
+        // bypass `validate_config` by writing a non-finite value after
+        // construction. Debug-only assertion; release builds proceed
+        // safely because downstream `update_with_decay` clamps weight
+        // changes via the WEIGHT_CLIP/GRAD_CLIP envelope.
+        debug_assert!(
+            self.config.critic_floor_replay.is_finite(),
+            "critic_floor_replay became non-finite post-construction: {}",
+            self.config.critic_floor_replay
+        );
+        let is_frozen = matches!(
+            &self.critic_hysteresis,
+            Some(h) if h.state == PlasticityState::Frozen
+        );
+        if !is_frozen {
+            return self.critic_surprise_scale(td_error_abs);
+        }
+        let is_sentinel = (self.config.critic_floor_replay - (-1.0)).abs()
+            < crate::pc_actor_critic::config::SENTINEL_EPSILON;
+        match mode {
+            LearnMode::Online => self.config.scale_floor,
+            LearnMode::Replay => {
+                if is_sentinel {
+                    self.config.scale_floor
+                } else {
+                    self.config.critic_floor_replay
+                }
+            }
+        }
     }
 
     /// Computes per-hidden-layer decay factors for the actor.
@@ -12462,23 +12527,19 @@ mod tests {
         );
     }
 
-    // ── v3.0.0 — critic_hysteresis weight-update gating (Red phase) ─────
+    // ── v3.0.0 — critic_hysteresis weight-update gating ────────────────
     //
     // Eight tests pin down the v3.0.0 contract: when `critic_hysteresis`
     // is enabled and the critic is in FROZEN state, the critic's
     // learning-rate scale is clamped at the gate. Online path uses
     // `scale_floor`; replay path consults `critic_floor_replay`
     // (sentinel `-1.0` → also `scale_floor`; strict positive → opt-in
-    // override).
+    // override). Tests 2 and 3 also serve as regression guards for
+    // PLASTIC and disabled-hysteresis paths (no behaviour change vs
+    // v2.2.x).
     //
-    // All eight are gated `#[ignore = "Red: requires v3.0.0 commit 4"]`
-    // until the production wire lands in commit 4. Tests 2 and 3 are
-    // regression guards (would pass even pre-commit-4 by virtue of
-    // current behavior); the `#[ignore]` keeps the eight-test set
-    // coherent — they all unignore together after the gate is wired.
-    //
-    // The production code that will satisfy these tests:
-    //   * `effective_critic_scale_for_mode` — new `pub(crate)` method
+    // The production code satisfying these tests:
+    //   * `effective_critic_scale_for_mode` — `pub(crate)` method
     //     resolving the per-mode critic scale with FROZEN gating.
     //   * Wiring at the `learn_continuous_inner` critic update site
     //     (replaces the unconditional `critic_surprise_scale(td.abs())`
@@ -12487,7 +12548,6 @@ mod tests {
     // All tests use seed 42 for determinism.
 
     #[test]
-    #[ignore = "Red: requires v3.0.0 commit 4"]
     fn test_critic_hysteresis_frozen_online_clamps_to_scale_floor() {
         // Online path with `critic_hysteresis = true` and FROZEN state
         // must clamp the critic's effective scale to `scale_floor`.
@@ -12523,7 +12583,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v3.0.0 commit 4"]
     fn test_critic_hysteresis_plastic_online_preserves_v2_2_0_behavior() {
         // Regression guard: with critic_hysteresis enabled but the
         // critic in PLASTIC state, behaviour is identical to v2.2.x —
@@ -12558,7 +12617,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v3.0.0 commit 4"]
     fn test_critic_hysteresis_disabled_preserves_v2_2_0_behavior() {
         // Regression guard for consumers who never enabled critic
         // hysteresis. With `critic_hysteresis = false`, the gate's
@@ -12600,7 +12658,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v3.0.0 commit 4"]
     fn test_critic_hysteresis_frozen_replay_default_sentinel_no_op() {
         // Replay path under FROZEN with the default `critic_floor_replay
         // = -1.0` sentinel must inherit the conservative semantics —
@@ -12631,7 +12688,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v3.0.0 commit 4"]
     fn test_critic_hysteresis_frozen_replay_opt_in_updates_critic() {
         // Replay path under FROZEN with `critic_floor_replay = 0.3` opts
         // in: critic must learn from the positive-reward batch even
@@ -12672,7 +12728,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v3.0.0 commit 4"]
     fn test_partial_optin_produces_asymmetric_but_predictable_behavior() {
         // Locks the §3.4 contract: asymmetric opt-in is allowed (no
         // validation error) and produces predictable per-quadrant
@@ -12737,7 +12792,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v3.0.0 commit 4"]
     fn test_migration_path_restores_v2_2_x_critic_behavior() {
         // MAGI Caspar Checkpoint 2 CRITICAL #2 — empirical proof of the
         // CHANGELOG migration claim. Two agents with identical seeds
@@ -12797,7 +12851,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v3.0.0 commit 4"]
     fn test_fisher_accumulation_under_frozen_critic_with_ewc() {
         // MAGI Caspar Checkpoint 2 CRITICAL #3 — EWC/Fisher interaction
         // under the new critic gate. EWC operates on actor parameters
