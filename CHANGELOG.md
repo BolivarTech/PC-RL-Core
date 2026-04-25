@@ -1,5 +1,109 @@
 # Changelog
 
+## [4.0.0] - 2026-04-25
+
+### Breaking changes
+
+- **Generic action space.** `pc-rl-core` now supports two action
+  spaces selected via `PcActorCriticConfig::action_space`:
+  - `ActionSpace::Discrete` (default) — preserves v3.x behavior bit-
+    for-bit. REINFORCE policy gradient on softmax(logits).
+  - `ActionSpace::Continuous` — fixed-σ Gaussian policy `a = μ + σ·ε`
+    with descent-direction gradient `(μ − a) / σ²`.
+
+  **Affected v3.x consumers:** if you never set `action_space`, you
+  default to `Discrete` and observe **no** behavior change. If you
+  explicitly set `Continuous`, you adopt the new code path.
+
+- **Removed `PcActorCritic::step()`.** The deprecated discrete step
+  method (deprecated since v2.0.0) is removed. Migration: replace
+  with `step_masked` and pass the full action set:
+
+  ```rust
+  // v3.x (removed in v4)
+  let action = agent.step(&state, reward, done);
+
+  // v4.0.0
+  let valid: Vec<usize> = (0..agent.actor.output_size).collect();
+  let action = agent.step_masked(&state, &valid, reward, done)?;
+  ```
+
+- **`act()` return type bumps to `Result<...>`.** Pattern-match
+  call sites must add `?`:
+
+  ```rust
+  // v3.x
+  let (action, infer) = agent.act(&state, &valid, SelectionMode::Play);
+  // v4.0.0
+  let (action, infer) = agent.act(&state, &valid, SelectionMode::Play)?;
+  ```
+
+- **`learn(trajectory)` now returns `Result<f64, PcError>`** (was
+  `f64`). Discrete-only — calling on Continuous agent returns
+  `ConfigValidation`. Method remains deprecated since v2.1.0;
+  scheduled for removal in v5.0.0.
+
+- **Replay schema migration.** `ReplayTransition::action: usize`
+  becomes `action: Action` (`#[serde(untagged)]` enum,
+  `Discrete(usize) | Continuous(Vec<f64>)`). v3.x save files
+  deserialize automatically — no consumer action required for
+  loading. Pattern-match call sites that read the field as `usize`
+  break at compile time.
+
+- **`ReplayTransition::valid_actions: Vec<usize>` → `Option<Vec<usize>>`.**
+  v3.x bare `[0,1,2]` form auto-wraps via serde Some-elision.
+  Validation enforces `is_some() iff Discrete`.
+
+- **`ReplayBuffer::push` now returns `Result<(), PcError>`** (was
+  `()`). Validates Action variant matches buffer's action_space and
+  the `valid_actions` invariant. Cross-mode contamination rejected.
+
+### Added
+
+- `ActionSpace` enum (`Discrete | Continuous`) in
+  `pc_actor_critic::config`.
+- `PcActorCriticConfig::policy_sigma: f64` — Gaussian policy std-dev
+  for continuous mode. Default 0.1.
+- `PcActorCritic::step_continuous(state, reward, done) -> Result<Vec<f64>, PcError>`
+  — continuous-mode learning step.
+- `PcActorCritic::step_continuous_raw_device(state, reward, done) -> Result<L::Vector, PcError>`
+  — forward-compat hook for future GpuLinAlg backends.
+- `PcActorCritic::act_continuous(state, mode: SelectionMode) -> Result<(Vec<f64>, InferResult<L>), PcError>`
+  — continuous inference. Play returns μ deterministically; Training
+  samples μ + σ·ε.
+- `Action` enum in `pc_actor_critic::replay` — replay transition
+  action variant.
+- Runtime precondition guards on all 4 entry points (`step_masked`,
+  `step_continuous`, `act`, `act_continuous`) reject mismatched
+  `action_space`.
+
+### Notes
+
+- **Self-recovery toolkit (`rollback_soft`/`rollback_hard`/
+  `champion_update`) remains available only in Discrete mode.**
+  Continuous + distillation lambda > 0 is rejected at validation
+  (KL undefined for raw output). L2-anchored continuous distillation
+  is experimental future work, no release commitment.
+
+- **Continuous-mode operational tuning.** Mitigation matrix for
+  empirical issues:
+
+  | Symptom | Primary mitigation | Secondary | Tertiary |
+  |---|---|---|---|
+  | WEIGHT_CLIP saturation | ↑ `policy_sigma` | ↓ `lr_weights` | ↓ `td_steps` or ↓ `gae_lambda` |
+  | Slow learning | ↓ `policy_sigma` | ↑ `lr_weights` | verify rewards in `[-1, 1]` |
+  | Hysteresis oscillating | confirm `adaptive_surprise=true` | retune `surprise_low`/`high` | disable hysteresis |
+  | Distillation rejected | `distillation_lambda_polyak/frozen = 0.0` | — | — |
+
+- **GpuLinAlg coordination:** v4.0.0 is CPU-first. `step_continuous_raw_device`
+  is the forward-compat hook. GpuLinAlg Phase 2 (separate workstream)
+  will port both v3.0.0 baseline AND v4.0.0 continuous-mode kernels.
+
+- **SemVer rationale:** breaking changes (removed `step()`, replay
+  schema migration, `act()` return type, `learn()` return type)
+  warrant the major bump per SemVer 2.0.0. Consumers `pc-rl-core = "3"`
+  do not auto-receive v4 — must explicitly bump `Cargo.toml`.
+
 ## [3.0.0] - 2026-04-25
 
 ### Breaking changes
