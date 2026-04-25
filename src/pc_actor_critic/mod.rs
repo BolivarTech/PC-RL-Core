@@ -675,6 +675,24 @@ impl<L: LinAlg> PcActorCritic<L> {
             )));
         }
 
+        // v3.0.0 — symmetric rule for the critic-side opt-in. Same tri-state
+        // sentinel semantics: -1.0 (sentinel) OR [0.0, 10*scale_ceil] finite.
+        // See `critic_floor_replay` rustdoc for the breaking-change context.
+        let is_critic_sentinel = (config.critic_floor_replay - (-1.0)).abs()
+            < crate::pc_actor_critic::config::SENTINEL_EPSILON;
+        let is_critic_valid_positive = config.critic_floor_replay.is_finite()
+            && config.critic_floor_replay >= 0.0
+            && config.critic_floor_replay <= upper_bound;
+        if !is_critic_sentinel && !is_critic_valid_positive {
+            return Err(PcError::ConfigValidation(format!(
+                "critic_floor_replay ({}) must be either ~-1.0 (sentinel for \
+                 'use scale_floor') or a finite non-negative value <= {} \
+                 (10× scale_ceil). NaN, ±Infinity, and values in (-1.0, 0.0) \
+                 are rejected as ambiguous or likely configuration errors.",
+                config.critic_floor_replay, upper_bound
+            )));
+        }
+
         Ok(())
     }
 
@@ -3649,6 +3667,7 @@ mod tests {
             replay_positive_only: true,
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
+            critic_floor_replay: -1.0,
         }
     }
 
@@ -4146,6 +4165,7 @@ mod tests {
             replay_positive_only: true,
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
+            critic_floor_replay: -1.0,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -5349,6 +5369,7 @@ mod tests {
             replay_positive_only: true,
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
+            critic_floor_replay: -1.0,
         }
     }
 
@@ -12109,6 +12130,67 @@ mod tests {
             assert!(
                 result.is_ok(),
                 "scale_floor_replay = {good} must be accepted, got {:?}",
+                result.err()
+            );
+        }
+    }
+
+    // ── v3.0.0 critic_floor_replay validation ──────────────────────────
+
+    #[test]
+    fn test_critic_floor_replay_validation_rejects_invalid_values() {
+        // v3.0.0 — symmetric rule for the critic-side opt-in. Mirror of
+        // `test_scale_floor_replay_validation_rejects_invalid_values`.
+        // Validation must reject:
+        //   * values in (-1.0, 0.0) — not the sentinel, opt-in undefined.
+        //   * non-finite values (NaN / ±Inf).
+        //   * values > 10 × scale_ceil.
+        let scale_ceil_default = default_config().scale_ceil;
+
+        let invalid_values = [
+            -0.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            100.1 * scale_ceil_default,
+        ];
+
+        for &bad in &invalid_values {
+            let mut cfg = default_config();
+            cfg.critic_floor_replay = bad;
+            let result: Result<PcActorCritic, PcError> =
+                PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+            assert!(
+                result.is_err(),
+                "critic_floor_replay = {bad} must be rejected"
+            );
+            match result.unwrap_err() {
+                PcError::ConfigValidation(msg) => {
+                    assert!(
+                        msg.contains("critic_floor_replay"),
+                        "error must mention field name for value {bad}: {msg}"
+                    );
+                }
+                other => panic!("expected ConfigValidation for {bad}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_critic_floor_replay_validation_accepts_valid_values() {
+        // v3.0.0 — must ACCEPT:
+        //   * `-1.0` exactly — sentinel meaning "opt-in not provided".
+        //   * Any finite value in `[0.0, 10 × scale_ceil]`.
+        let valid_values = [-1.0_f64, 0.0, 0.1, 0.5, 1.0, 5.0];
+
+        for &good in &valid_values {
+            let mut cfg = default_config();
+            cfg.critic_floor_replay = good;
+            let result: Result<PcActorCritic, PcError> =
+                PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+            assert!(
+                result.is_ok(),
+                "critic_floor_replay = {good} must be accepted, got {:?}",
                 result.err()
             );
         }

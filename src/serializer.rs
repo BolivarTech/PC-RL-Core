@@ -537,6 +537,7 @@ mod tests {
             replay_positive_only: true,
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
+            critic_floor_replay: -1.0,
         }
     }
 
