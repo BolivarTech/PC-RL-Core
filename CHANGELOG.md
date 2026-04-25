@@ -1,5 +1,70 @@
 # Changelog
 
+## [2.2.1] - 2026-04-24
+
+### Added
+
+- `PcActorCriticConfig::scale_floor_replay: f64` — opt-in override
+  for replay-path actor learning-rate floor under FROZEN hysteresis.
+  Default `-1.0` (sentinel) preserves v2.2.0 behavior exactly;
+  values `> 0.0` let consumers enable replay-driven actor updates
+  even during hysteresis FROZEN stress. When opted in (strict
+  positive), the `skip_kl` gate is also bypassed so Polyak and
+  Frozen KL anchors contribute to the replay update. The value
+  `0.0` is accepted but functionally identical to the default,
+  reserved for documentary use.
+
+### Fixed
+
+- Polyak target EMA no longer drifts toward the live actor during
+  prolonged hysteresis FROZEN windows. Previously the EMA update
+  ran unconditionally, causing `θ_polyak → θ_live_frozen` after
+  `~1/polyak_tau` FROZEN steps and degrading `rollback_soft()` to
+  a no-op. The EMA now advances only when the actor weights
+  actually change (`s_scale > 0`), preserving the target's
+  reference value across FROZEN windows. No config change needed;
+  behavior is strictly better for any configuration that uses the
+  Polyak target (`distillation_lambda_polyak > 0`).
+- Config validation now rejects non-finite `scale_floor_replay`
+  (NaN, ±Infinity) and values greater than `10 × scale_ceil` at
+  both `PcActorCritic::new` and `apply_config` paths. Pre-v2.2.1
+  code accepted these silently, producing undefined-behavior
+  weight updates. This closes MAGI Melchior + Caspar Checkpoint 2
+  iter 2 hardening requirement.
+
+### Notes
+
+- **Adding a public field to `PcActorCriticConfig` is technically a
+  SemVer-minor concern.** Downstream consumers using the builder
+  pattern (`PcActorCriticConfig { ..., ..Default::default() }`) or
+  serde deserialization are unaffected. Consumers using exhaustive
+  struct literals (`PcActorCriticConfig { field1: x, field2: y,
+  ..., <all fields listed> }`) will get a missing-field compile
+  error on upgrade — the fix is to add `scale_floor_replay: -1.0`
+  to the literal or switch to `..Default::default()`. We ship this
+  as a patch because the correct remediation is mechanical and
+  non-behavioral.
+- **Serde unknown-fields policy:** `PcActorCriticConfig` does NOT
+  use `#[serde(deny_unknown_fields)]`. Legacy save files that lack
+  the new field deserialize cleanly via `#[serde(default)]`;
+  forward compatibility with future fields is also preserved
+  (unknown fields are silently ignored on load). This policy is
+  unchanged from v2.0.0+.
+- **Polyak-target dynamics shift under replay opt-in.** Consumers
+  running with `distillation_lambda_polyak > 0` AND the new
+  `scale_floor_replay > 0.0` opt-in should expect a measurable
+  change in Polyak-target behavior. The EMA semantic is "target
+  tracks actor movement, not plasticity label": under the default
+  sentinel, FROZEN actors don't move during replay and the target
+  doesn't advance; under the opt-in, the actor DOES move during
+  replay and the Polyak target tracks those replay-driven changes.
+  This is symmetric with the online `scale_floor > 0` case and
+  intentional — the target becomes partially shaped by the replay
+  compartment, not only by on-policy trajectories. No action
+  required if you keep the `-1.0` default; reconsider your
+  `polyak_tau` if you opt in and observe target lag differently
+  from v2.2.0.
+
 ## [2.2.0] - 2026-04-19
 
 This release bundles everything since the v2.0.0 tag: the Continuous

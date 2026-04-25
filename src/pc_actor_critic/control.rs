@@ -52,6 +52,17 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// Returns [`PcError::ConfigValidation`] if the Polyak target is not
     /// allocated (`distillation_lambda_polyak == 0.0`).
+    ///
+    /// # Interaction with hysteresis (v2.2.1+)
+    ///
+    /// Prior to v2.2.1, the Polyak target EMA advanced on every
+    /// `apply_actor_update_and_bookkeeping` call regardless of actor
+    /// state, so during prolonged FROZEN windows the target drifted
+    /// toward the (static) live actor, eventually degrading
+    /// `rollback_soft()` to a no-op. From v2.2.1 onward, the Polyak EMA
+    /// only advances when the actor is actually being updated
+    /// (`s_scale > 0`), so the target remains at its last-PLASTIC-window
+    /// value across arbitrary FROZEN windows.
     pub fn rollback_soft(&mut self) -> Result<(), PcError> {
         let polyak = self.polyak_target.as_ref().ok_or_else(|| {
             PcError::ConfigValidation(

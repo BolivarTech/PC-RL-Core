@@ -657,6 +657,24 @@ impl<L: LinAlg> PcActorCritic<L> {
             ));
         }
 
+        // Tolerance-based sentinel check + NaN/Infinity rejection + upper bound
+        // per MAGI Melchior + Caspar Checkpoint 2 iter 2 hardening requirement.
+        let upper_bound = 10.0 * config.scale_ceil;
+        let is_sentinel = (config.scale_floor_replay - (-1.0)).abs()
+            < crate::pc_actor_critic::config::SENTINEL_EPSILON;
+        let is_valid_positive = config.scale_floor_replay.is_finite()
+            && config.scale_floor_replay >= 0.0
+            && config.scale_floor_replay <= upper_bound;
+        if !is_sentinel && !is_valid_positive {
+            return Err(PcError::ConfigValidation(format!(
+                "scale_floor_replay ({}) must be either ~-1.0 (sentinel for \
+                 'use scale_floor') or a finite non-negative value <= {} \
+                 (10× scale_ceil). NaN, ±Infinity, and values in (-1.0, 0.0) \
+                 are rejected as ambiguous or likely configuration errors.",
+                config.scale_floor_replay, upper_bound
+            )));
+        }
+
         Ok(())
     }
 
@@ -1945,13 +1963,17 @@ impl<L: LinAlg> PcActorCritic<L> {
         mode: LearnMode,
     ) -> f64 {
         let is_online = mode == LearnMode::Online;
-        let s_scale = self.effective_actor_scale(infer.surprise_score);
+        let s_scale = self.effective_actor_scale_for_mode(infer.surprise_score, mode);
         let actor_decay = self.effective_actor_decay();
 
         // KL distillation gradients: inject both Polyak and frozen signals
         // into delta before weight update. Both are additive.
         // Shared skip conditions: actor not frozen, >1 valid action.
-        let skip_kl = self.is_actor_frozen() || valid_actions.len() <= 1;
+        // Replay mode with `scale_floor_replay > 0.0` opts in via
+        // `replay_bypasses_hysteresis`, lifting the FROZEN clamp on KL
+        // distillation so Polyak/Frozen anchors can contribute.
+        let replay_opt_in = !is_online && self.replay_bypasses_hysteresis();
+        let skip_kl = valid_actions.len() <= 1 || (self.is_actor_frozen() && !replay_opt_in);
 
         // KL_polyak gradient
         let mut effective_delta: Vec<f64> = if !skip_kl
@@ -2029,9 +2051,31 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         // Polyak target update: AFTER actor weights are updated.
         if let Some(ref mut polyak) = self.polyak_target {
-            // polyak_update_from cannot fail here — topology is guaranteed identical
-            // because polyak_target is always cloned from self.actor.
-            let _ = polyak.polyak_update_from(&self.actor, self.config.polyak_tau);
+            // Gate Polyak EMA on "actor weights actually changed this step"
+            // (`s_scale > 0`). Semantically: Polyak tracks the live actor's
+            // trajectory, so it should only advance when the actor advances.
+            //
+            // This gate captures TWO distinct no-update scenarios:
+            //   (a) Hysteresis clamp: actor FROZEN → effective_actor_scale
+            //       returns scale_floor. When scale_floor == 0.0 (default),
+            //       s_scale == 0.0 → gate closes → Polyak preserved.
+            //   (b) Organic zero: actor PLASTIC but surprise below surprise_low
+            //       → surprise_scale returns scale_floor → s_scale == 0.0 →
+            //       gate closes → Polyak preserved.
+            //
+            // Both are correct: the actor's weight update is `lr * s_scale *
+            // delta`, which is zero when s_scale == 0.0 in either scenario.
+            // Polyak tracks changes in actor weights, so no change → no
+            // tracking needed.
+            //
+            // Edge case when consumer overrides scale_floor to a positive
+            // value (e.g. scale_floor = 0.1): then s_scale >= 0.1 always,
+            // gate is always open, Polyak tracks even under FROZEN — this
+            // is the consistent behavior (actor is partially updating at
+            // 0.1× rate, Polyak follows at its EMA lag).
+            if s_scale > 0.0 {
+                let _ = polyak.polyak_update_from(&self.actor, self.config.polyak_tau);
+            }
         }
 
         // Update per-layer prediction error EMA for adaptive consolidation (M3b)
@@ -2467,13 +2511,68 @@ impl<L: LinAlg> PcActorCritic<L> {
 
     /// Computes the effective actor learning rate scale considering hysteresis.
     ///
-    /// When actor hysteresis is enabled and the actor is FROZEN, returns
-    /// `scale_floor`. Otherwise delegates to [`surprise_scale()`](Self::surprise_scale).
+    /// Thin wrapper around
+    /// [`effective_actor_scale_for_mode`](Self::effective_actor_scale_for_mode)
+    /// with `LearnMode::Online`. Preserves v2.2.0 call-site semantics:
+    /// hysteresis clamps to `scale_floor` when FROZEN, otherwise delegates
+    /// to [`surprise_scale()`](Self::surprise_scale).
+    #[cfg(test)]
     pub(crate) fn effective_actor_scale(&self, surprise: f64) -> f64 {
+        self.effective_actor_scale_for_mode(surprise, LearnMode::Online)
+    }
+
+    /// Effective actor learning-rate scale for a given `LearnMode`.
+    ///
+    /// - In `Online` mode: identical to `effective_actor_scale` — hysteresis
+    ///   clamps to `scale_floor` when FROZEN.
+    /// - In `Replay` mode: when `scale_floor_replay >= 0.0`, the FROZEN
+    ///   clamp uses that custom floor instead of `scale_floor`. Only a
+    ///   value strictly greater than zero (`> 0.0`) constitutes a real
+    ///   opt-in: it activates the `skip_kl` bypass so Polyak/Frozen KL
+    ///   anchors contribute. A value of exactly `0.0` is accepted for
+    ///   documentary purposes (the consumer has explicitly acknowledged
+    ///   the knob) but is functionally equivalent to the default sentinel
+    ///   under default `scale_floor = 0.0` — no behavior change. The
+    ///   default sentinel `-1.0` preserves v2.2.0 behavior (clamp to
+    ///   `scale_floor`).
+    pub(crate) fn effective_actor_scale_for_mode(&self, surprise: f64, mode: LearnMode) -> f64 {
+        // Runtime-mutation NaN/Inf escape guard. `config.scale_floor_replay`
+        // is `pub`, so a consumer can bypass `validate_config` by writing
+        // a non-finite value after construction. This debug_assert catches
+        // that path in test/debug builds; release builds proceed safely
+        // because downstream weight-update code has its own NaN guards
+        // (see `apply_actor_update_and_bookkeeping`).
+        debug_assert!(
+            self.config.scale_floor_replay.is_finite(),
+            "scale_floor_replay became non-finite post-construction: {}",
+            self.config.scale_floor_replay
+        );
+        let is_sentinel = (self.config.scale_floor_replay - (-1.0)).abs()
+            < crate::pc_actor_critic::config::SENTINEL_EPSILON;
+        let clamp_to = match mode {
+            LearnMode::Online => self.config.scale_floor,
+            LearnMode::Replay => {
+                if is_sentinel {
+                    self.config.scale_floor
+                } else {
+                    self.config.scale_floor_replay
+                }
+            }
+        };
         match &self.actor_hysteresis {
-            Some(h) if h.state == PlasticityState::Frozen => self.config.scale_floor,
+            Some(h) if h.state == PlasticityState::Frozen => clamp_to,
             _ => self.surprise_scale(surprise),
         }
+    }
+
+    /// Whether `LearnMode::Replay` should bypass the hysteresis-driven
+    /// `skip_kl` gate. True iff `scale_floor_replay > 0.0` — strict
+    /// positive trigger to avoid the `0.0` anti-pattern where KL would be
+    /// computed but then zeroed by `s_scale=0` (wasted compute, no
+    /// behavior change vs default).
+    #[inline]
+    fn replay_bypasses_hysteresis(&self) -> bool {
+        self.config.scale_floor_replay > 0.0
     }
 
     /// Computes per-hidden-layer decay factors for the actor.
@@ -3290,6 +3389,47 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// `Ok(())` as a silent no-op when no buffer is configured or when
     /// the buffer is empty — callers typically invoke replay_learn on
     /// a fixed cadence and should not crash on startup.
+    ///
+    /// # Interaction with actor hysteresis
+    ///
+    /// By default (`scale_floor_replay = -1.0` sentinel), replay updates
+    /// to the actor are subject to the same hysteresis gating as on-policy
+    /// learning: when the actor is in FROZEN state, `s_scale` collapses
+    /// to `scale_floor` (default 0.0), producing a no-op actor update
+    /// while the critic still learns from the replay batch.
+    ///
+    /// Consumers who want replay to reinforce the actor even under
+    /// FROZEN stress can set `scale_floor_replay > 0.0`. The validator
+    /// accepts any finite value in `[0.0, 10 × scale_ceil]` (see the
+    /// `scale_floor_replay` field rustdoc for the upper-bound rationale);
+    /// strictly-positive values activate the opt-in path: during FROZEN,
+    /// replay uses the custom floor AND bypasses the `skip_kl` gate so
+    /// the Polyak and Frozen KL anchors also contribute. Typical values
+    /// are `0.1` - `0.3` for mild recovery, higher for aggressive
+    /// override.
+    ///
+    /// A value of `0.0` is accepted for documentation purposes but is
+    /// functionally equivalent to the default sentinel — no opt-in, no
+    /// behavior change. This lets consumers signal "I evaluated this knob
+    /// and chose default behavior deliberately" via an explicit config
+    /// entry. Use `-1.0` if you simply have not considered the knob.
+    ///
+    /// This knob does NOT affect on-policy learning (`step` / `step_masked`):
+    /// hysteresis always gates those paths via `scale_floor`.
+    ///
+    /// # Polyak target behavior under replay opt-in
+    ///
+    /// The Polyak EMA semantic is "target tracks the actor's effective
+    /// movement, not its plasticity label". Under the default sentinel,
+    /// FROZEN actors do not move during replay, so the Polyak target
+    /// does not advance. Under `scale_floor_replay > 0.0`, the opt-in
+    /// actor DOES move during replay, and the Polyak target will
+    /// therefore track those replay-driven changes. Consumers running
+    /// with `distillation_lambda_polyak > 0` should expect a measurable
+    /// shift in Polyak-target dynamics when enabling this opt-in: the
+    /// target becomes partially shaped by the replay compartment
+    /// content, not only by on-policy trajectories. This is intentional
+    /// and symmetric with the online `scale_floor > 0` case.
     pub fn replay_learn(&mut self, batch_size: usize) -> Result<(), PcError> {
         // Pre-extract batch to release the buffer borrow before the
         // mutable-self learning loop below (MAGI R2 W2).
@@ -3508,6 +3648,7 @@ mod tests {
             replay_recent_capacity: 0,
             replay_positive_only: true,
             replay_batch_size: 64,
+            scale_floor_replay: -1.0,
         }
     }
 
@@ -4004,6 +4145,7 @@ mod tests {
             replay_recent_capacity: 0,
             replay_positive_only: true,
             replay_batch_size: 64,
+            scale_floor_replay: -1.0,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -5206,6 +5348,7 @@ mod tests {
             replay_recent_capacity: 0,
             replay_positive_only: true,
             replay_batch_size: 64,
+            scale_floor_replay: -1.0,
         }
     }
 
@@ -11610,5 +11753,630 @@ mod tests {
         // The clamp-binding count must only grow from the current step;
         // it is a monotonic telemetry counter.
         let _ = clamped_td;
+    }
+
+    // ── v2.2.1 — Polyak preservation under FROZEN-replay ───────────────
+    //
+    // These four tests pin down the semantic that the Polyak EMA must
+    // track ACTOR CHANGES, not the raw plasticity label. The enforcing
+    // production code is the `if s_scale > 0.0` gate wrapping
+    // `polyak_update_from` in `apply_actor_update_and_bookkeeping`
+    // (see `mod.rs` Polyak gate block). All four use `seed = 42` for
+    // determinism (MAGI R2/R3 requirement).
+    //
+    // Tests 1 and 3 exercise the two gate-firing regimes:
+    //   * FROZEN actor with `scale_floor = 0` → `s_scale = 0`, gate
+    //     closes, Polyak frozen.
+    //   * PLASTIC actor with surprise-driven `s_scale = 0` → gate
+    //     closes for the same reason, proving the gate keys on the
+    //     effective scale, not the plasticity label.
+    //
+    // Tests 2 and 4 are regression guards for the open-gate regime:
+    // Polyak MUST advance under PLASTIC with non-zero scale, and under
+    // FROZEN with `scale_floor > 0` (the actor still moves at the
+    // reduced rate, so the EMA must follow).
+
+    #[test]
+    fn test_polyak_target_does_not_drift_under_frozen_actor() {
+        // Construct an agent with Polyak distillation enabled and the
+        // actor hysteresis state machine available so we can force the
+        // FROZEN state via direct mutation. With `scale_floor = 0.0`
+        // the FROZEN actor receives `s_scale = 0` from
+        // `effective_actor_scale`, so the production `s_scale > 0` gate
+        // must short-circuit the Polyak update.
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.05;
+        cfg.polyak_tau = 0.005;
+        cfg.actor_hysteresis = true;
+        cfg.scale_floor = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Drive 50 PLASTIC step_masked calls with a non-trivial reward
+        // signal so the Polyak target moves away from its initial
+        // (identical-to-actor) state.
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..50 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+
+        // Force the actor into FROZEN. With `scale_floor = 0` this
+        // makes `effective_actor_scale` return 0, so the actor itself
+        // also stops updating — the Polyak EMA must therefore freeze
+        // alongside it.
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        let polyak_snapshot = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+
+        // 500 more steps under FROZEN. Each invocation tries to call
+        // `polyak_update_from`; the production gate must short-circuit
+        // it because `s_scale == 0`.
+        for _ in 0..500 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+
+        let polyak_after = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+        let drift = l2_delta(&polyak_snapshot, &polyak_after);
+        assert!(
+            drift < 1e-12,
+            "Polyak target must not drift under FROZEN actor with scale_floor=0, drift={drift}"
+        );
+    }
+
+    #[test]
+    fn test_polyak_target_advances_when_actor_plastic() {
+        // Regression guard: a PLASTIC actor with non-zero reward and
+        // surprise above `surprise_low` must still advance the Polyak
+        // target. Confirms the `s_scale > 0` gate does not over-fire
+        // and silently freeze the EMA in normal use.
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.05;
+        cfg.polyak_tau = 0.005;
+        // Default config already keeps actor PLASTIC (hysteresis off
+        // and `scale_floor = 0.1`), so any non-trivial step yields
+        // `s_scale >= 0.1 > 0` and the Polyak gate must open.
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let polyak_init = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..100 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+
+        let polyak_after = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+        let drift = l2_delta(&polyak_init, &polyak_after);
+        assert!(
+            drift > 1e-6,
+            "Polyak target must drift under PLASTIC actor with non-zero reward, drift={drift}"
+        );
+    }
+
+    #[test]
+    fn test_polyak_does_not_advance_under_plastic_zero_surprise() {
+        // MAGI iter 2/3 edge case. The semantic the gate locks in is:
+        // "Polyak tracks ACTOR CHANGES, not the plasticity label".
+        // When the actor is PLASTIC but its effective scale collapses
+        // to zero, the actor stops updating and so must the Polyak EMA.
+        //
+        // Construction strategy (two-phase, no LearnStep mocking):
+        //
+        //  Phase A — warm-up under PLASTIC with `s_scale > 0`. Uses
+        //   a non-stationary state and reward 1.0 so surprise sits in
+        //   the linear-interp band (above the low default
+        //   `surprise_low=0.02`). The actor moves AWAY from initial
+        //   weights, and the Polyak EMA lags behind it.
+        //
+        //  Phase B — same agent, mutate the (public) config to force
+        //   `s_scale = 0.0` for any further steps:
+        //     * `scale_floor   = 0.0`  — value returned when
+        //                                surprise <= surprise_low.
+        //     * `surprise_low  = 10.0` — guaranteed to exceed any
+        //                                realistic PC RMS error.
+        //   Drive 100 more PLASTIC steps. Without the gate, a lagging
+        //   EMA would still close toward the now-static actor, so drift
+        //   would be > 0. With the production `s_scale > 0` gate around
+        //   `polyak_update_from`, drift must be bit-exact zero (well
+        //   within 1e-12).
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.05;
+        cfg.polyak_tau = 0.05; // amplifies any lag→advance leakage in Phase B
+                               // actor_hysteresis stays false — actor remains PLASTIC throughout.
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Phase A: PLASTIC, non-zero surprise, actor moves and Polyak lags.
+        let warm_state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..50 {
+            let _ = agent.step_masked(&warm_state, &valid, 1.0, false).unwrap();
+        }
+
+        // Sanity: actor really is PLASTIC (no hysteresis machine).
+        assert!(agent.actor_hysteresis.is_none());
+
+        let polyak_snapshot = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+
+        // Phase B: collapse s_scale to 0 by raising surprise_low above any
+        // realistic surprise and dropping the floor. Live config is
+        // intentionally `pub` for runtime steering, so this is a supported
+        // mutation.
+        agent.config.scale_floor = 0.0;
+        agent.config.surprise_low = 10.0;
+        agent.config.surprise_high = 20.0;
+
+        let cold_state = vec![0.0; 9];
+        for _ in 0..100 {
+            let _ = agent.step_masked(&cold_state, &valid, 0.0, false).unwrap();
+        }
+
+        let polyak_after = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+        let drift = l2_delta(&polyak_snapshot, &polyak_after);
+        assert!(
+            drift < 1e-12,
+            "Polyak target must not drift under PLASTIC actor when s_scale=0, drift={drift}"
+        );
+    }
+
+    #[test]
+    fn test_polyak_advances_with_positive_scale_floor_under_frozen() {
+        // MAGI iter 2/3 edge case. Documents the symmetric semantic:
+        // when `scale_floor > 0` and the actor is FROZEN,
+        // `effective_actor_scale` still returns `scale_floor`, so the
+        // actor's weights still update at that reduced rate. The
+        // Polyak gate must open and the EMA must advance — Polyak
+        // follows the actor's effective MOVEMENT, not its label.
+        let mut cfg = default_config();
+        cfg.distillation_lambda_polyak = 0.05;
+        cfg.polyak_tau = 0.005;
+        cfg.actor_hysteresis = true;
+        cfg.scale_floor = 0.1;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Force FROZEN immediately. Actor still updates at `0.1×` rate.
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        let polyak_before = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..100 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+
+        let polyak_after = agent.polyak_target.as_ref().unwrap().layers[0]
+            .weights
+            .data
+            .clone();
+        let drift = l2_delta(&polyak_before, &polyak_after);
+        assert!(
+            drift > 1e-9,
+            "Polyak target must advance under FROZEN actor with scale_floor>0, drift={drift}"
+        );
+    }
+
+    // ── v2.2.1 — scale_floor_replay opt-in ───────────────────────────────
+    //
+    // Six tests pin down the contract for the new `scale_floor_replay`
+    // opt-in field. Together with the config-module Test 1 they form a
+    // 7-test behavioral set:
+    //
+    //   * Test 2: validation REJECTS invalid values
+    //     (negative-but-not-sentinel, NaN, ±Inf, > 10×scale_ceil).
+    //   * Test 3: validation ACCEPTS the sentinel and any value in
+    //     `[0.0, 10×scale_ceil]`.
+    //   * Test 4: replay-under-FROZEN with the default sentinel (or
+    //     explicit 0.0) leaves the actor unchanged but still updates
+    //     the critic — the conservative no-op semantic.
+    //   * Test 5: replay-under-FROZEN with `scale_floor_replay = 0.5`
+    //     opts the actor into learning from positive-reward memories.
+    //   * Test 6: KL distillation gradient applies under opt-in (the
+    //     `skip_kl` bypass must be lifted when replay opts in).
+    //   * Test 7: full regularizer stack (EWC + Polyak + Frozen) under
+    //     opt-in stays finite, Fisher untouched, Polyak bounded.
+    //
+    // The production code enforcing these contracts lives in:
+    //   * `validate_config` (scale_floor_replay range + finiteness rule)
+    //   * `effective_actor_scale_for_mode` (per-mode scale resolution)
+    //   * `replay_bypasses_hysteresis` (strict-positive opt-in predicate
+    //     gating Polyak/Fisher behavior and the `skip_kl` bypass)
+    //   * `apply_actor_update_and_bookkeeping` (mode-aware s_scale and
+    //     skip_kl resolution)
+    //
+    // All tests use seed 42 to keep `StdRng` behaviour deterministic
+    // across CI runs (MAGI R2/R3 requirement).
+
+    /// Helper: build a positive-reward 9-dim ReplayTransition compatible
+    /// with the agents constructed by `default_config()` /
+    /// `replay_config()`. Distinct from `make_replay_transition` so the
+    /// red tests use a guaranteed-positive reward without re-specifying
+    /// the marker arithmetic.
+    fn make_positive_transition(state_dim: usize) -> ReplayTransition {
+        let mut state = vec![0.0; state_dim];
+        state[0] = 0.5;
+        let mut next_state = vec![0.0; state_dim];
+        next_state[1] = 0.5;
+        ReplayTransition {
+            state,
+            action: 0,
+            reward: 1.0,
+            next_state,
+            done: false,
+            valid_actions: (0..state_dim).collect(),
+        }
+    }
+
+    /// Push `n` identical positive-reward transitions into the agent's
+    /// replay buffer. Panics if no buffer is configured. State dim is
+    /// fixed at 9 to match `default_config()`.
+    fn populate_positive_replay_buffer(agent: &mut PcActorCritic, n: usize) {
+        let buf = agent
+            .replay_buffer
+            .as_mut()
+            .expect("populate_positive_replay_buffer: buffer must be configured");
+        for _ in 0..n {
+            buf.push(make_positive_transition(9));
+        }
+    }
+
+    /// Snapshot every entry of a `Matrix` into a flat `Vec<f64>` for
+    /// later L2-delta / equality comparison.
+    fn snapshot_mat(m: &crate::matrix::Matrix) -> Vec<f64> {
+        m.data.clone()
+    }
+
+    /// Snapshot every entry of a CpuLinAlg `Vector` (i.e. `Vec<f64>`)
+    /// into an owned vector. Slice-typed for clippy::ptr_arg.
+    fn snapshot_vec(v: &[f64]) -> Vec<f64> {
+        v.to_owned()
+    }
+
+    // ── Test 2 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_scale_floor_replay_validation_rejects_invalid_values() {
+        // Commit 4's validation rule (per plan §3.5) must reject:
+        //   * values in (-1.0, 0.0) — these are NOT the sentinel and
+        //     opt-in is undefined for negative scales.
+        //   * non-finite values (NaN / ±Inf).
+        //   * values > 10 × scale_ceil — outside the documented opt-in
+        //     range; allowing them would let a typo silently scale the
+        //     actor into divergence.
+        let scale_ceil_default = PcActorCriticConfig { ..default_config() }.scale_ceil;
+
+        let invalid_values = [
+            -0.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            100.1 * scale_ceil_default,
+        ];
+
+        for &bad in &invalid_values {
+            let mut cfg = default_config();
+            cfg.scale_floor_replay = bad;
+            let result: Result<PcActorCritic, PcError> =
+                PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+            assert!(
+                result.is_err(),
+                "scale_floor_replay = {bad} must be rejected"
+            );
+            match result.unwrap_err() {
+                PcError::ConfigValidation(msg) => {
+                    assert!(
+                        msg.contains("scale_floor_replay"),
+                        "error must mention field name for value {bad}: {msg}"
+                    );
+                }
+                other => panic!("expected ConfigValidation for {bad}, got {other:?}",),
+            }
+        }
+    }
+
+    // ── Test 3 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_scale_floor_replay_validation_accepts_valid_values() {
+        // Commit 4's validation rule must ACCEPT:
+        //   * `-1.0` exactly — the sentinel meaning "opt-in not provided".
+        //   * Any finite value in `[0.0, 10 × scale_ceil]`.
+        let valid_values = [-1.0_f64, 0.0, 0.1, 0.5, 1.0, 5.0];
+
+        for &good in &valid_values {
+            let mut cfg = default_config();
+            cfg.scale_floor_replay = good;
+            let result: Result<PcActorCritic, PcError> =
+                PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+            assert!(
+                result.is_ok(),
+                "scale_floor_replay = {good} must be accepted, got {:?}",
+                result.err()
+            );
+        }
+    }
+
+    // ── Test 4 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_replay_learn_no_op_under_frozen_with_default_sentinel() {
+        // Two parameterized scenarios, each must produce identical
+        // behaviour:
+        //   (4a) `scale_floor_replay = -1.0` (default sentinel — no opt-in).
+        //   (4b) `scale_floor_replay =  0.0` (explicit acknowledgement).
+        //
+        // Under a FROZEN actor with no opt-in, replay_learn must:
+        //   * leave actor weights bit-identical (L2 < 1e-12).
+        //   * STILL update critic weights (replay batch executed; the
+        //     critic always learns regardless of opt-in).
+        for &sfr in &[-1.0_f64, 0.0] {
+            let mut cfg = replay_config(100, 0);
+            cfg.actor_hysteresis = true;
+            cfg.scale_floor = 0.0;
+            cfg.scale_floor_replay = sfr;
+            let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+            // Force actor FROZEN before populating the buffer so the
+            // replay path executes in the FROZEN regime end-to-end.
+            agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+            populate_positive_replay_buffer(&mut agent, 8);
+
+            let actor_w_before = agent.actor.layers[0].weights.data.clone();
+            let critic_w_before = agent.critic.layers[0].weights.data.clone();
+
+            agent.replay_learn(8).expect("replay_learn must succeed");
+
+            let actor_delta = l2_delta(&agent.actor.layers[0].weights.data, &actor_w_before);
+            let critic_delta = l2_delta(&agent.critic.layers[0].weights.data, &critic_w_before);
+
+            assert!(
+                actor_delta < 1e-12,
+                "actor must NOT update under FROZEN with scale_floor_replay={sfr}, delta={actor_delta}"
+            );
+            assert!(
+                critic_delta > 1e-6,
+                "critic MUST update under FROZEN replay (always learns), delta={critic_delta}, sfr={sfr}"
+            );
+        }
+    }
+
+    // ── Test 5 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_replay_learn_updates_actor_under_frozen_with_opt_in() {
+        // Under a FROZEN actor, opting in via `scale_floor_replay = 0.5`
+        // must let the actor learn from positive-reward memories. The
+        // gate logic in `effective_actor_scale_for_mode` must return 0.5
+        // during replay, overriding the FROZEN scale floor.
+        let mut cfg = replay_config(100, 0);
+        cfg.actor_hysteresis = true;
+        cfg.scale_floor = 0.0;
+        cfg.scale_floor_replay = 0.5;
+        cfg.distillation_lambda_frozen = 0.05;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        populate_positive_replay_buffer(&mut agent, 16);
+
+        let actor_w_before = agent.actor.layers[0].weights.data.clone();
+        let critic_w_before = agent.critic.layers[0].weights.data.clone();
+
+        agent.replay_learn(16).expect("replay_learn must succeed");
+
+        let actor_delta = l2_delta(&agent.actor.layers[0].weights.data, &actor_w_before);
+        let critic_delta = l2_delta(&agent.critic.layers[0].weights.data, &critic_w_before);
+
+        assert!(
+            actor_delta > 1e-6,
+            "actor MUST update under FROZEN replay opt-in, delta={actor_delta}"
+        );
+        assert!(
+            critic_delta > 1e-6,
+            "critic MUST update under replay opt-in, delta={critic_delta}"
+        );
+    }
+
+    // ── Test 6 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_replay_learn_applies_kl_gradient_under_frozen_with_opt_in() {
+        // Two parallel agents with identical seeds and identical
+        // configs EXCEPT `distillation_lambda_frozen`:
+        //   * agent_no_kl  : distillation_lambda_frozen = 0.0
+        //   * agent_with_kl: distillation_lambda_frozen = 0.05
+        //
+        // Both opt in via `scale_floor_replay = 0.5` and force FROZEN.
+        // Under opt-in the `skip_kl` bypass in
+        // `apply_actor_update_and_bookkeeping` must be lifted, so the
+        // KL gradient term contributes a measurable extra delta.
+        // Expectation: L2(actor_delta_with_kl − actor_delta_no_kl) > 1e-6.
+        let build = |lambda_frozen: f64| -> PcActorCritic {
+            let mut cfg = replay_config(100, 0);
+            cfg.actor_hysteresis = true;
+            cfg.scale_floor = 0.0;
+            cfg.scale_floor_replay = 0.5;
+            cfg.distillation_lambda_frozen = lambda_frozen;
+            let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+            agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+            populate_positive_replay_buffer(&mut agent, 16);
+            agent
+        };
+
+        let mut agent_no_kl = build(0.0);
+        let mut agent_with_kl = build(0.05);
+
+        let w_no_kl_before = agent_no_kl.actor.layers[0].weights.data.clone();
+        let w_with_kl_before = agent_with_kl.actor.layers[0].weights.data.clone();
+
+        agent_no_kl
+            .replay_learn(16)
+            .expect("replay_learn (no kl) must succeed");
+        agent_with_kl
+            .replay_learn(16)
+            .expect("replay_learn (with kl) must succeed");
+
+        // Per-element delta vectors so we can compare the KL contribution
+        // directly rather than just scalar L2 norms (which can coincide
+        // by accident even when the gradient direction differs).
+        let delta_no_kl: Vec<f64> = agent_no_kl.actor.layers[0]
+            .weights
+            .data
+            .iter()
+            .zip(w_no_kl_before.iter())
+            .map(|(a, b)| a - b)
+            .collect();
+        let delta_with_kl: Vec<f64> = agent_with_kl.actor.layers[0]
+            .weights
+            .data
+            .iter()
+            .zip(w_with_kl_before.iter())
+            .map(|(a, b)| a - b)
+            .collect();
+
+        let diff_norm = l2_delta(&delta_with_kl, &delta_no_kl);
+        assert!(
+            diff_norm > 1e-6,
+            "KL gradient contribution must be measurable under opt-in, diff_norm={diff_norm}"
+        );
+    }
+
+    // ── Test 7 ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_combined_regularizers_under_frozen_replay_opt_in() {
+        // Saturation test. Configure the FULL regularizer stack:
+        //   * EWC               (ewc_lambda = 0.1)
+        //   * Polyak distill    (distillation_lambda_polyak = 0.05)
+        //   * Frozen distill    (distillation_lambda_frozen = 0.05)
+        //   * Replay opt-in     (scale_floor_replay = 0.5)
+        // and verify replay-under-FROZEN behaves as specified:
+        //   (a) actor weights remain finite
+        //   (b) critic weights remain finite
+        //   (c) Fisher diagonal entries finite AND `f_ema_*` UNCHANGED
+        //       — Fisher is `is_online`-gated per R6 W1; replay must
+        //       not contaminate the EMA.
+        //   (d) Polyak target finite AND L2-distance from snapshot < 0.1
+        //       — bound rationale: with `polyak_tau = 0.005`, one replay
+        //       batch can shift each target weight at most by
+        //       `tau · |actor_delta|` = `0.005 · |actor_delta|`. Under
+        //       the full regularizer stack with `scale_floor_replay = 0.5`
+        //       and a 32-transition batch, the empirical actor delta L2
+        //       stays under ~1.0, so the Polyak drift L2 stays well under
+        //       `0.005 · 1.0 = 0.005` and the observed value is typically
+        //       in the 1e-4 range. The 0.1 threshold is two orders of
+        //       magnitude above that — tight enough to catch catastrophic
+        //       drift (the old 0.5 bound let near-diverging gradients
+        //       through), loose enough to absorb seed-driven variance.
+        //   (e) Actor L2 delta > 1e-6 — actor still learns despite full
+        //       regularizer stack.
+        let mut cfg = replay_config(100, 0);
+        cfg.actor_hysteresis = true;
+        cfg.scale_floor = 0.0;
+        cfg.scale_floor_replay = 0.5;
+        cfg.ewc_lambda = 0.1;
+        cfg.distillation_lambda_polyak = 0.05;
+        cfg.polyak_tau = 0.005;
+        cfg.distillation_lambda_frozen = 0.05;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Force FROZEN via direct mutation.
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.actor_frozen_steps = 100;
+
+        populate_positive_replay_buffer(&mut agent, 32);
+
+        // Snapshot anchors and Fisher EMAs BEFORE the replay batch so
+        // we can check the no-contamination and bounded-drift contracts.
+        let polyak_snap: Vec<f64> = snapshot_mat(
+            &agent
+                .polyak_target
+                .as_ref()
+                .expect("polyak target must exist when distillation_lambda_polyak > 0")
+                .layers[0]
+                .weights,
+        );
+
+        // Fisher EMA snapshots, one per actor layer.
+        let fisher_ema_w_snaps: Vec<Vec<f64>> = agent
+            .actor_fisher
+            .iter()
+            .map(|f| snapshot_mat(&f.f_ema_weights))
+            .collect();
+        let fisher_ema_b_snaps: Vec<Vec<f64>> = agent
+            .actor_fisher
+            .iter()
+            .map(|f| snapshot_vec(&f.f_ema_bias))
+            .collect();
+
+        let actor_w_before = agent.actor.layers[0].weights.data.clone();
+
+        agent.replay_learn(32).expect("replay_learn must succeed");
+
+        // (a) + (b) finite weights everywhere.
+        assert!(
+            all_weights_finite(&agent),
+            "actor + critic weights must remain finite"
+        );
+
+        // (c) Fisher diagonal: every entry finite AND f_ema unchanged.
+        assert!(
+            !fisher_any_non_finite(&agent),
+            "Fisher diagonal must remain finite"
+        );
+        for (i, fs) in agent.actor_fisher.iter().enumerate() {
+            assert_eq!(
+                fs.f_ema_weights.data, fisher_ema_w_snaps[i],
+                "actor Fisher f_ema_weights[{i}] must be unchanged by replay (R6 W1)"
+            );
+            assert_eq!(
+                fs.f_ema_bias, fisher_ema_b_snaps[i],
+                "actor Fisher f_ema_bias[{i}] must be unchanged by replay (R6 W1)"
+            );
+        }
+
+        // (d) Polyak target finite + bounded drift.
+        let polyak_after = snapshot_mat(
+            &agent
+                .polyak_target
+                .as_ref()
+                .expect("polyak target must remain allocated")
+                .layers[0]
+                .weights,
+        );
+        assert!(
+            polyak_after.iter().all(|x| x.is_finite()),
+            "polyak target must remain finite"
+        );
+        let polyak_drift = l2_delta(&polyak_snap, &polyak_after);
+        assert!(
+            polyak_drift < 0.1,
+            "polyak drift under replay opt-in must stay bounded \
+             (tau·|actor_delta| envelope ≪ 0.1), drift={polyak_drift}"
+        );
+
+        // (e) Actor learned despite the full regularizer stack.
+        let actor_delta = l2_delta(&agent.actor.layers[0].weights.data, &actor_w_before);
+        assert!(
+            actor_delta > 1e-6,
+            "actor must learn under full regularizer stack + opt-in, delta={actor_delta}"
+        );
     }
 }

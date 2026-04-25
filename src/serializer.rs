@@ -536,6 +536,7 @@ mod tests {
             replay_recent_capacity: 0,
             replay_positive_only: true,
             replay_batch_size: 64,
+            scale_floor_replay: -1.0,
         }
     }
 
