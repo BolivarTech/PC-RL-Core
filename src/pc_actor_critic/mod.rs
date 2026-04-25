@@ -1636,6 +1636,14 @@ impl<L: LinAlg> PcActorCritic<L> {
         valid_actions: &[usize],
         mode: SelectionMode,
     ) -> Result<(usize, InferResult<L>), PcError> {
+        if self.config.action_space != ActionSpace::Discrete {
+            return Err(PcError::ConfigValidation(format!(
+                "act is only valid when action_space == Discrete; \
+                 current action_space = {:?}. Use act_continuous() for \
+                 continuous action spaces.",
+                self.config.action_space
+            )));
+        }
         let infer_result = self.actor.infer(input);
         let action =
             self.actor
@@ -2266,6 +2274,14 @@ impl<L: LinAlg> PcActorCritic<L> {
         reward: f64,
         terminal: bool,
     ) -> Result<usize, PcError> {
+        if self.config.action_space != ActionSpace::Discrete {
+            return Err(PcError::ConfigValidation(format!(
+                "step_masked is only valid when action_space == Discrete; \
+                 current action_space = {:?}. Use step_continuous() for \
+                 continuous action spaces.",
+                self.config.action_space
+            )));
+        }
         if valid_actions.is_empty() {
             return Err(PcError::ConfigValidation(
                 "valid_actions must not be empty".to_string(),
@@ -12497,7 +12513,6 @@ mod tests {
     // ── v4.0.0 entry-point precondition guards (Brainstorm Q6) ─────────
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 1.5 precondition guards"]
     fn test_step_masked_rejects_continuous_config() {
         let mut cfg = default_config();
         cfg.action_space = ActionSpace::Continuous;
@@ -12520,7 +12535,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 1.5 precondition guards"]
     fn test_act_rejects_continuous_config() {
         let mut cfg = default_config();
         cfg.action_space = ActionSpace::Continuous;
@@ -12535,7 +12549,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 1.5 precondition guards"]
     fn test_step_continuous_rejects_discrete_config() {
         let cfg = default_config();
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
@@ -12545,7 +12558,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 1.5 precondition guards"]
     fn test_act_continuous_rejects_discrete_config() {
         let cfg = default_config();
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
