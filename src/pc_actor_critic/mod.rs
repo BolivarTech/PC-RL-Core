@@ -669,9 +669,8 @@ impl<L: LinAlg> PcActorCritic<L> {
             return Err(PcError::ConfigValidation(format!(
                 "scale_floor_replay ({}) must be either ~-1.0 (sentinel for \
                  'use scale_floor') or a finite non-negative value <= {} \
-                 (10× scale_ceil). NaN, ±Infinity, negative zero, and values \
-                 in (-1.0, 0.0) are rejected as ambiguous or likely \
-                 configuration errors.",
+                 (10× scale_ceil). NaN, ±Infinity, and values in (-1.0, 0.0) \
+                 are rejected as ambiguous or likely configuration errors.",
                 config.scale_floor_replay, upper_bound
             )));
         }
@@ -2528,12 +2527,14 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///   clamps to `scale_floor` when FROZEN.
     /// - In `Replay` mode: when `scale_floor_replay >= 0.0`, the FROZEN
     ///   clamp uses that custom floor instead of `scale_floor`. Only a
-    ///   value strictly greater than zero (`> 0.0`) also activates the
-    ///   `skip_kl` bypass so Polyak/Frozen KL anchors contribute. A value
-    ///   of exactly `0.0` uses that floor literally (same effective
-    ///   behavior as the `-1.0` sentinel, but consumer has explicitly
-    ///   acknowledged the knob). The default sentinel `-1.0` preserves
-    ///   v2.2.0 behavior (clamp to `scale_floor`).
+    ///   value strictly greater than zero (`> 0.0`) constitutes a real
+    ///   opt-in: it activates the `skip_kl` bypass so Polyak/Frozen KL
+    ///   anchors contribute. A value of exactly `0.0` is accepted for
+    ///   documentary purposes (the consumer has explicitly acknowledged
+    ///   the knob) but is functionally equivalent to the default sentinel
+    ///   under default `scale_floor = 0.0` — no behavior change. The
+    ///   default sentinel `-1.0` preserves v2.2.0 behavior (clamp to
+    ///   `scale_floor`).
     pub(crate) fn effective_actor_scale_for_mode(&self, surprise: f64, mode: LearnMode) -> f64 {
         let is_sentinel = (self.config.scale_floor_replay - (-1.0)).abs()
             < crate::pc_actor_critic::config::SENTINEL_EPSILON;
@@ -3377,6 +3378,31 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// `Ok(())` as a silent no-op when no buffer is configured or when
     /// the buffer is empty — callers typically invoke replay_learn on
     /// a fixed cadence and should not crash on startup.
+    ///
+    /// # Interaction with actor hysteresis
+    ///
+    /// By default (`scale_floor_replay = -1.0` sentinel), replay updates
+    /// to the actor are subject to the same hysteresis gating as on-policy
+    /// learning: when the actor is in FROZEN state, `s_scale` collapses
+    /// to `scale_floor` (default 0.0), producing a no-op actor update
+    /// while the critic still learns from the replay batch.
+    ///
+    /// Consumers who want replay to reinforce the actor even under
+    /// FROZEN stress can set `scale_floor_replay > 0.0`. Values in
+    /// `(0.0, scale_ceil]` produce an opt-in override: during FROZEN,
+    /// replay uses the custom floor AND bypasses the `skip_kl` gate so
+    /// the Polyak and Frozen KL anchors also contribute. Typical values
+    /// are `0.1` - `0.3` for mild recovery, higher for aggressive
+    /// override.
+    ///
+    /// A value of `0.0` is accepted for documentation purposes but is
+    /// functionally equivalent to the default sentinel — no opt-in, no
+    /// behavior change. This lets consumers signal "I evaluated this knob
+    /// and chose default behavior deliberately" via an explicit config
+    /// entry. Use `-1.0` if you simply have not considered the knob.
+    ///
+    /// This knob does NOT affect on-policy learning (`step` / `step_masked`):
+    /// hysteresis always gates those paths via `scale_floor`.
     pub fn replay_learn(&mut self, batch_size: usize) -> Result<(), PcError> {
         // Pre-extract batch to release the buffer borrow before the
         // mutable-self learning loop below (MAGI R2 W2).

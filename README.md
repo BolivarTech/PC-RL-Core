@@ -193,6 +193,32 @@ See the `# When to use` sections on `rollback_soft` / `rollback_hard`
 and the "Stale V(s) batch semantics" rustdoc on `replay_learn` for the
 full design rationale and parameter-tuning guidance.
 
+### Replay under actor hysteresis
+
+By default, when actor hysteresis is enabled and the actor is in
+FROZEN state, `replay_learn` updates ONLY the critic — the actor
+is protected from off-policy gradients during stress. This is
+safe but means the replay signal does not reach the actor during
+~70% of a typical stress-heavy run.
+
+To let replay reinforce the actor even under FROZEN stress, set
+`scale_floor_replay = 0.1` (or higher) in the config. The opt-in
+also enables Polyak and Frozen KL anchor gradients in the replay
+update. This is a consumer decision — trading hysteresis
+protection for replay efficacy.
+
+> ⚠ **Forward-compatibility notice for v3.0.0 migration.** The
+> next major release will introduce `critic_floor_replay` as a
+> parallel knob for the critic side (currently not gated by
+> hysteresis). If you set `scale_floor_replay > 0` in v2.2.1,
+> when upgrading to v3.0.0 you will need to ALSO set
+> `critic_floor_replay` to a matching value to preserve
+> symmetric actor-critic dynamics. Without the pair, actor
+> would recover via replay while the critic stays hysteresis-
+> gated — producing measurable desphasage between the two
+> networks. The v2.2.1 release notes include the full migration
+> table; plan your adoption accordingly.
+
 ## Architecture
 
 ### Core Components
