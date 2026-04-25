@@ -12461,4 +12461,407 @@ mod tests {
             "actor must learn under full regularizer stack + opt-in, delta={actor_delta}"
         );
     }
+
+    // ── v3.0.0 — critic_hysteresis weight-update gating (Red phase) ─────
+    //
+    // Eight tests pin down the v3.0.0 contract: when `critic_hysteresis`
+    // is enabled and the critic is in FROZEN state, the critic's
+    // learning-rate scale is clamped at the gate. Online path uses
+    // `scale_floor`; replay path consults `critic_floor_replay`
+    // (sentinel `-1.0` → also `scale_floor`; strict positive → opt-in
+    // override).
+    //
+    // All eight are gated `#[ignore = "Red: requires v3.0.0 commit 4"]`
+    // until the production wire lands in commit 4. Tests 2 and 3 are
+    // regression guards (would pass even pre-commit-4 by virtue of
+    // current behavior); the `#[ignore]` keeps the eight-test set
+    // coherent — they all unignore together after the gate is wired.
+    //
+    // The production code that will satisfy these tests:
+    //   * `effective_critic_scale_for_mode` — new `pub(crate)` method
+    //     resolving the per-mode critic scale with FROZEN gating.
+    //   * Wiring at the `learn_continuous_inner` critic update site
+    //     (replaces the unconditional `critic_surprise_scale(td.abs())`
+    //     call with the mode-aware lookup).
+    //
+    // All tests use seed 42 for determinism.
+
+    #[test]
+    #[ignore = "Red: requires v3.0.0 commit 4"]
+    fn test_critic_hysteresis_frozen_online_clamps_to_scale_floor() {
+        // Online path with `critic_hysteresis = true` and FROZEN state
+        // must clamp the critic's effective scale to `scale_floor`.
+        // With `scale_floor = 0.0`, FROZEN means byte-equal critic
+        // weights across step_masked calls. Pre-v3.0.0 the critic kept
+        // updating via `critic_surprise_scale(td_error.abs())` — that
+        // is the bug this test exposes.
+        let mut cfg = default_config();
+        cfg.critic_hysteresis = true;
+        cfg.scale_floor = 0.0;
+        // Disable cross-wake coupling so a process_hysteresis transition
+        // can't quietly flip critic_hysteresis back to PLASTIC mid-loop.
+        cfg.actor_wakes_critic = false;
+        cfg.critic_wakes_actor = false;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let critic_w_before = agent.critic.layers[0].weights.data.clone();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..10 {
+            // Force FROZEN before every step so the gate sees FROZEN
+            // even if process_hysteresis transitions internally.
+            agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+
+        let critic_delta = l2_delta(&agent.critic.layers[0].weights.data, &critic_w_before);
+        assert!(
+            critic_delta < 1e-12,
+            "critic weights MUST NOT update under FROZEN+online with scale_floor=0, delta={critic_delta}"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires v3.0.0 commit 4"]
+    fn test_critic_hysteresis_plastic_online_preserves_v2_2_0_behavior() {
+        // Regression guard: with critic_hysteresis enabled but the
+        // critic in PLASTIC state, behaviour is identical to v2.2.x —
+        // critic_surprise_scale governs the update, the new gate is a
+        // no-op pass-through. Critic weights must change measurably.
+        let mut cfg = default_config();
+        cfg.critic_hysteresis = true;
+        cfg.actor_wakes_critic = false;
+        cfg.critic_wakes_actor = false;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // critic_hysteresis defaults to PLASTIC at construction; assert
+        // and keep it that way for the duration of this test.
+        assert_eq!(
+            agent.critic_hysteresis.as_ref().unwrap().state,
+            PlasticityState::Plastic
+        );
+
+        let critic_w_before = agent.critic.layers[0].weights.data.clone();
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..10 {
+            agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Plastic;
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+
+        let critic_delta = l2_delta(&agent.critic.layers[0].weights.data, &critic_w_before);
+        assert!(
+            critic_delta > 1e-6,
+            "critic weights MUST update under PLASTIC, delta={critic_delta}"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires v3.0.0 commit 4"]
+    fn test_critic_hysteresis_disabled_preserves_v2_2_0_behavior() {
+        // Regression guard for consumers who never enabled critic
+        // hysteresis. With `critic_hysteresis = false`, the gate's
+        // `is_some()` branch evaluates to false → fall-through to the
+        // legacy `critic_surprise_scale` path → unchanged behaviour
+        // versus v2.2.x. Test exercises both online and replay paths.
+        let mut cfg = replay_config(100, 0);
+        cfg.critic_hysteresis = false;
+        cfg.actor_wakes_critic = false;
+        cfg.critic_wakes_actor = false;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        assert!(agent.critic_hysteresis.is_none());
+
+        // Online: critic must update normally.
+        let critic_w_before = agent.critic.layers[0].weights.data.clone();
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..10 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+        let critic_delta_online = l2_delta(&agent.critic.layers[0].weights.data, &critic_w_before);
+        assert!(
+            critic_delta_online > 1e-6,
+            "critic_hysteresis=false: critic must update online (no regression vs v2.2.x), delta={critic_delta_online}"
+        );
+
+        // Replay: critic must also update normally (no gate active).
+        populate_positive_replay_buffer(&mut agent, 8);
+        let critic_w_before_replay = agent.critic.layers[0].weights.data.clone();
+        agent.replay_learn(8).expect("replay_learn must succeed");
+        let critic_delta_replay = l2_delta(
+            &agent.critic.layers[0].weights.data,
+            &critic_w_before_replay,
+        );
+        assert!(
+            critic_delta_replay > 1e-6,
+            "critic_hysteresis=false: critic must update via replay_learn (no regression), delta={critic_delta_replay}"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires v3.0.0 commit 4"]
+    fn test_critic_hysteresis_frozen_replay_default_sentinel_no_op() {
+        // Replay path under FROZEN with the default `critic_floor_replay
+        // = -1.0` sentinel must inherit the conservative semantics —
+        // critic weights byte-equal across replay_learn calls. Mirror
+        // of the actor-side `test_replay_learn_no_op_under_frozen_with_default_sentinel`
+        // for the critic.
+        for &cfr in &[-1.0_f64, 0.0] {
+            let mut cfg = replay_config(100, 0);
+            cfg.critic_hysteresis = true;
+            cfg.scale_floor = 0.0;
+            cfg.critic_floor_replay = cfr;
+            cfg.actor_wakes_critic = false;
+            cfg.critic_wakes_actor = false;
+            let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+            agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+            populate_positive_replay_buffer(&mut agent, 8);
+
+            let critic_w_before = agent.critic.layers[0].weights.data.clone();
+            agent.replay_learn(8).expect("replay_learn must succeed");
+            let critic_delta = l2_delta(&agent.critic.layers[0].weights.data, &critic_w_before);
+
+            assert!(
+                critic_delta < 1e-12,
+                "critic MUST NOT update under FROZEN+replay with critic_floor_replay={cfr}, delta={critic_delta}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires v3.0.0 commit 4"]
+    fn test_critic_hysteresis_frozen_replay_opt_in_updates_critic() {
+        // Replay path under FROZEN with `critic_floor_replay = 0.3` opts
+        // in: critic must learn from the positive-reward batch even
+        // while critic_hysteresis is FROZEN. Independence from actor
+        // opt-in: actor_hysteresis is also FROZEN (no actor opt-in via
+        // scale_floor_replay), so the actor must remain unchanged
+        // (invariant 5: per-network gating, no cross-contamination).
+        let mut cfg = replay_config(100, 0);
+        cfg.actor_hysteresis = true;
+        cfg.critic_hysteresis = true;
+        cfg.scale_floor = 0.0;
+        cfg.scale_floor_replay = -1.0; // actor: no opt-in
+        cfg.critic_floor_replay = 0.3; // critic: opt-in
+        cfg.actor_wakes_critic = false;
+        cfg.critic_wakes_actor = false;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+        populate_positive_replay_buffer(&mut agent, 16);
+
+        let actor_w_before = agent.actor.layers[0].weights.data.clone();
+        let critic_w_before = agent.critic.layers[0].weights.data.clone();
+
+        agent.replay_learn(16).expect("replay_learn must succeed");
+
+        let actor_delta = l2_delta(&agent.actor.layers[0].weights.data, &actor_w_before);
+        let critic_delta = l2_delta(&agent.critic.layers[0].weights.data, &critic_w_before);
+
+        assert!(
+            critic_delta > 1e-6,
+            "critic MUST update under FROZEN+replay with critic_floor_replay=0.3, delta={critic_delta}"
+        );
+        assert!(
+            actor_delta < 1e-12,
+            "actor MUST NOT update (no actor opt-in), delta={actor_delta}"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires v3.0.0 commit 4"]
+    fn test_partial_optin_produces_asymmetric_but_predictable_behavior() {
+        // Locks the §3.4 contract: asymmetric opt-in is allowed (no
+        // validation error) and produces predictable per-quadrant
+        // behaviour. Four sub-scenarios under both actor + critic FROZEN:
+        //   (6a) (-1.0, -1.0) — neither network changes (symmetric protected)
+        //   (6b) ( 0.3,  0.3) — both change (symmetric recovery)
+        //   (6c) ( 0.3, -1.0) — only actor changes (asymmetric Q3)
+        //   (6d) (-1.0,  0.3) — only critic changes (asymmetric Q4)
+        let scenarios = [
+            (-1.0_f64, -1.0_f64, false, false), // 6a
+            (0.3, 0.3, true, true),             // 6b
+            (0.3, -1.0, true, false),           // 6c
+            (-1.0, 0.3, false, true),           // 6d
+        ];
+
+        for (sfr, cfr, actor_should_change, critic_should_change) in scenarios {
+            let mut cfg = replay_config(100, 0);
+            cfg.actor_hysteresis = true;
+            cfg.critic_hysteresis = true;
+            cfg.scale_floor = 0.0;
+            cfg.scale_floor_replay = sfr;
+            cfg.critic_floor_replay = cfr;
+            cfg.actor_wakes_critic = false;
+            cfg.critic_wakes_actor = false;
+            let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+            agent.actor_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+            agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+            populate_positive_replay_buffer(&mut agent, 16);
+
+            let actor_w_before = agent.actor.layers[0].weights.data.clone();
+            let critic_w_before = agent.critic.layers[0].weights.data.clone();
+
+            agent.replay_learn(16).expect("replay_learn must succeed");
+
+            let actor_delta = l2_delta(&agent.actor.layers[0].weights.data, &actor_w_before);
+            let critic_delta = l2_delta(&agent.critic.layers[0].weights.data, &critic_w_before);
+
+            if actor_should_change {
+                assert!(
+                    actor_delta > 1e-6,
+                    "scenario (sfr={sfr}, cfr={cfr}): actor MUST update, delta={actor_delta}"
+                );
+            } else {
+                assert!(
+                    actor_delta < 1e-12,
+                    "scenario (sfr={sfr}, cfr={cfr}): actor MUST NOT update, delta={actor_delta}"
+                );
+            }
+            if critic_should_change {
+                assert!(
+                    critic_delta > 1e-6,
+                    "scenario (sfr={sfr}, cfr={cfr}): critic MUST update, delta={critic_delta}"
+                );
+            } else {
+                assert!(
+                    critic_delta < 1e-12,
+                    "scenario (sfr={sfr}, cfr={cfr}): critic MUST NOT update, delta={critic_delta}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires v3.0.0 commit 4"]
+    fn test_migration_path_restores_v2_2_x_critic_behavior() {
+        // MAGI Caspar Checkpoint 2 CRITICAL #2 — empirical proof of the
+        // CHANGELOG migration claim. Two agents with identical seeds
+        // and identical replay buffers:
+        //   * Baseline (simulates v2.2.x): `critic_hysteresis = false`
+        //     — no gate ever fires, critic always updates via
+        //     `critic_surprise_scale`.
+        //   * v3.0.0 + migration: `critic_hysteresis = true` forced
+        //     FROZEN, `critic_floor_replay = scale_ceil` (= 2.0). The
+        //     opt-in clamp at scale_ceil approximates "always update at
+        //     the upper end of the surprise→scale band" — the closest
+        //     the v3 API can come to v2.2.x's td-magnitude-driven scale.
+        //
+        // Drive 50 identical replay_learn batches. After convergence,
+        // the L2 distance between the two critic weight vectors must
+        // remain bounded (< 0.5) — confirming migration approximately
+        // preserves v2.2.x effective behaviour. Order-of-magnitude
+        // drift would indicate the migration claim is false.
+        let build_agent = |critic_hyst: bool, cfr: f64| -> PcActorCritic {
+            let mut cfg = replay_config(200, 0);
+            cfg.critic_hysteresis = critic_hyst;
+            cfg.critic_floor_replay = cfr;
+            cfg.scale_floor = 0.0;
+            cfg.actor_wakes_critic = false;
+            cfg.critic_wakes_actor = false;
+            let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+            populate_positive_replay_buffer(&mut agent, 64);
+            if critic_hyst {
+                agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+            }
+            agent
+        };
+
+        let scale_ceil = default_config().scale_ceil;
+        let mut agent_baseline = build_agent(false, -1.0);
+        let mut agent_migration = build_agent(true, scale_ceil);
+
+        for _ in 0..50 {
+            agent_baseline
+                .replay_learn(16)
+                .expect("baseline replay_learn must succeed");
+            // Re-force FROZEN in case any code path transitioned.
+            agent_migration.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+            agent_migration
+                .replay_learn(16)
+                .expect("migration replay_learn must succeed");
+        }
+
+        let l2_distance = l2_delta(
+            &agent_baseline.critic.layers[0].weights.data,
+            &agent_migration.critic.layers[0].weights.data,
+        );
+        assert!(
+            l2_distance < 0.5,
+            "migration path must approximate v2.2.x critic behavior, L2={l2_distance}"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires v3.0.0 commit 4"]
+    fn test_fisher_accumulation_under_frozen_critic_with_ewc() {
+        // MAGI Caspar Checkpoint 2 CRITICAL #3 — EWC/Fisher interaction
+        // under the new critic gate. EWC operates on actor parameters
+        // (`actor_fisher`); the critic gate is orthogonal. Forcing the
+        // CRITIC into FROZEN must NOT contaminate the actor Fisher EMA
+        // — actor weight updates continue to drive Fisher accumulation
+        // independently of the critic's plasticity label.
+        let mut cfg = default_config();
+        cfg.ewc_lambda = 0.1;
+        cfg.critic_hysteresis = true;
+        cfg.actor_wakes_critic = false;
+        cfg.critic_wakes_actor = false;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Phase A: warm-up under PLASTIC critic to establish a
+        // non-trivial Fisher diagonal.
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..50 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+        let fisher_after_warmup: Vec<Vec<f64>> = agent
+            .actor_fisher
+            .iter()
+            .map(|f| f.f_ema_weights.data.clone())
+            .collect();
+
+        // Phase B: force critic FROZEN, drive 20 more step_masked.
+        // Fisher must remain finite throughout.
+        for _ in 0..20 {
+            agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Frozen;
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+            assert!(
+                !fisher_any_non_finite(&agent),
+                "actor Fisher must remain finite under FROZEN-critic"
+            );
+        }
+
+        // Phase C: return to PLASTIC, normal Fisher accumulation must
+        // resume. Drive enough steps to detect ema motion.
+        for _ in 0..30 {
+            agent.critic_hysteresis.as_mut().unwrap().state = PlasticityState::Plastic;
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+        let fisher_after_plastic: Vec<Vec<f64>> = agent
+            .actor_fisher
+            .iter()
+            .map(|f| f.f_ema_weights.data.clone())
+            .collect();
+
+        // Fisher must have moved measurably between warmup and final
+        // (post-PLASTIC) snapshot — confirms accumulation continued
+        // across the FROZEN-critic window without divergence.
+        let mut total_motion = 0.0;
+        for (a, b) in fisher_after_warmup.iter().zip(fisher_after_plastic.iter()) {
+            total_motion += l2_delta(a, b);
+        }
+        assert!(
+            total_motion > 1e-6,
+            "actor Fisher EMA must accumulate normally despite FROZEN-critic, total_motion={total_motion}"
+        );
+        assert!(
+            !fisher_any_non_finite(&agent),
+            "actor Fisher must remain finite at end of test"
+        );
+    }
 }
