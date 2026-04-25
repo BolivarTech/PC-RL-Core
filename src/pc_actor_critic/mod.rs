@@ -676,8 +676,10 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// sentinel contract.
     ///
     /// Accepts: `~-1.0` (sentinel for "opt-in not provided") OR any
-    /// finite value in `[0.0, upper_bound]`. Rejects: values in
-    /// `(-1.0, 0.0)`, NaN, ±Infinity, and values above `upper_bound`.
+    /// finite value in the **closed inclusive** interval
+    /// `[0.0, upper_bound]` (`value == upper_bound` is accepted —
+    /// `value > upper_bound` is rejected). Rejects: values in
+    /// `(-1.0, 0.0)`, NaN, and ±Infinity.
     ///
     /// Used by both `scale_floor_replay` (v2.2.1) and
     /// `critic_floor_replay` (v3.0.0) — extracted in v3.0.0 to dedupe
@@ -2553,6 +2555,13 @@ impl<L: LinAlg> PcActorCritic<L> {
 
     /// Effective actor learning-rate scale for a given `LearnMode`.
     ///
+    /// Sibling of
+    /// [`effective_critic_scale_for_mode`](Self::effective_critic_scale_for_mode)
+    /// — both methods implement the same FROZEN/Online vs FROZEN/Replay
+    /// gate semantics, with the actor reading `scale_floor_replay` and
+    /// the critic reading `critic_floor_replay`. Keep the two in lockstep
+    /// when modifying gate behaviour to preserve actor-critic symmetry.
+    ///
     /// - In `Online` mode: identical to `effective_actor_scale` — hysteresis
     ///   clamps to `scale_floor` when FROZEN.
     /// - In `Replay` mode: when `scale_floor_replay >= 0.0`, the FROZEN
@@ -2609,11 +2618,15 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// Effective critic learning-rate scale for a given `LearnMode`,
     /// honouring `critic_hysteresis.state` (v3.0.0).
     ///
-    /// Mirror of [`effective_actor_scale_for_mode`](Self::effective_actor_scale_for_mode)
-    /// for the critic. Prior to v3.0.0, `critic_hysteresis.state` was
-    /// tracked but never enforced on critic weight updates — the critic
-    /// kept learning regardless of plasticity label. This method closes
-    /// that asymmetry.
+    /// Sibling of
+    /// [`effective_actor_scale_for_mode`](Self::effective_actor_scale_for_mode).
+    /// Both methods implement the same FROZEN/Online vs FROZEN/Replay
+    /// gate semantics, with the actor reading `scale_floor_replay` and
+    /// the critic reading `critic_floor_replay`. Prior to v3.0.0,
+    /// `critic_hysteresis.state` was tracked but never enforced on
+    /// critic weight updates — the critic kept learning regardless of
+    /// plasticity label. This method closes that asymmetry. Keep the
+    /// two siblings in lockstep when modifying gate behaviour.
     ///
     /// - **Not FROZEN** (PLASTIC, or `critic_hysteresis = None`): the
     ///   gate is a no-op pass-through to
@@ -12800,23 +12813,33 @@ mod tests {
 
     #[test]
     fn test_migration_path_restores_v2_2_x_critic_behavior() {
-        // MAGI Caspar Checkpoint 2 CRITICAL #2 — empirical proof of the
-        // CHANGELOG migration claim. Two agents with identical seeds
-        // and identical replay buffers:
+        // MAGI Caspar Checkpoint 2 CRITICAL #2 — empirical bound on the
+        // CHANGELOG migration claim "closest approximation to v2.2.x
+        // replay learning ← `critic_floor_replay = scale_ceil`".
+        //
+        // **What this test guarantees:** under a positive-reward replay
+        // buffer with similar td-error magnitudes across both agents,
+        // the v3 migration setting tracks the v2.2.x baseline within an
+        // L2 envelope of `0.5` over 50 batches. This is an
+        // ORDER-OF-MAGNITUDE bound — the test rejects the migration
+        // claim being grossly wrong, not a fine-grained equivalence.
+        //
+        // **What it does NOT guarantee:** exact bit equivalence, nor
+        // tight bounds under heterogeneous td-magnitudes (where v2.2.x
+        // would dynamically interpolate between scale_floor and
+        // scale_ceil while the migration uses scale_ceil literally).
+        // The CHANGELOG explicitly frames the migration row as
+        // "closest approximation"; the test backs that wording, not a
+        // stronger claim. Tightening this bound (e.g. mixed-td
+        // distribution) is a candidate follow-up if downstream
+        // empirical drift becomes a concern.
+        //
+        // Two agents with identical seeds and identical replay buffers:
         //   * Baseline (simulates v2.2.x): `critic_hysteresis = false`
-        //     — no gate ever fires, critic always updates via
+        //     — no gate fires, critic always updates via
         //     `critic_surprise_scale`.
         //   * v3.0.0 + migration: `critic_hysteresis = true` forced
-        //     FROZEN, `critic_floor_replay = scale_ceil` (= 2.0). The
-        //     opt-in clamp at scale_ceil approximates "always update at
-        //     the upper end of the surprise→scale band" — the closest
-        //     the v3 API can come to v2.2.x's td-magnitude-driven scale.
-        //
-        // Drive 50 identical replay_learn batches. After convergence,
-        // the L2 distance between the two critic weight vectors must
-        // remain bounded (< 0.5) — confirming migration approximately
-        // preserves v2.2.x effective behaviour. Order-of-magnitude
-        // drift would indicate the migration claim is false.
+        //     FROZEN, `critic_floor_replay = scale_ceil` (= 2.0).
         let build_agent = |critic_hyst: bool, cfr: f64| -> PcActorCritic {
             let mut cfg = replay_config(200, 0);
             cfg.critic_hysteresis = critic_hyst;
@@ -12836,6 +12859,12 @@ mod tests {
         let mut agent_baseline = build_agent(false, -1.0);
         let mut agent_migration = build_agent(true, scale_ceil);
 
+        // Snapshot init weights — both agents start from the same
+        // seed, so the snapshots are bit-identical and serve as the
+        // non-triviality precondition (Balthasar Loop 2 polish).
+        let baseline_init = agent_baseline.critic.layers[0].weights.data.clone();
+        let migration_init = agent_migration.critic.layers[0].weights.data.clone();
+
         for _ in 0..50 {
             agent_baseline
                 .replay_learn(16)
@@ -12847,13 +12876,38 @@ mod tests {
                 .expect("migration replay_learn must succeed");
         }
 
+        // Non-triviality precondition: both agents must have moved
+        // measurably from their initial weights. A test that compares
+        // two agents both stuck at init would trivially pass the L2
+        // bound for the wrong reason.
+        let baseline_motion = l2_delta(
+            &agent_baseline.critic.layers[0].weights.data,
+            &baseline_init,
+        );
+        let migration_motion = l2_delta(
+            &agent_migration.critic.layers[0].weights.data,
+            &migration_init,
+        );
+        assert!(
+            baseline_motion > 1e-6,
+            "baseline agent must learn (non-triviality), motion={baseline_motion}"
+        );
+        assert!(
+            migration_motion > 1e-6,
+            "migration agent must learn (non-triviality), motion={migration_motion}"
+        );
+
+        // Approximation bound: the two trajectories track within
+        // an order-of-magnitude envelope. This bounds, not proves,
+        // the migration equivalence claim.
         let l2_distance = l2_delta(
             &agent_baseline.critic.layers[0].weights.data,
             &agent_migration.critic.layers[0].weights.data,
         );
         assert!(
             l2_distance < 0.5,
-            "migration path must approximate v2.2.x critic behavior, L2={l2_distance}"
+            "migration path must approximate v2.2.x critic behavior \
+             (order-of-magnitude bound, not exact equivalence), L2={l2_distance}"
         );
     }
 

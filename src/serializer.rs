@@ -1711,4 +1711,54 @@ mod tests {
 
         let _ = fs::remove_file(&path);
     }
+
+    /// v3.0.0 forward-compat: pre-v3 JSON state files (which lack the
+    /// new `critic_floor_replay` config field) must load successfully
+    /// and surface the field at its `-1.0` sentinel default. Closes
+    /// MAGI Caspar Loop 2 W3 (silent serde adoption gap for v2.2.x
+    /// consumers upgrading to v3.0.0). Mirrors the v2.0.0 → v2.1.0
+    /// `test_legacy_json_loads_as_clean_plastic` pattern.
+    #[test]
+    fn test_pre_v3_json_loads_with_default_critic_floor_replay() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::pc_actor_critic::config::is_replay_floor_sentinel;
+
+        // 1. Save a v3.0.0 agent so we get a complete schema baseline.
+        let agent: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), default_config(), 42).unwrap();
+        let path = temp_path("test_pre_v3_critic_floor_replay.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+
+        // 2. Strip `critic_floor_replay` from the saved JSON to simulate
+        //    a pre-v3 (v2.2.x) save file written before the field
+        //    existed. The actor-side `scale_floor_replay` is preserved
+        //    to confirm v2.2.1 schema specifically (not v2.0.0).
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let removed = json["config"]
+            .as_object_mut()
+            .expect("config must be an object")
+            .remove("critic_floor_replay");
+        assert!(
+            removed.is_some(),
+            "v3.0.0 saves must serialize critic_floor_replay (precondition for this test)"
+        );
+        // Sanity: scale_floor_replay must still be present (v2.2.1 schema).
+        assert!(
+            json["config"]["scale_floor_replay"].is_number(),
+            "scale_floor_replay must remain present (v2.2.1 schema requirement)"
+        );
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        // 3. Load the modified file and verify critic_floor_replay
+        //    deserialized to the -1.0 sentinel via #[serde(default)].
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+        assert!(
+            is_replay_floor_sentinel(loaded.config.critic_floor_replay),
+            "pre-v3 JSON must load with critic_floor_replay = -1.0 sentinel, got {}",
+            loaded.config.critic_floor_replay
+        );
+
+        let _ = fs::remove_file(&path);
+    }
 }
