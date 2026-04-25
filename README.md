@@ -232,34 +232,39 @@ weight updates for the first time. Consumers running with
 `CHANGELOG.md` `[3.0.0] - Breaking changes` for the full
 migration table.
 
-**Recommended migration — paired opt-in:**
+**Recommended migration — paired opt-in.** Start from your existing
+v2.2.x `PcActorCriticConfig` literal (or your serde-loaded config)
+and override the four self-recovery fields below:
 
 ```rust,ignore
 use pc_rl_core::PcActorCriticConfig;
 
-let config = PcActorCriticConfig {
-    // ... existing self-recovery fields ...
-    actor_hysteresis: true,
-    critic_hysteresis: true,
+// `existing_v2_2_x_config` is your current full PcActorCriticConfig
+// literal (PcActorCriticConfig does NOT implement Default — replicate
+// your existing field-by-field literal here, or reload via serde).
+let mut config: PcActorCriticConfig = existing_v2_2_x_config;
 
-    // Paired opt-in: both actor and critic learn during
-    // FROZEN-replay. This preserves the v2.2.x effective
-    // behaviour (where the critic was always learning) while
-    // also activating the actor side. The two fields should be
-    // set TOGETHER to avoid actor-critic desynchronization.
-    scale_floor_replay: 0.3,
-    critic_floor_replay: 0.3,
+// Paired opt-in: both actor and critic learn during FROZEN-replay,
+// preserving the v2.2.x effective behaviour of "critic always
+// learning during stress" while also activating the actor side.
+// The two fields should be set TOGETHER to avoid actor-critic
+// desynchronization.
+config.actor_hysteresis = true;
+config.critic_hysteresis = true;
 
-    ..Default::default()
-};
+// 0.3 is "mild recovery". For behavioural equivalence to the
+// v2.2.x dynamic surprise→scale band, use `config.scale_ceil`
+// (typically 2.0); see CHANGELOG [3.0.0] migration table.
+config.scale_floor_replay = 0.3;
+config.critic_floor_replay = 0.3;
 ```
 
 Leaving both at their default `-1.0` sentinel is also valid and
-corresponds to "full stress protection" — neither network
-updates during FROZEN windows, and cross-wake coupling
-eventually re-activates learning. Partial opt-in (one field
-positive, the other `-1.0`) is allowed but produces asymmetric
-dynamics and is not recommended for most workloads.
+corresponds to "full stress protection" — neither network updates
+during FROZEN windows, and cross-wake coupling eventually
+re-activates learning. Partial opt-in (one field positive, the
+other `-1.0`) is allowed but produces asymmetric dynamics and is
+not recommended for most workloads.
 
 ## Architecture
 

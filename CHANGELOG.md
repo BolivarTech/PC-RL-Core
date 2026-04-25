@@ -34,9 +34,10 @@
   | Pre-v3.0.0 setting | v3.0.0 equivalent (preserve behavior) |
   |---|---|
   | `critic_hysteresis = false` | `critic_hysteresis = false` (no change, no regression) |
-  | `critic_hysteresis = true`, replay active, want v2.2.x replay learning | add `critic_floor_replay = 0.3` (or higher; up to `10 × scale_ceil`) |
+  | `critic_hysteresis = true`, replay active, want **closest approximation** to v2.2.x replay learning | add `critic_floor_replay = scale_ceil` (typically `2.0` — matches v2.2.x's td-magnitude-driven upper-band scale) |
+  | `critic_hysteresis = true`, replay active, want **mild recovery** (less aggressive than v2.2.x) | add `critic_floor_replay = 0.3` (rule-of-thumb operating point; smaller values clamp tighter) |
   | `critic_hysteresis = true`, want TRUE stress protection (new behavior) | no change needed — v3.0.0 default delivers the symmetric protection that the field always intended |
-  | `critic_hysteresis = true`, cross-wake disabled, critic stuck FROZEN | enable cross-wake OR set `critic_floor_replay` high (≥ 1.0) |
+  | `critic_hysteresis = true`, cross-wake disabled, critic stuck FROZEN | enable cross-wake OR set `critic_floor_replay` high (≥ `scale_ceil`) |
 
   See README "Migration from v2.2.x to v3.0.0" subsection for a
   ready-to-copy config snippet showing the recommended paired
