@@ -12287,6 +12287,97 @@ mod tests {
         }
     }
 
+    // ── v4.0.0 continuous-mode validation rules ───────────────────────
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 1.3 validation rule"]
+    fn test_continuous_with_invalid_sigma_rejected() {
+        // Brainstorm Q1/spec §6: continuous mode requires policy_sigma > 0
+        // and finite. NaN/Inf/<=0 must be rejected at construction.
+        let invalid_sigmas = [0.0_f64, -0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        for &sigma in &invalid_sigmas {
+            let mut cfg = default_config();
+            cfg.action_space = ActionSpace::Continuous;
+            cfg.policy_sigma = sigma;
+            // Continuous requires distillation off (separate rule, also v4) —
+            // pre-disable here so this test isolates the sigma rule.
+            cfg.distillation_lambda_polyak = 0.0;
+            cfg.distillation_lambda_frozen = 0.0;
+            let result: Result<PcActorCritic, PcError> =
+                PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+            assert!(
+                result.is_err(),
+                "policy_sigma = {sigma} must be rejected in Continuous mode"
+            );
+            match result.unwrap_err() {
+                PcError::ConfigValidation(msg) => {
+                    assert!(
+                        msg.contains("policy_sigma"),
+                        "error must mention field name, got: {msg}"
+                    );
+                }
+                other => panic!("expected ConfigValidation, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 1.3 validation rule"]
+    fn test_continuous_with_polyak_distillation_rejected() {
+        // Brainstorm/spec §5.5: KL is undefined for raw continuous output.
+        // distillation_lambda_polyak > 0 in Continuous mode → reject.
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.05;
+        let result: Result<PcActorCritic, PcError> = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => {
+                assert!(msg.contains("distillation_lambda_polyak"));
+                assert!(msg.contains("continuous") || msg.contains("Continuous"));
+            }
+            other => panic!("expected ConfigValidation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 1.3 validation rule"]
+    fn test_continuous_with_frozen_distillation_rejected() {
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_frozen = 0.05;
+        let result: Result<PcActorCritic, PcError> = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => {
+                assert!(msg.contains("distillation_lambda_frozen"));
+                assert!(msg.contains("continuous") || msg.contains("Continuous"));
+            }
+            other => panic!("expected ConfigValidation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 1.3 validation rule"]
+    fn test_continuous_with_valid_config_accepted() {
+        // Smoke: continuous + sigma=0.1 + distillation off + entropy=0
+        // must construct without error.
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        cfg.entropy_coeff = 0.0;
+        let result: Result<PcActorCritic, PcError> = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            result.is_ok(),
+            "valid Continuous config must construct, got {:?}",
+            result.err()
+        );
+    }
+
     // ── Test 4 ──────────────────────────────────────────────────────────
 
     #[test]
