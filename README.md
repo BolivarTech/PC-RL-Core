@@ -223,6 +223,54 @@ Asymmetric pairs (one strict-positive, the other at sentinel)
 are allowed but produce desynchronization — the moving network
 learns from storage while the gated network stays frozen.
 
+### Migration from v3.x to v4.0.0 — generic action space
+
+In v4.0.0, `pc-rl-core` adds continuous-action support alongside
+the existing discrete pipeline. v3.x consumers:
+
+**Discrete (default) — minimal migration:**
+
+- Add `?` to `act()` calls (return type became `Result`).
+- Replace deprecated `step(state, reward, done)` with
+  `step_masked(state, &(0..output_size).collect::<Vec<_>>(), reward, done)?`.
+- All other API surface unchanged.
+
+**Adopting continuous:**
+
+```rust,ignore
+use pc_rl_core::{ActionSpace, PcActorCriticConfig};
+use pc_rl_core::activation::Activation;
+
+// Start from your existing v3.x config literal (PcActorCriticConfig
+// has no Default impl — replicate field-by-field or reload via serde).
+let mut config: PcActorCriticConfig = existing_v3_config;
+
+config.action_space = ActionSpace::Continuous;
+config.policy_sigma = 0.1;             // Gaussian std-dev
+config.distillation_lambda_polyak = 0.0;  // required: continuous mode
+config.distillation_lambda_frozen = 0.0;  // required: continuous mode
+config.actor.output_activation = Activation::Tanh;  // for bounded actions
+
+let mut agent = PcActorCritic::new(backend, config, seed)?;
+
+loop {
+    let action = agent.step_continuous(&state, reward, done)?;
+    let next_state = env.apply(&action);
+    state = next_state;
+}
+```
+
+**Self-recovery toolkit availability:**
+
+| Mode | rollback_soft | rollback_hard | champion_update |
+|---|---|---|---|
+| Discrete | ✓ | ✓ | ✓ |
+| Continuous | ✗ (Polyak distillation rejected) | ✗ (Frozen distillation rejected) | ✗ |
+
+L2-anchored continuous distillation is experimental future work.
+For continuous training requiring self-recovery, evaluate via
+discrete intermediate or wait for the experimental branch.
+
 ### Migration from v2.2.x to v3.0.0 — critic hysteresis enforcement
 
 In v3.0.0 the critic's `critic_hysteresis.state` is enforced on

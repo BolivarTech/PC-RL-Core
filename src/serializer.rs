@@ -386,6 +386,7 @@ pub fn load_agent_generic<L: LinAlg>(
             save_file.config.replay_training_capacity,
             save_file.config.replay_recent_capacity,
             save_file.config.replay_positive_only,
+            save_file.config.action_space,
         ))
     } else {
         None
@@ -463,6 +464,7 @@ mod tests {
     use crate::layer::LayerDef;
     use crate::mlp_critic::MlpCriticConfig;
     use crate::pc_actor::PcActorConfig;
+    use crate::pc_actor_critic::ActionSpace;
     use std::fs;
 
     fn default_config() -> PcActorCriticConfig {
@@ -538,6 +540,8 @@ mod tests {
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
             critic_floor_replay: -1.0,
+            action_space: ActionSpace::Discrete,
+            policy_sigma: 0.1,
         }
     }
 
@@ -713,8 +717,12 @@ mod tests {
         let mut actions1 = Vec::new();
         let mut actions2 = Vec::new();
         for _ in 0..20 {
-            let (a1, _) = loaded1.act(&input, &valid, crate::pc_actor::SelectionMode::Training);
-            let (a2, _) = loaded2.act(&input, &valid, crate::pc_actor::SelectionMode::Training);
+            let (a1, _) = loaded1
+                .act(&input, &valid, crate::pc_actor::SelectionMode::Training)
+                .unwrap();
+            let (a2, _) = loaded2
+                .act(&input, &valid, crate::pc_actor::SelectionMode::Training)
+                .unwrap();
             actions1.push(a1);
             actions2.push(a2);
         }
@@ -803,7 +811,7 @@ mod tests {
         // Train one step to modify rezero_alpha
         let input = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
         let trajectory = vec![crate::pc_actor_critic::TrajectoryStep {
             input: input.clone(),
             latent_concat: infer.latent_concat,
@@ -898,7 +906,7 @@ mod tests {
         // Train to modify projection weights
         let input = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
         let trajectory = vec![crate::pc_actor_critic::TrajectoryStep {
             input: input.clone(),
             latent_concat: infer.latent_concat,
@@ -945,7 +953,9 @@ mod tests {
         // Verify agent produces valid inference
         let state = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
-        let (action, _) = agent.act(&state, &valid, crate::pc_actor::SelectionMode::Play);
+        let (action, _) = agent
+            .act(&state, &valid, crate::pc_actor::SelectionMode::Play)
+            .unwrap();
         assert!(action < 9, "Action must be in valid range");
     }
 
@@ -1044,7 +1054,7 @@ mod tests {
         // Agent should work normally (no panic from missing CL state)
         let state = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
-        let (action, _) = agent.act(&state, &valid, SelectionMode::Play);
+        let (action, _) = agent.act(&state, &valid, SelectionMode::Play).unwrap();
         assert!(action < 9);
 
         // Step should work (no CL processing since all disabled by defaults)
@@ -1094,7 +1104,7 @@ mod tests {
 
         let state = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
-        let (action, _) = agent.act(&state, &valid, SelectionMode::Play);
+        let (action, _) = agent.act(&state, &valid, SelectionMode::Play).unwrap();
         assert!(action < 9);
     }
 
@@ -1468,11 +1478,11 @@ mod tests {
             next_state[1] = marker;
             ReplayTransition {
                 state,
-                action: (marker as usize) % 9,
+                action: crate::pc_actor_critic::replay::Action::Discrete((marker as usize) % 9),
                 reward,
                 next_state,
                 done: false,
-                valid_actions: (0..9).collect(),
+                valid_actions: Some((0..9).collect()),
             }
         };
 
@@ -1482,7 +1492,7 @@ mod tests {
             for i in 0..30 {
                 let tx = make_tx(i as f64, 1.0);
                 training_originals.push(tx.clone());
-                buf.push(tx);
+                buf.push(tx).unwrap();
             }
         }
         assert_eq!(
@@ -1505,7 +1515,7 @@ mod tests {
             for i in 0..20 {
                 let tx = make_tx(100.0 + i as f64, 0.5);
                 recent_originals.push(tx.clone());
-                buf.push(tx);
+                buf.push(tx).unwrap();
             }
         }
         assert_eq!(
@@ -1707,6 +1717,120 @@ mod tests {
         assert_eq!(
             loaded.rollback_hard_cooldown_steps,
             crate::pc_actor_critic::DEFAULT_ROLLBACK_HARD_COOLDOWN
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// v4.0.0 forward-compat: pre-v4 JSON state files (lacking
+    /// `action_space`, `policy_sigma`, and using bare integer action +
+    /// bare array `valid_actions`) must load successfully and surface
+    /// defaults (`action_space=Discrete`, `policy_sigma=0.1`). Closes
+    /// Brainstorm Q1 + Q8 silent serde adoption gap. Mirrors v3.0.0
+    /// precedent `test_pre_v3_json_loads_with_default_critic_floor_replay`.
+    #[test]
+    fn test_pre_v4_json_loads_with_defaults_and_unwrapped_action() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::pc_actor_critic::ActionSpace;
+
+        // 1. Build a v4 agent with a small replay buffer.
+        let mut cfg = default_config();
+        cfg.replay_training_capacity = 4;
+        cfg.replay_recent_capacity = 0;
+        cfg.replay_positive_only = true;
+        cfg.adaptive_surprise = false;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Push one positive Discrete transition so the buffer is inhabited.
+        let transition = crate::pc_actor_critic::replay::ReplayTransition {
+            state: vec![0.1; 9],
+            action: crate::pc_actor_critic::replay::Action::Discrete(3),
+            reward: 1.0,
+            next_state: vec![0.2; 9],
+            done: false,
+            valid_actions: Some(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]),
+        };
+        agent
+            .replay_buffer
+            .as_mut()
+            .expect("buffer must be Some after construction with capacity > 0")
+            .push(transition)
+            .unwrap();
+
+        // 2. Save to a temp file and reload as a mutable JSON value.
+        let path = temp_path("test_pre_v4_json_defaults.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        // 3. Simulate v3.x schema: remove action_space + policy_sigma from
+        //    the config block (those fields did not exist before v4.0.0).
+        let cfg_obj = json["config"]
+            .as_object_mut()
+            .expect("config must be a JSON object");
+        let removed_as = cfg_obj.remove("action_space");
+        let removed_ps = cfg_obj.remove("policy_sigma");
+        assert!(
+            removed_as.is_some(),
+            "v4 saves must serialize action_space (precondition)"
+        );
+        assert!(
+            removed_ps.is_some(),
+            "v4 saves must serialize policy_sigma (precondition)"
+        );
+
+        // 4. Simulate v3.x replay buffer schema: remove action_space from
+        //    the replay_buffer object so pre-v4 files can round-trip.
+        if let Some(rb) = json["replay_buffer"].as_object_mut() {
+            rb.remove("action_space");
+        }
+
+        // 5. Verify the action is already a bare integer in the saved JSON
+        //    (Action::Discrete via #[serde(untagged)] — Q1). If it isn't,
+        //    rewrite it so the load exercises the bare-integer path.
+        if let Some(mems) = json["replay_buffer"]["training_memories"].as_array_mut() {
+            for mem in mems.iter_mut() {
+                // Confirm or enforce bare integer action.
+                let action_val = mem["action"].clone();
+                assert!(
+                    action_val.is_number(),
+                    "Action::Discrete must serialize as bare integer via #[serde(untagged)], \
+                     got: {action_val}"
+                );
+                // Confirm or enforce bare array valid_actions (Some([…]) via
+                // serde Some-elision — Q8).
+                let va_val = mem["valid_actions"].clone();
+                assert!(
+                    va_val.is_array(),
+                    "valid_actions Some(vec) must serialize as bare array via serde \
+                     Some-elision, got: {va_val}"
+                );
+            }
+        }
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        // 6. Load the mutated (pre-v4 schema) file and verify defaults.
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+        assert_eq!(
+            loaded.config.action_space,
+            ActionSpace::Discrete,
+            "pre-v4 JSON must load with action_space=Discrete (default)"
+        );
+        assert!(
+            (loaded.config.policy_sigma - 0.1).abs() < 1e-12,
+            "pre-v4 JSON must load with policy_sigma=0.1 (default), got {}",
+            loaded.config.policy_sigma
+        );
+
+        // 7. Replay buffer must have loaded the v3.x bare-integer action as
+        //    Action::Discrete via untagged enum deserialization (Q1).
+        let buffer = loaded
+            .replay_buffer
+            .as_ref()
+            .expect("v3.x fixture must produce a populated replay buffer");
+        assert!(
+            buffer.total_len() > 0,
+            "replay buffer must have ≥1 transition after v3.x round-trip"
         );
 
         let _ = fs::remove_file(&path);

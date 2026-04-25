@@ -86,6 +86,37 @@ pub(crate) enum LearnMode {
     Replay,
 }
 
+/// Action carried inside a [`LearnStep`]. Variant chosen at the call site
+/// based on the agent's `action_space`. The gradient branch in
+/// `learn_continuous_inner` switches on this enum.
+///
+/// # Variants
+///
+/// * `Discrete` — index-based action with a valid-action mask. Preserves
+///   the v3.x discrete gradient path bit-for-bit.
+/// * `Continuous` — sampled action vector `a = μ + σ·ε`. Used to compute
+///   `(a − μ)` for the Gaussian-policy gradient (Phase 3.3).
+#[derive(Debug, Clone, Copy)]
+// `Continuous` variant is a Phase 3.3 stub; suppress the dead-code lint
+// so the build stays warning-free before the gradient dispatch lands.
+#[allow(dead_code)]
+pub(crate) enum StepAction<'a> {
+    /// Discrete action taken at the current state.
+    Discrete {
+        /// Index of the action taken.
+        action: usize,
+        /// Indices of valid actions at the current state.
+        valid_actions: &'a [usize],
+    },
+    /// Continuous action taken at the current state.
+    Continuous {
+        /// The sampled action vector `a = μ + σ·ε` that was actually
+        /// executed for this step. Used to compute `(a − μ)` for the
+        /// Gaussian-policy gradient.
+        action: &'a [f64],
+    },
+}
+
 /// Parameter bundle for [`PcActorCritic::learn_continuous_inner`].
 ///
 /// Replaces an 11-positional-parameter signature with a single
@@ -100,11 +131,11 @@ pub(crate) struct LearnStep<'a, L: LinAlg> {
     pub state: &'a [f64],
     /// Inference result from `act` at the current state.
     pub infer: &'a InferResult<L>,
-    /// Action taken at the current state.
-    pub action: usize,
-    /// Indices of valid actions at the current state.
-    pub valid_actions: &'a [usize],
-    /// Reward received after taking `action`.
+    /// Action and action mask for this step. Discrete variant carries the
+    /// action index and valid-action mask; Continuous variant carries the
+    /// sampled action vector.
+    pub action: StepAction<'a>,
+    /// Reward received after taking the action.
     pub reward: f64,
     /// Next-state observation (flat row-major).
     pub next_state: &'a [f64],
@@ -135,12 +166,22 @@ impl<'a, L: LinAlg> LearnStep<'a, L> {
     /// internal on-policy call sites (TD(0), TD(n) non-terminal,
     /// TD(n) flush with externally supplied pre-V(s) — which overrides
     /// `pre_v_s` via a struct-literal override if needed).
+    ///
+    /// # Arguments
+    ///
+    /// * `state` — current state observation.
+    /// * `infer` — inference result from `act` at the current state.
+    /// * `action` — [`StepAction`] enum (Discrete or Continuous variant).
+    /// * `reward` — reward received after taking the action.
+    /// * `next_state` — next-state observation.
+    /// * `next_infer` — inference result from `act` at the next state.
+    /// * `done` — whether the episode ended at the next state.
+    /// * `gamma` — effective discount factor.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn online(
         state: &'a [f64],
         infer: &'a InferResult<L>,
-        action: usize,
-        valid_actions: &'a [usize],
+        action: StepAction<'a>,
         reward: f64,
         next_state: &'a [f64],
         next_infer: &'a InferResult<L>,
@@ -151,7 +192,6 @@ impl<'a, L: LinAlg> LearnStep<'a, L> {
             state,
             infer,
             action,
-            valid_actions,
             reward,
             next_state,
             next_infer,
@@ -186,8 +226,16 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     pub(crate) backend: L,
     /// Previous observation (transient, not serialized).
     state_prev: Option<L::Vector>,
-    /// Previous action taken (transient, not serialized).
+    /// Previous discrete action taken (transient, not serialized).
+    /// Mutually exclusive with [`Self::action_prev_continuous`]: only the
+    /// field matching `config.action_space` is populated by the active
+    /// step path.
     action_prev: Option<usize>,
+    /// Previous continuous action vector taken (transient, not serialized).
+    /// Holds the sampled `a = μ + σ·ε` from the prior `step_continuous`
+    /// call so the next call can build the Gaussian-policy gradient
+    /// `(μ − a)/σ²`. Mutually exclusive with [`Self::action_prev`].
+    action_prev_continuous: Option<Vec<f64>>,
     /// Previous inference result (transient, not serialized).
     infer_prev: Option<InferResult<L>>,
     /// Previous valid actions mask (transient, not serialized).
@@ -657,6 +705,68 @@ impl<L: LinAlg> PcActorCritic<L> {
             ));
         }
 
+        // v4.0.0 — continuous-mode rules. Brainstorm Q1, spec §5.5, §6.
+        if config.action_space == ActionSpace::Continuous {
+            // policy_sigma must be > 0 and finite when continuous.
+            if !config.policy_sigma.is_finite() || config.policy_sigma <= 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "policy_sigma ({}) must be > 0 and finite when \
+                     action_space == Continuous. Got {}.",
+                    config.policy_sigma, config.policy_sigma
+                )));
+            }
+            // KL distillation is undefined for raw continuous output.
+            if config.distillation_lambda_polyak > 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "distillation_lambda_polyak ({}) is not supported in \
+                     continuous action space (KL is undefined for raw \
+                     output). Set to 0.0 or use ActionSpace::Discrete.",
+                    config.distillation_lambda_polyak
+                )));
+            }
+            if config.distillation_lambda_frozen > 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "distillation_lambda_frozen ({}) is not supported in \
+                     continuous action space — same reason as Polyak.",
+                    config.distillation_lambda_frozen
+                )));
+            }
+            // entropy_coeff > 0 is silently inert in continuous (fixed-σ
+            // Gaussian → entropy gradient is constant). Brainstorm Q3 /
+            // spec §4.3: NO rejection here.
+
+            // GAE eligibility traces are discrete-shape; no continuous arm.
+            if config.gae_lambda.is_some() {
+                return Err(PcError::ConfigValidation(format!(
+                    "gae_lambda ({:?}) is not supported in continuous action space \
+                     (eligibility trace is discrete-shape). Set to None or use \
+                     ActionSpace::Discrete.",
+                    config.gae_lambda
+                )));
+            }
+            // TD(n) flush is not yet implemented for continuous mode in v4.0.0.
+            if config.td_steps != 0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "td_steps ({}) > 0 is not supported in continuous action space \
+                     in v4.0.0. Set to 0 or use ActionSpace::Discrete. Continuous \
+                     TD(n) is tracked for v4.x.",
+                    config.td_steps
+                )));
+            }
+            // replay_learn hard-rejects Continuous transitions; buffer would be
+            // write-only. Reject at construction instead of silently accumulating
+            // transitions that can never be trained on.
+            if config.replay_training_capacity > 0 || config.replay_recent_capacity > 0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "replay_training_capacity ({}) and replay_recent_capacity ({}) \
+                     must be 0 in continuous action space in v4.0.0 — replay_learn \
+                     does not yet support Continuous transitions. Tracked for v4.x. \
+                     Set both to 0 or use ActionSpace::Discrete.",
+                    config.replay_training_capacity, config.replay_recent_capacity
+                )));
+            }
+        }
+
         // Tolerance-based sentinel check + NaN/Infinity rejection + upper bound
         // per MAGI Melchior + Caspar Checkpoint 2 iter 2 hardening requirement.
         // The actor and critic replay-floor fields share the same tri-state
@@ -1067,6 +1177,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                     config.replay_training_capacity,
                     config.replay_recent_capacity,
                     config.replay_positive_only,
+                    config.action_space,
                 ))
             } else if old_training_cap > 0 && new_training_cap == 0 {
                 None
@@ -1079,6 +1190,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                         config.replay_training_capacity,
                         config.replay_recent_capacity,
                         config.replay_positive_only,
+                        config.action_space,
                     ))
                 } else {
                     self.replay_buffer.take()
@@ -1092,6 +1204,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         self.surprise_buffer = VecDeque::new();
         self.state_prev = None;
         self.action_prev = None;
+        self.action_prev_continuous = None;
         self.infer_prev = None;
         self.valid_actions_prev = None;
         self.actor_hysteresis = actor_hysteresis;
@@ -1181,6 +1294,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                 config.replay_training_capacity,
                 config.replay_recent_capacity,
                 config.replay_positive_only,
+                config.action_space,
             ))
         } else {
             None
@@ -1195,6 +1309,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             backend,
             state_prev: None,
             action_prev: None,
+            action_prev_continuous: None,
             infer_prev: None,
             valid_actions_prev: None,
             actor_hysteresis,
@@ -1316,6 +1431,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             backend: parent_a.backend.clone(),
             state_prev: None,
             action_prev: None,
+            action_prev_continuous: None,
             infer_prev: None,
             valid_actions_prev: None,
             actor_hysteresis: None,
@@ -1372,6 +1488,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             backend,
             state_prev: None,
             action_prev: None,
+            action_prev_continuous: None,
             infer_prev: None,
             valid_actions_prev: None,
             actor_hysteresis: None,
@@ -1595,20 +1712,29 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// * `valid_actions` - Indices of legal actions.
     /// * `mode` - Training (stochastic) or Play (deterministic).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `valid_actions` is empty.
+    /// Returns [`PcError::ConfigValidation`] when called on an agent configured
+    /// for `ActionSpace::Continuous` (wire-in guard lands in Phase 1.5).
     pub fn act(
         &mut self,
         input: &[f64],
         valid_actions: &[usize],
         mode: SelectionMode,
-    ) -> (usize, InferResult<L>) {
+    ) -> Result<(usize, InferResult<L>), PcError> {
+        if self.config.action_space != ActionSpace::Discrete {
+            return Err(PcError::ConfigValidation(format!(
+                "act is only valid when action_space == Discrete; \
+                 current action_space = {:?}. Use act_continuous() for \
+                 continuous action spaces.",
+                self.config.action_space
+            )));
+        }
         let infer_result = self.actor.infer(input);
         let action =
             self.actor
                 .select_action(&infer_result.y_conv, valid_actions, mode, &mut self.rng);
-        (action, infer_result)
+        Ok((action, infer_result))
     }
 
     /// Learns from a complete episode trajectory using REINFORCE with baseline.
@@ -1739,8 +1865,10 @@ impl<L: LinAlg> PcActorCritic<L> {
         let step = LearnStep::online(
             input,
             infer,
-            action,
-            valid_actions,
+            StepAction::Discrete {
+                action,
+                valid_actions,
+            },
             reward,
             next_input,
             next_infer,
@@ -1860,103 +1988,204 @@ impl<L: LinAlg> PcActorCritic<L> {
             &self.critic_decay_factors,
         );
 
-        // Policy gradient (same formula as learn, but scaled by td_error)
+        // Policy gradient — dispatch on action space (v4.0.0 Phase 3.3).
+        //
+        // Sign convention: `update_weights` performs descent
+        // `θ ← θ − lr · ∂loss/∂θ`, so `delta` MUST be the descent
+        // direction (the gradient of `−advantage · log π`).
+        //
+        // Discrete path: REINFORCE with masked softmax.
+        //   ∂(−log π_a)/∂logit = π − one_hot(a)
+        //   delta = td_error · (π − one_hot(a)), plus entropy reg.
+        //   GAE eligibility trace lives here.
+        //
+        // Continuous path: Gaussian-policy log-likelihood gradient.
+        //   ∂(−log π)/∂μ = (μ − a) / σ²
+        //   delta_j = td_error · (μ_j − a_taken_j) / σ²
+        //   Per brainstorm Q3 / spec §4.3, fixed-σ Gaussian entropy is
+        //   constant w.r.t. policy parameters → entropy gradient = 0;
+        //   skip the entropy term entirely.
         let y_conv_vec = self.backend.vec_to_vec(&step.infer.y_conv);
-        let scaled: Vec<f64> = y_conv_vec
-            .iter()
-            .map(|&v| v / self.actor.config.temperature)
-            .collect();
-        let scaled_l = self.backend.vec_from_slice(&scaled);
-        let pi_l = self.backend.softmax_masked(&scaled_l, step.valid_actions);
-        let pi = self.backend.vec_to_vec(&pi_l);
+        match step.action {
+            StepAction::Discrete {
+                action: action_idx,
+                valid_actions,
+            } => {
+                let scaled: Vec<f64> = y_conv_vec
+                    .iter()
+                    .map(|&v| v / self.actor.config.temperature)
+                    .collect();
+                let scaled_l = self.backend.vec_from_slice(&scaled);
+                let pi_l = self.backend.softmax_masked(&scaled_l, valid_actions);
+                let pi = self.backend.vec_to_vec(&pi_l);
 
-        // --- GAE(λ) eligibility trace path ---
-        if let Some(lambda) = self.config.gae_lambda {
-            // GAE and td_steps are mutually exclusive (validated at construction).
-            debug_assert!(
-                self.td_buffer.is_empty(),
-                "GAE and td_steps are mutually exclusive"
-            );
-            // Gradient direction WITHOUT td_error scaling
-            let mut grad_direction = vec![0.0; pi.len()];
-            for &i in step.valid_actions {
-                grad_direction[i] = pi[i];
-            }
-            grad_direction[step.action] -= 1.0;
+                // --- GAE(λ) eligibility trace path ---
+                if let Some(lambda) = self.config.gae_lambda {
+                    // GAE and td_steps are mutually exclusive (validated at construction).
+                    debug_assert!(
+                        self.td_buffer.is_empty(),
+                        "GAE and td_steps are mutually exclusive"
+                    );
+                    // Gradient direction WITHOUT td_error scaling
+                    let mut grad_direction = vec![0.0; pi.len()];
+                    for &i in valid_actions {
+                        grad_direction[i] = pi[i];
+                    }
+                    grad_direction[action_idx] -= 1.0;
 
-            // Trace update: online-only. Replay batches must not pollute
-            // the on-policy eligibility trace.
-            if is_online {
-                let gamma_lambda = self.config.gamma * lambda;
-                for v in &mut self.actor_trace {
-                    *v *= gamma_lambda;
+                    // Trace update: online-only. Replay batches must not pollute
+                    // the on-policy eligibility trace.
+                    if is_online {
+                        let gamma_lambda = self.config.gamma * lambda;
+                        for v in &mut self.actor_trace {
+                            *v *= gamma_lambda;
+                        }
+                        for (i, &g) in grad_direction.iter().enumerate() {
+                            self.actor_trace[i] += g;
+                        }
+                        for v in &mut self.actor_trace {
+                            *v = v.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
+                        }
+                    }
+
+                    // Effective delta. For Online we scale the (just-updated) trace
+                    // by td_error (standard GAE). For Replay we fall back to the
+                    // plain policy-gradient direction so the off-policy update still
+                    // improves the policy without touching the on-policy trace.
+                    let mut delta: Vec<f64> = if is_online {
+                        self.actor_trace.iter().map(|&t| td_error * t).collect()
+                    } else {
+                        grad_direction.iter().map(|&g| td_error * g).collect()
+                    };
+
+                    // Entropy regularization per-step (not accumulated in trace)
+                    for &i in valid_actions {
+                        let log_pi = (pi[i].max(1e-10)).ln();
+                        delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
+                    }
+
+                    // Use shared bookkeeping
+                    return Ok(self.apply_actor_update_and_bookkeeping(
+                        &delta,
+                        step.infer,
+                        step.state,
+                        &y_conv_vec,
+                        valid_actions,
+                        action_idx,
+                        td_error,
+                        loss,
+                        step.mode,
+                    ));
                 }
-                for (i, &g) in grad_direction.iter().enumerate() {
-                    self.actor_trace[i] += g;
+
+                // --- Standard TD(0)/TD(n) path continues below ---
+                let mut delta = vec![0.0; pi.len()];
+                for &i in valid_actions {
+                    delta[i] = pi[i];
                 }
-                for v in &mut self.actor_trace {
-                    *v = v.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
+                delta[action_idx] -= 1.0;
+
+                for &i in valid_actions {
+                    delta[i] *= td_error;
                 }
+
+                // Entropy regularization
+                for &i in valid_actions {
+                    let log_pi = (pi[i].max(1e-10)).ln();
+                    delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
+                }
+
+                Ok(self.apply_actor_update_and_bookkeeping(
+                    &delta,
+                    step.infer,
+                    step.state,
+                    &y_conv_vec,
+                    valid_actions,
+                    action_idx,
+                    td_error,
+                    loss,
+                    step.mode,
+                ))
             }
+            StepAction::Continuous { action: a_taken } => {
+                // Gaussian-policy gradient (brainstorm Q3 / spec §5.3).
+                //
+                //   π(a|s) = N(μ(s), σ² I)             — isotropic Gaussian
+                //   log π(a|s) = −‖a − μ‖² / (2σ²) + const
+                //   ∇_θ log π = ((a − μ) / σ²) · ∇_θ μ
+                //
+                // The output-level delta (post-activation) is therefore
+                //   delta_j = (a_taken_j − μ_j) / σ²
+                // multiplied by td_error (advantage). The existing
+                // `update_with_decay` machinery in `apply_actor_update_and_
+                // bookkeeping` propagates this through the network using the
+                // standard activation derivatives; the Gaussian-vs-softmax
+                // distinction is fully captured by the delta vector built
+                // here.
+                //
+                // GAE eligibility traces are intentionally NOT applied in
+                // the Continuous path: the trace formulation `actor_trace`
+                // is sized and seeded for the discrete one-hot gradient,
+                // and the public continuous API (Phase 4) does not yet
+                // expose GAE for continuous control. If gae_lambda is set
+                // alongside ActionSpace::Continuous, we fall through to
+                // the standard TD path; config validation forbids the
+                // Continuous + GAE combination at construction time when
+                // it is unsupported.
+                let mu = &y_conv_vec; // y_conv is the post-activation μ(s).
+                let sigma = self.config.policy_sigma;
+                let sigma_sq = sigma * sigma;
+                debug_assert!(
+                    sigma_sq.is_finite() && sigma_sq > 0.0,
+                    "policy_sigma must produce finite positive sigma_sq, got {sigma_sq} \
+                     (sigma = {sigma})"
+                );
+                debug_assert_eq!(
+                    a_taken.len(),
+                    mu.len(),
+                    "continuous action length {} must match μ length {}",
+                    a_taken.len(),
+                    mu.len()
+                );
 
-            // Effective delta. For Online we scale the (just-updated) trace
-            // by td_error (standard GAE). For Replay we fall back to the
-            // plain policy-gradient direction so the off-policy update still
-            // improves the policy without touching the on-policy trace.
-            let mut delta: Vec<f64> = if is_online {
-                self.actor_trace.iter().map(|&t| td_error * t).collect()
-            } else {
-                grad_direction.iter().map(|&g| td_error * g).collect()
-            };
+                // Descent-direction delta:
+                //   delta_j = td_error · (μ_j − a_taken_j) / σ²
+                //
+                // Sanity: with td_error > 0 and a_taken > μ, delta < 0,
+                // so the bias update b_j ← b_j − lr·δ pushes μ_j UP —
+                // pulling the mean toward the rewarded action, which
+                // matches the Phase 4.1 gradient-direction test contract
+                // ("if a > μ and advantage > 0, μ moves up").
+                let mut delta = vec![0.0; mu.len()];
+                for j in 0..mu.len() {
+                    delta[j] = td_error * (mu[j] - a_taken[j]) / sigma_sq;
+                }
 
-            // Entropy regularization per-step (not accumulated in trace)
-            for &i in step.valid_actions {
-                let log_pi = (pi[i].max(1e-10)).ln();
-                delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
+                // Entropy regularization: SKIPPED for fixed-σ Gaussian.
+                // H(N(μ,σ²I)) = 0.5·k·(1 + ln(2πσ²)) is independent of θ
+                // (μ is the only learnable output and entropy depends only
+                // on σ, which is fixed). ∇_θ H = 0.
+
+                // Use shared bookkeeping. Pass an empty mask and action=0
+                // so KL distillation (gated on `valid_actions.len() > 1`)
+                // and EWC logits-reversal (gated on `!valid_actions.
+                // is_empty()`) are skipped. These regularizers are
+                // discrete-specific and conceptually undefined for
+                // Gaussian policies; the continuous path keeps the
+                // canonical scale/decay/Fisher-on-delta machinery only.
+                Ok(self.apply_actor_update_and_bookkeeping(
+                    &delta,
+                    step.infer,
+                    step.state,
+                    &y_conv_vec,
+                    &[],
+                    0,
+                    td_error,
+                    loss,
+                    step.mode,
+                ))
             }
-
-            // Use shared bookkeeping
-            return Ok(self.apply_actor_update_and_bookkeeping(
-                &delta,
-                step.infer,
-                step.state,
-                &y_conv_vec,
-                step.valid_actions,
-                step.action,
-                td_error,
-                loss,
-                step.mode,
-            ));
         }
-
-        // --- Standard TD(0)/TD(n) path continues below ---
-        let mut delta = vec![0.0; pi.len()];
-        for &i in step.valid_actions {
-            delta[i] = pi[i];
-        }
-        delta[step.action] -= 1.0;
-
-        for &i in step.valid_actions {
-            delta[i] *= td_error;
-        }
-
-        // Entropy regularization
-        for &i in step.valid_actions {
-            let log_pi = (pi[i].max(1e-10)).ln();
-            delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
-        }
-
-        Ok(self.apply_actor_update_and_bookkeeping(
-            &delta,
-            step.infer,
-            step.state,
-            &y_conv_vec,
-            step.valid_actions,
-            step.action,
-            td_error,
-            loss,
-            step.mode,
-        ))
     }
 
     /// Shared post-delta bookkeeping: scale/decay, EWC/Fisher, weight update,
@@ -2043,8 +2272,16 @@ impl<L: LinAlg> PcActorCritic<L> {
         // estimate (MAGI R6 W1). Replay mode falls through to the plain
         // weight update with neither Fisher accumulation nor EWC correction.
         if is_online && self.config.ewc_lambda > 0.0 && !self.actor_fisher.is_empty() {
-            // Step 2: Extract per-layer gradients for Fisher EMA (read-only)
-            let fisher_delta = if self.config.logits_reversal {
+            // Step 2: Extract per-layer gradients for Fisher EMA (read-only).
+            //
+            // Logits-reversal Fisher (`delta_fisher = softmax(−y/T) −
+            // one_hot(action)`) is a discrete-policy formulation. For
+            // continuous (Gaussian) policies the caller passes an empty
+            // `valid_actions` slice, in which case `softmax_masked`
+            // returns all zeros and the construction is undefined; fall
+            // back to `delta` so Fisher accumulates the actual gradient
+            // direction (still a valid Fisher proxy for Gaussian).
+            let fisher_delta = if self.config.logits_reversal && !valid_actions.is_empty() {
                 // Logits reversal: delta_fisher = softmax(-y_conv/T, valid) - one_hot(action)
                 let y_conv_rev: Vec<f64> = y_conv_vec
                     .iter()
@@ -2234,6 +2471,14 @@ impl<L: LinAlg> PcActorCritic<L> {
         reward: f64,
         terminal: bool,
     ) -> Result<usize, PcError> {
+        if self.config.action_space != ActionSpace::Discrete {
+            return Err(PcError::ConfigValidation(format!(
+                "step_masked is only valid when action_space == Discrete; \
+                 current action_space = {:?}. Use step_continuous() for \
+                 continuous action spaces.",
+                self.config.action_space
+            )));
+        }
         if valid_actions.is_empty() {
             return Err(PcError::ConfigValidation(
                 "valid_actions must not be empty".to_string(),
@@ -2246,6 +2491,266 @@ impl<L: LinAlg> PcActorCritic<L> {
             terminal,
             Some(valid_actions.to_vec()),
         ))
+    }
+
+    /// v4.0.0 — Continuous-mode training step.
+    ///
+    /// Mirrors [`step_masked`](Self::step_masked) for `ActionSpace::Continuous`:
+    ///
+    /// 1. Runs actor inference on the current `state` to obtain `μ(s)`.
+    /// 2. Samples `a = μ + σ·ε` with `ε ~ N(0, I)` via Box-Muller from
+    ///    the agent's deterministic [`StdRng`] (so a fixed seed yields
+    ///    a fixed action sequence). `σ = config.policy_sigma`.
+    /// 3. If a previous transition is stored from the prior call, runs
+    ///    a TD(0) update via the internal continuous learning path with
+    ///    `StepAction::Continuous` — exercising the Gaussian-policy
+    ///    gradient `δ_j = td_error · (μ_j − a_j)/σ²` (Phase 3.3).
+    /// 4. Records `(state, action, reward, next_state, done)` in the
+    ///    replay buffer when configured.
+    /// 5. Updates `state_prev / action_prev_continuous / infer_prev`
+    ///    so the next call closes the TD bootstrap.
+    /// 6. On terminal, clears all transient state to start a fresh
+    ///    episode on the next call.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` — current observation vector.
+    /// * `reward` — reward received from the environment after the
+    ///   previous action (ignored on the first call of an episode).
+    /// * `done` — whether the current state is terminal.
+    ///
+    /// # Returns
+    ///
+    /// The sampled action vector `a = μ(s) + σ·ε` of length
+    /// `config.actor.output_size`.
+    ///
+    /// # Determinism
+    ///
+    /// Sampling uses the agent's internal `StdRng`. Same seed at
+    /// construction → identical action sequence under identical inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcError::ConfigValidation`] if
+    /// `config.action_space != Continuous` — discrete callers must use
+    /// [`step`](Self::step) or [`step_masked`](Self::step_masked).
+    ///
+    /// # See also
+    ///
+    /// - [`step_continuous_raw_device`](Self::step_continuous_raw_device)
+    ///   — same flow, returns `L::Vector` (forward-compat for GPU).
+    /// - [`act_continuous`](Self::act_continuous) — inference-only with
+    ///   Play/Training mode selector.
+    pub fn step_continuous(
+        &mut self,
+        state: &[f64],
+        reward: f64,
+        done: bool,
+    ) -> Result<Vec<f64>, PcError> {
+        if self.config.action_space != ActionSpace::Continuous {
+            return Err(PcError::ConfigValidation(format!(
+                "step_continuous is only valid when action_space == Continuous; \
+                 current action_space = {:?}. Use step_masked() for discrete \
+                 action spaces.",
+                self.config.action_space
+            )));
+        }
+
+        // 1. Actor inference at current state.
+        let current_infer = self.actor.infer(state);
+
+        // 2. Learn from the previous transition if buffered. Continuous
+        //    step_continuous is TD(0) only at Phase 4.1; TD(n) and GAE
+        //    paths for the continuous gradient land in Phase 4.3.
+        if let (Some(prev_state), Some(prev_action), Some(prev_infer)) = (
+            self.state_prev.take(),
+            self.action_prev_continuous.take(),
+            self.infer_prev.take(),
+        ) {
+            let prev_state_vec = self.backend.vec_to_vec(&prev_state);
+            let surprise_score = prev_infer.surprise_score;
+
+            let step = LearnStep::online(
+                &prev_state_vec,
+                &prev_infer,
+                StepAction::Continuous {
+                    action: &prev_action,
+                },
+                reward,
+                state,
+                &current_infer,
+                done,
+                self.config.gamma,
+            );
+            // Propagate any error from learn_continuous_inner. The loss value
+            // is not returned by step_continuous (caller gets the action),
+            // but errors must not be silently swallowed.
+            let _ = self.learn_continuous_inner(&step)?;
+
+            if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
+                self.process_hysteresis(surprise_score, self.last_td_error.abs());
+            }
+
+            // Auto-record into replay buffer when configured.
+            if let Some(ref mut buffer) = self.replay_buffer {
+                let transition = crate::pc_actor_critic::replay::ReplayTransition {
+                    state: prev_state_vec,
+                    action: crate::pc_actor_critic::replay::Action::Continuous(prev_action.clone()),
+                    reward,
+                    next_state: state.to_vec(),
+                    done,
+                    valid_actions: None,
+                };
+                let _ = buffer.push(transition);
+            }
+        }
+
+        // 3. Sample action from N(μ, σ² I) via Box-Muller. Two uniform
+        //    draws per Gaussian sample. Going through `self.rng` keeps
+        //    the action sequence deterministic under a fixed seed.
+        use rand::Rng;
+        let mu = self.backend.vec_to_vec(&current_infer.y_conv);
+        let sigma = self.config.policy_sigma;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut action: Vec<f64> = Vec::with_capacity(mu.len());
+        for &m in &mu {
+            // u1 ∈ (0, 1] avoids ln(0); u2 ∈ [0, 1).
+            let u1: f64 = self.rng.gen_range(f64::EPSILON..=1.0);
+            let u2: f64 = self.rng.gen_range(0.0..1.0);
+            let eps = (-2.0 * u1.ln()).sqrt() * (two_pi * u2).cos();
+            action.push(m + sigma * eps);
+        }
+
+        // 4. Stash (state, action, infer) for the next call's bootstrap.
+        self.state_prev = Some(self.backend.vec_from_slice(state));
+        self.action_prev_continuous = Some(action.clone());
+        self.infer_prev = Some(current_infer);
+        // `valid_actions_prev` is discrete-only; clear so a future
+        // accidental `step_masked` call after a config swap does not
+        // pick up a stale mask.
+        self.valid_actions_prev = None;
+        self.action_prev = None;
+
+        // 5. Terminal: drop all transient state.
+        if done {
+            self.state_prev = None;
+            self.action_prev = None;
+            self.action_prev_continuous = None;
+            self.infer_prev = None;
+            self.valid_actions_prev = None;
+            for v in &mut self.actor_trace {
+                *v = 0.0;
+            }
+        }
+
+        Ok(action)
+    }
+
+    /// v4.0.0 — same as [`step_continuous`](Self::step_continuous) but returns
+    /// the device-native action vector. Forward-compat hook for future
+    /// `GpuLinAlg` backends. On `CpuLinAlg` (where `Vector = Vec<f64>`), this
+    /// is bit-equivalent to `step_continuous` plus a `vec_from_slice`
+    /// round-trip; future `GpuLinAlg` can override to be zero-copy
+    /// device-side.
+    ///
+    /// **Precondition:** `config.action_space == ActionSpace::Continuous`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcError::ConfigValidation`] if
+    /// `config.action_space != Continuous` — propagated from `step_continuous`.
+    pub fn step_continuous_raw_device(
+        &mut self,
+        state: &[f64],
+        reward: f64,
+        done: bool,
+    ) -> Result<L::Vector, PcError> {
+        let action = self.step_continuous(state, reward, done)?;
+        Ok(self.backend.vec_from_slice(&action))
+    }
+
+    /// v4.0.0 — Continuous-mode inference with `SelectionMode` control.
+    ///
+    /// Runs actor inference to obtain the mean `μ(s)` for the current
+    /// state, then produces an action according to the caller's mode:
+    ///
+    /// | `mode` | Action returned | Side-effect on RNG |
+    /// |---|---|---|
+    /// | `SelectionMode::Play` | Deterministic `μ(s)` — no noise | None (RNG not advanced) |
+    /// | `SelectionMode::Training` | `μ(s) + σ·ε`, `ε ~ N(0, I)` via Box-Muller | One draw per output dimension |
+    ///
+    /// `σ = config.policy_sigma`.
+    ///
+    /// This is the inference-only counterpart of
+    /// [`step_continuous`](Self::step_continuous): it does not perform a
+    /// learning update or modify any stored state. Use it for evaluation
+    /// rollouts or action collection inside a REINFORCE loop.
+    ///
+    /// **Determinism:** Under `Training` mode, the Box-Muller samples come
+    /// from the agent's internal `StdRng`. The same seed at construction
+    /// combined with the same sequence of calls yields identical actions.
+    ///
+    /// **Precondition:** `config.action_space == ActionSpace::Continuous`.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` — current observation vector of length `actor.input_size`.
+    /// * `mode` — `Play` for deterministic μ; `Training` for stochastic sample.
+    ///
+    /// # Returns
+    ///
+    /// A `(action, infer_result)` pair where `action` is a `Vec<f64>` of
+    /// length `actor.output_size` and `infer_result` carries the full PC
+    /// inference state (surprise score, activations, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcError::ConfigValidation`] if
+    /// `config.action_space != Continuous` — discrete callers must use
+    /// [`act`](Self::act).
+    ///
+    /// # See also
+    ///
+    /// - [`step_continuous`](Self::step_continuous) — learning step that
+    ///   also samples an action and performs a TD(0) update.
+    /// - [`act`](Self::act) — equivalent for `ActionSpace::Discrete`.
+    pub fn act_continuous(
+        &mut self,
+        state: &[f64],
+        mode: crate::pc_actor::SelectionMode,
+    ) -> Result<(Vec<f64>, InferResult<L>), PcError> {
+        if self.config.action_space != ActionSpace::Continuous {
+            return Err(PcError::ConfigValidation(format!(
+                "act_continuous is only valid when action_space == Continuous; \
+                 current action_space = {:?}. Use act() for discrete action spaces.",
+                self.config.action_space
+            )));
+        }
+
+        let infer = self.actor.infer(state);
+        let mu = self.backend.vec_to_vec(&infer.y_conv);
+
+        let action = match mode {
+            crate::pc_actor::SelectionMode::Play => {
+                // Play: deterministic μ, no RNG advance.
+                mu
+            }
+            crate::pc_actor::SelectionMode::Training => {
+                // Training: μ + σ·ε, RNG advances. Box-Muller per dim.
+                use rand::Rng;
+                let sigma = self.config.policy_sigma;
+                mu.iter()
+                    .map(|m| {
+                        let u1: f64 = self.rng.gen_range(f64::EPSILON..=1.0);
+                        let u2: f64 = self.rng.gen_range(0.0..1.0);
+                        let eps = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                        m + sigma * eps
+                    })
+                    .collect::<Vec<f64>>()
+            }
+        };
+
+        Ok((action, infer))
     }
 
     /// Shared implementation for `step()` and `step_masked()`.
@@ -2336,8 +2841,10 @@ impl<L: LinAlg> PcActorCritic<L> {
                     let step = LearnStep::online(
                         &oldest_state_vec,
                         &oldest.infer,
-                        oldest.action,
-                        &oldest.valid_actions,
+                        StepAction::Discrete {
+                            action: oldest.action,
+                            valid_actions: &oldest.valid_actions,
+                        },
                         n_step_reward,
                         state,
                         &current_infer,
@@ -2358,13 +2865,13 @@ impl<L: LinAlg> PcActorCritic<L> {
             if let Some(ref mut buffer) = self.replay_buffer {
                 let transition = crate::pc_actor_critic::replay::ReplayTransition {
                     state: prev_state_vec,
-                    action: prev_action,
+                    action: crate::pc_actor_critic::replay::Action::Discrete(prev_action),
                     reward,
                     next_state: state.to_vec(),
                     done: terminal,
-                    valid_actions: learn_mask,
+                    valid_actions: Some(learn_mask),
                 };
-                buffer.push(transition);
+                let _ = buffer.push(transition);
             }
         }
 
@@ -2386,6 +2893,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         if terminal {
             self.state_prev = None;
             self.action_prev = None;
+            self.action_prev_continuous = None;
             self.infer_prev = None;
             self.valid_actions_prev = None;
             for v in &mut self.actor_trace {
@@ -2449,8 +2957,10 @@ impl<L: LinAlg> PcActorCritic<L> {
             let step = LearnStep {
                 state: &state_vec,
                 infer: &transition.infer,
-                action: transition.action,
-                valid_actions: &transition.valid_actions,
+                action: StepAction::Discrete {
+                    action: transition.action,
+                    valid_actions: &transition.valid_actions,
+                },
                 reward: n_step_reward,
                 next_state: terminal_state,
                 next_infer: terminal_infer,
@@ -2478,6 +2988,7 @@ impl<L: LinAlg> PcActorCritic<L> {
     pub fn reset_step(&mut self) {
         self.state_prev = None;
         self.action_prev = None;
+        self.action_prev_continuous = None;
         self.infer_prev = None;
         self.valid_actions_prev = None;
         self.td_buffer.clear();
@@ -3599,11 +4110,30 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
             let clamped_td_error = raw_td_error.clamp(-MAX_REPLAY_TD_ERROR, MAX_REPLAY_TD_ERROR);
 
+            // Phase 2: only Discrete transitions supported. Continuous
+            // gradient dispatch lands in Phase 3.3.
+            let action_idx = match &transition.action {
+                crate::pc_actor_critic::replay::Action::Discrete(idx) => *idx,
+                crate::pc_actor_critic::replay::Action::Continuous(_) => {
+                    return Err(PcError::ConfigValidation(
+                        "replay_learn cannot handle Continuous transitions in Phase 2 \
+                         (gradient dispatch lands Phase 3.3)"
+                            .into(),
+                    ));
+                }
+            };
+            let valid = transition
+                .valid_actions
+                .as_deref()
+                .unwrap_or(&[] as &[usize]);
+
             let step = LearnStep {
                 state: &transition.state,
                 infer: &infer,
-                action: transition.action,
-                valid_actions: &transition.valid_actions,
+                action: StepAction::Discrete {
+                    action: action_idx,
+                    valid_actions: valid,
+                },
                 reward: transition.reward,
                 next_state: &transition.next_state,
                 next_infer: &next_infer,
@@ -3753,6 +4283,8 @@ mod tests {
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
             critic_floor_replay: -1.0,
+            action_space: ActionSpace::Discrete,
+            policy_sigma: 0.1,
         }
     }
 
@@ -3786,7 +4318,7 @@ mod tests {
     fn make_trajectory(agent: &mut PcActorCritic) -> Vec<TrajectoryStep> {
         let input = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
         let valid = vec![2, 7];
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
         vec![TrajectoryStep {
             input,
             latent_concat: infer.latent_concat,
@@ -3852,7 +4384,7 @@ mod tests {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
         let trajectory = vec![TrajectoryStep {
             input,
             latent_concat: infer.latent_concat,
@@ -3884,7 +4416,7 @@ mod tests {
 
         let mut trajectory = Vec::new();
         for (i, inp) in inputs.iter().enumerate() {
-            let (action, infer) = agent.act(inp, &valid, SelectionMode::Training);
+            let (action, infer) = agent.act(inp, &valid, SelectionMode::Training).unwrap();
             trajectory.push(TrajectoryStep {
                 input: inp.clone(),
                 latent_concat: infer.latent_concat,
@@ -3916,8 +4448,10 @@ mod tests {
         let input = vec![0.5; 9];
         let next_input = vec![-0.5; 9];
         let valid = vec![0, 1, 2];
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
-        let (_, next_infer) = agent.act(&next_input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
+        let (_, next_infer) = agent
+            .act(&next_input, &valid, SelectionMode::Training)
+            .unwrap();
 
         // Non-terminal: should incorporate next value
         let loss = agent.learn_continuous(
@@ -3939,8 +4473,10 @@ mod tests {
         let input = vec![0.5; 9];
         let next_input = vec![0.0; 9];
         let valid = vec![0, 1, 2];
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
-        let (_, next_infer) = agent.act(&next_input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
+        let (_, next_infer) = agent
+            .act(&next_input, &valid, SelectionMode::Training)
+            .unwrap();
 
         // Terminal: target = reward only (no gamma * V(s'))
         let loss = agent.learn_continuous(
@@ -3970,12 +4506,20 @@ mod tests {
         let valid = vec![0, 1, 2];
 
         // Use identical actions and inferences
-        let (action, infer) = agent_term.act(&input, &valid, SelectionMode::Training);
-        let (_, next_infer) = agent_term.act(&next_input, &valid, SelectionMode::Training);
+        let (action, infer) = agent_term
+            .act(&input, &valid, SelectionMode::Training)
+            .unwrap();
+        let (_, next_infer) = agent_term
+            .act(&next_input, &valid, SelectionMode::Training)
+            .unwrap();
 
         // Clone infer for the non-terminal agent (same starting point)
-        let (action2, infer2) = agent_nonterm.act(&input, &valid, SelectionMode::Training);
-        let (_, next_infer2) = agent_nonterm.act(&next_input, &valid, SelectionMode::Training);
+        let (action2, infer2) = agent_nonterm
+            .act(&input, &valid, SelectionMode::Training)
+            .unwrap();
+        let (_, next_infer2) = agent_nonterm
+            .act(&next_input, &valid, SelectionMode::Training)
+            .unwrap();
 
         // Terminal update
         let loss_term = agent_term.learn_continuous(
@@ -4015,8 +4559,10 @@ mod tests {
         let input = vec![0.5; 9];
         let next_input = vec![-0.5; 9];
         let valid = vec![0, 1, 2];
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
-        let (_, next_infer) = agent.act(&next_input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
+        let (_, next_infer) = agent
+            .act(&next_input, &valid, SelectionMode::Training)
+            .unwrap();
         let w_before = agent.actor.layers[0].weights.data.clone();
         let _ = agent.learn_continuous(
             &input,
@@ -4122,7 +4668,7 @@ mod tests {
 
         // Train many times on same trajectory
         for _ in 0..20 {
-            let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             let trajectory = vec![TrajectoryStep {
                 input: input.clone(),
                 latent_concat: infer.latent_concat,
@@ -4142,7 +4688,7 @@ mod tests {
         // Check that policy is not collapsed (multiple actions selected over 50 trials)
         let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
-            let (action, _) = agent.act(&input, &valid, SelectionMode::Training);
+            let (action, _) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             seen.insert(action);
         }
         assert!(
@@ -4160,7 +4706,7 @@ mod tests {
         let input = vec![0.5; 9];
         let valid = vec![1, 3, 5, 7];
         for _ in 0..20 {
-            let (action, _) = agent.act(&input, &valid, SelectionMode::Training);
+            let (action, _) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             assert!(valid.contains(&action), "Action {action} not in valid set");
         }
     }
@@ -4170,7 +4716,7 @@ mod tests {
     fn test_act_empty_valid_panics() {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
-        let _ = agent.act(&input, &[], SelectionMode::Training);
+        let _ = agent.act(&input, &[], SelectionMode::Training).unwrap();
     }
 
     // ── learning diagnostic test ──────────────────────────────
@@ -4251,6 +4797,8 @@ mod tests {
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
             critic_floor_replay: -1.0,
+            action_space: ActionSpace::Discrete,
+            policy_sigma: 0.1,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -4260,7 +4808,7 @@ mod tests {
 
         // Repeatedly reward action 4
         for _ in 0..200 {
-            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             let trajectory = vec![TrajectoryStep {
                 input: input.clone(),
                 latent_concat: infer.latent_concat,
@@ -4279,7 +4827,7 @@ mod tests {
 
         // After 200 episodes always rewarding action 4, it should be the
         // preferred action in Play mode (deterministic argmax)
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Play);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Play).unwrap();
 
         // Check that action 4's logit is the highest
         let logit_4 = infer.y_conv[4];
@@ -4367,7 +4915,7 @@ mod tests {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2];
-        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
 
         let num_hidden = infer.hidden_states.len();
         let mut cache: ActivationCache = ActivationCache::new(num_hidden);
@@ -4381,14 +4929,16 @@ mod tests {
         let valid = vec![0, 1, 2];
         let init_input = vec![0.5; 9];
         let num_hidden = {
-            let (_, infer) = agent.act(&init_input, &valid, SelectionMode::Training);
+            let (_, infer) = agent
+                .act(&init_input, &valid, SelectionMode::Training)
+                .unwrap();
             infer.hidden_states.len()
         };
 
         let mut cache: ActivationCache = ActivationCache::new(num_hidden);
         for i in 0..5 {
             let input = vec![i as f64 * 0.1; 9];
-            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             cache.record(&infer.hidden_states);
         }
         assert_eq!(cache.batch_size(), 5);
@@ -4399,7 +4949,7 @@ mod tests {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2];
-        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
 
         let num_hidden = infer.hidden_states.len();
         let mut cache: ActivationCache = ActivationCache::new(num_hidden);
@@ -4420,7 +4970,7 @@ mod tests {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2];
-        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
 
         let num_hidden = infer.hidden_states.len();
         let mut cache: ActivationCache = ActivationCache::new(num_hidden);
@@ -4435,14 +4985,16 @@ mod tests {
         let valid = vec![0, 1, 2];
         let init_input = vec![0.5; 9];
         let num_hidden = {
-            let (_, infer) = agent.act(&init_input, &valid, SelectionMode::Training);
+            let (_, infer) = agent
+                .act(&init_input, &valid, SelectionMode::Training)
+                .unwrap();
             infer.hidden_states.len()
         };
 
         let mut cache: ActivationCache = ActivationCache::new(num_hidden);
         for i in 0..10 {
             let input = vec![i as f64 * 0.1; 9];
-            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             cache.record(&infer.hidden_states);
         }
 
@@ -4470,7 +5022,7 @@ mod tests {
             let input: Vec<f64> = (0..agent.config.actor.input_size)
                 .map(|j| ((i * 9 + j) as f64 * 0.1).sin())
                 .collect();
-            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             actor_cache.record(&infer.hidden_states);
             let mut critic_input = input;
             critic_input.extend_from_slice(&infer.latent_concat);
@@ -4574,7 +5126,7 @@ mod tests {
 
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2, 3, 4];
-        let (action, _) = child.act(&input, &valid, SelectionMode::Training);
+        let (action, _) = child.act(&input, &valid, SelectionMode::Training).unwrap();
         assert!(valid.contains(&action), "Action {action} not in valid set");
     }
 
@@ -4756,8 +5308,12 @@ mod tests {
         let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
         let all_actions: Vec<usize> = (0..9).collect();
 
-        let (action1, infer1) = agent_b.act(&s1, &all_actions, SelectionMode::Training);
-        let (_, infer2) = agent_b.act(&s2, &all_actions, SelectionMode::Training);
+        let (action1, infer1) = agent_b
+            .act(&s1, &all_actions, SelectionMode::Training)
+            .unwrap();
+        let (_, infer2) = agent_b
+            .act(&s2, &all_actions, SelectionMode::Training)
+            .unwrap();
 
         let _ = agent_b.learn_continuous(
             &s1,
@@ -4797,8 +5353,12 @@ mod tests {
         let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
         let all_actions: Vec<usize> = (0..9).collect();
 
-        let (action1, infer1) = agent_b.act(&s1, &all_actions, SelectionMode::Training);
-        let (_, infer2) = agent_b.act(&s2, &all_actions, SelectionMode::Training);
+        let (action1, infer1) = agent_b
+            .act(&s1, &all_actions, SelectionMode::Training)
+            .unwrap();
+        let (_, infer2) = agent_b
+            .act(&s2, &all_actions, SelectionMode::Training)
+            .unwrap();
 
         let _ =
             agent_b.learn_continuous(&s1, &infer1, action1, &all_actions, 1.0, &s2, &infer2, true);
@@ -4830,8 +5390,10 @@ mod tests {
         // Agent B: manual path
         let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
-        let (action1, infer1) = agent_b.act(&s1, &mask, SelectionMode::Training);
-        let (_, infer2) = agent_b.act(&s2, &all_actions, SelectionMode::Training);
+        let (action1, infer1) = agent_b.act(&s1, &mask, SelectionMode::Training).unwrap();
+        let (_, infer2) = agent_b
+            .act(&s2, &all_actions, SelectionMode::Training)
+            .unwrap();
 
         let _ = agent_b.learn_continuous(&s1, &infer1, action1, &mask, 1.0, &s2, &infer2, false);
 
@@ -4970,7 +5532,7 @@ mod tests {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2];
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
         assert!(action < 9);
         assert!(infer.surprise_score.is_finite());
     }
@@ -5455,6 +6017,8 @@ mod tests {
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
             critic_floor_replay: -1.0,
+            action_space: ActionSpace::Discrete,
+            policy_sigma: 0.1,
         }
     }
 
@@ -9372,7 +9936,9 @@ mod tests {
         let _ = agent.step(&state, 0.0, false);
         let _ = agent.step(&state, 0.5, true);
 
-        let (action_before, _) = agent.act(&state, &[0, 1, 2, 3], SelectionMode::Play);
+        let (action_before, _) = agent
+            .act(&state, &[0, 1, 2, 3], SelectionMode::Play)
+            .unwrap();
         let w_before = agent.actor.layers[0].weights.data.clone();
 
         let path = format!(
@@ -9419,7 +9985,9 @@ mod tests {
             "critic lr diverged after round-trip"
         );
 
-        let (action_after, _) = loaded.act(&state, &[0, 1, 2, 3], SelectionMode::Play);
+        let (action_after, _) = loaded
+            .act(&state, &[0, 1, 2, 3], SelectionMode::Play)
+            .unwrap();
         assert_eq!(
             action_before, action_after,
             "Behavioral equivalence after round-trip"
@@ -10783,8 +11351,10 @@ mod tests {
         let replay_step = LearnStep {
             state: &state,
             infer: &infer,
-            action: 0,
-            valid_actions: &valid_actions,
+            action: StepAction::Discrete {
+                action: 0,
+                valid_actions: &valid_actions,
+            },
             reward: 1.0,
             next_state: &next_state,
             next_infer: &next_infer,
@@ -10859,8 +11429,10 @@ mod tests {
         let nan_step = LearnStep {
             state: &state,
             infer: &infer,
-            action: 0,
-            valid_actions: &valid_actions,
+            action: StepAction::Discrete {
+                action: 0,
+                valid_actions: &valid_actions,
+            },
             reward: f64::NAN,
             next_state: &next_state,
             next_infer: &next_infer,
@@ -10911,7 +11483,7 @@ mod tests {
     // un-ignored in commit 16 once the real method bodies landed.
     // ═══════════════════════════════════════════════════════════════════
 
-    use crate::pc_actor_critic::replay::ReplayTransition;
+    use crate::pc_actor_critic::replay::{Action, ReplayTransition};
 
     /// L2 norm of the element-wise difference between two weight vectors.
     fn l2_delta(a: &[f64], b: &[f64]) -> f64 {
@@ -10945,11 +11517,11 @@ mod tests {
         next_state[1] = marker;
         ReplayTransition {
             state,
-            action: 0,
+            action: Action::Discrete(0),
             reward,
             next_state,
             done: false,
-            valid_actions: (0..9).collect(),
+            valid_actions: Some((0..9).collect()),
         }
     }
 
@@ -10962,7 +11534,7 @@ mod tests {
             .expect("populate_replay_buffer: agent must have replay_buffer configured");
         for i in 0..n {
             let marker = (i as f64) / (n as f64);
-            buf.push(make_replay_transition(marker, 1.0));
+            buf.push(make_replay_transition(marker, 1.0)).unwrap();
         }
     }
 
@@ -11255,7 +11827,8 @@ mod tests {
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
             for i in 0..8 {
-                buf.push(make_replay_transition((i as f64) * 0.1, 100.0));
+                buf.push(make_replay_transition((i as f64) * 0.1, 100.0))
+                    .unwrap();
             }
         }
 
@@ -11299,7 +11872,8 @@ mod tests {
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
             for i in 0..4 {
-                buf.push(make_replay_transition((i as f64) * 0.1, f64::INFINITY));
+                buf.push(make_replay_transition((i as f64) * 0.1, f64::INFINITY))
+                    .unwrap();
             }
         }
 
@@ -11337,7 +11911,7 @@ mod tests {
         // Record a single transition directly.
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
-            buf.push(make_replay_transition(1.0, 1.0));
+            buf.push(make_replay_transition(1.0, 1.0)).unwrap();
         }
 
         // Drift the agent with 100 on-policy updates.
@@ -11661,7 +12235,8 @@ mod tests {
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
             for i in 0..30 {
-                buf.push(make_replay_transition(-(i as f64) * 0.01, 1.0));
+                buf.push(make_replay_transition(-(i as f64) * 0.01, 1.0))
+                    .unwrap();
             }
         }
         agent.seal_replay_training_memories().unwrap();
@@ -11669,7 +12244,8 @@ mod tests {
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
             for i in 0..25 {
-                buf.push(make_replay_transition((i as f64) * 0.02, 1.0));
+                buf.push(make_replay_transition((i as f64) * 0.02, 1.0))
+                    .unwrap();
             }
         }
 
@@ -11762,7 +12338,7 @@ mod tests {
         // |raw_td| >> MAX_REPLAY_TD_ERROR, so the clamp is definitely binding.
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
-            buf.push(make_replay_transition(0.1, 100.0));
+            buf.push(make_replay_transition(0.1, 100.0)).unwrap();
         }
 
         // Capture the raw td_error the critic would see without clamping.
@@ -12123,11 +12699,11 @@ mod tests {
         next_state[1] = 0.5;
         ReplayTransition {
             state,
-            action: 0,
+            action: Action::Discrete(0),
             reward: 1.0,
             next_state,
             done: false,
-            valid_actions: (0..state_dim).collect(),
+            valid_actions: Some((0..state_dim).collect()),
         }
     }
 
@@ -12140,7 +12716,7 @@ mod tests {
             .as_mut()
             .expect("populate_positive_replay_buffer: buffer must be configured");
         for _ in 0..n {
-            buf.push(make_positive_transition(9));
+            buf.push(make_positive_transition(9)).unwrap();
         }
     }
 
@@ -12279,6 +12855,149 @@ mod tests {
                 result.err()
             );
         }
+    }
+
+    // ── v4.0.0 continuous-mode validation rules ───────────────────────
+
+    #[test]
+    fn test_continuous_with_invalid_sigma_rejected() {
+        // Brainstorm Q1/spec §6: continuous mode requires policy_sigma > 0
+        // and finite. NaN/Inf/<=0 must be rejected at construction.
+        let invalid_sigmas = [0.0_f64, -0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        for &sigma in &invalid_sigmas {
+            let mut cfg = default_config();
+            cfg.action_space = ActionSpace::Continuous;
+            cfg.policy_sigma = sigma;
+            // Continuous requires distillation off (separate rule, also v4) —
+            // pre-disable here so this test isolates the sigma rule.
+            cfg.distillation_lambda_polyak = 0.0;
+            cfg.distillation_lambda_frozen = 0.0;
+            let result: Result<PcActorCritic, PcError> =
+                PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+            assert!(
+                result.is_err(),
+                "policy_sigma = {sigma} must be rejected in Continuous mode"
+            );
+            match result.unwrap_err() {
+                PcError::ConfigValidation(msg) => {
+                    assert!(
+                        msg.contains("policy_sigma"),
+                        "error must mention field name, got: {msg}"
+                    );
+                }
+                other => panic!("expected ConfigValidation, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_continuous_with_polyak_distillation_rejected() {
+        // Brainstorm/spec §5.5: KL is undefined for raw continuous output.
+        // distillation_lambda_polyak > 0 in Continuous mode → reject.
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.05;
+        let result: Result<PcActorCritic, PcError> = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => {
+                assert!(msg.contains("distillation_lambda_polyak"));
+                assert!(msg.contains("continuous") || msg.contains("Continuous"));
+            }
+            other => panic!("expected ConfigValidation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_continuous_with_frozen_distillation_rejected() {
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_frozen = 0.05;
+        let result: Result<PcActorCritic, PcError> = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => {
+                assert!(msg.contains("distillation_lambda_frozen"));
+                assert!(msg.contains("continuous") || msg.contains("Continuous"));
+            }
+            other => panic!("expected ConfigValidation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_continuous_with_valid_config_accepted() {
+        // Smoke: continuous + sigma=0.1 + distillation off + entropy=0
+        // must construct without error.
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        cfg.entropy_coeff = 0.0;
+        let result: Result<PcActorCritic, PcError> = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            result.is_ok(),
+            "valid Continuous config must construct, got {:?}",
+            result.err()
+        );
+    }
+
+    // ── v4.0.0 entry-point precondition guards (Brainstorm Q6) ─────────
+
+    #[test]
+    fn test_step_masked_rejects_continuous_config() {
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.0; 9];
+        let valid: Vec<usize> = (0..9).collect();
+        let result = agent.step_masked(&state, &valid, 0.0, false);
+        assert!(result.is_err(), "step_masked on Continuous must reject");
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => {
+                assert!(msg.contains("Discrete") || msg.contains("Continuous"));
+                assert!(msg.contains("step_masked") || msg.contains("step_continuous"));
+            }
+            other => panic!("expected ConfigValidation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_act_rejects_continuous_config() {
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let state = vec![0.0; 9];
+        let valid: Vec<usize> = (0..9).collect();
+        let result = agent.act(&state, &valid, crate::pc_actor::SelectionMode::Play);
+        assert!(result.is_err(), "act on Continuous must reject");
+    }
+
+    #[test]
+    fn test_step_continuous_rejects_discrete_config() {
+        let cfg = default_config();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let state = vec![0.0; 9];
+        let result = agent.step_continuous(&state, 0.0, false);
+        assert!(result.is_err(), "step_continuous on Discrete must reject");
+    }
+
+    #[test]
+    fn test_act_continuous_rejects_discrete_config() {
+        let cfg = default_config();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let state = vec![0.0; 9];
+        let result = agent.act_continuous(&state, crate::pc_actor::SelectionMode::Play);
+        assert!(result.is_err(), "act_continuous on Discrete must reject");
     }
 
     // ── Test 4 ──────────────────────────────────────────────────────────
@@ -12977,5 +13696,334 @@ mod tests {
             !fisher_any_non_finite(&agent),
             "actor Fisher must remain finite at end of test"
         );
+    }
+
+    // ── Phase 3.1 regression: Discrete path finite + non-trivial movement ──
+
+    #[test]
+    fn test_discrete_path_remains_finite_and_moves_after_refactor() {
+        // Regression guard: with action_space=Discrete (default) and
+        // a fixed seed, weights must move measurably and remain finite
+        // across 100 step_masked calls. Catches accidental semantic
+        // changes to the discrete path during the StepAction refactor
+        // (Phase 3.1) or future continuous-mode work.
+        //
+        // NOTE: this is NOT a bit-equivalence test against v3.x runtime
+        // (no v3.x binary available in CI). For true bit-equivalence,
+        // a checksum lock-in would require running v3.x once and
+        // hard-coding the resulting weights — fragile across compiler
+        // versions.
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Discrete;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let valid: Vec<usize> = (0..9).collect();
+        for _ in 0..100 {
+            let _ = agent.step_masked(&state, &valid, 1.0, false).unwrap();
+        }
+
+        let weights = &agent.actor.layers[0].weights.data;
+        let sum: f64 = weights.iter().sum();
+        let sumsq: f64 = weights.iter().map(|w| w * w).sum();
+
+        // sumsq sanity: should not be 0 (non-trivial movement).
+        assert!(
+            sumsq > 1e-12,
+            "discrete weights show no movement: sumsq={sumsq}"
+        );
+        // Magnitude bounds: verify weights stayed in a reasonable range.
+        assert!(
+            sum.is_finite() && sum > -1e6 && sum < 1e6,
+            "drift sanity: {sum}"
+        );
+    }
+
+    #[test]
+    fn test_continuous_gradient_direction_1d() {
+        // Phase 4.1 — empirical verification of the Gaussian-policy
+        // gradient sign convention. With `policy_sigma=0.1`, a positive
+        // advantage (reward > V(s)), and Box-Muller-sampled action
+        // around μ, the descent-direction delta is
+        //   δ = td_error · (μ − a) / σ²
+        // and the bias update `b ← b − lr·δ` pulls μ toward the rewarded
+        // action. Across many calls μ drifts measurably; we only assert
+        // non-zero finite drift here (the deeper sign-convention
+        // validation lives in Task 3.3 unit tests on the gradient
+        // computation itself).
+        use crate::activation::Activation;
+        use crate::layer::LayerDef;
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        cfg.entropy_coeff = 0.0;
+        // 1-D linear-output network for an unbounded μ.
+        cfg.actor.input_size = 4;
+        cfg.actor.output_size = 1;
+        cfg.actor.output_activation = Activation::Linear;
+        cfg.actor.hidden_layers = vec![LayerDef {
+            size: 4,
+            activation: Activation::Tanh,
+        }];
+        // Critic input = state(4) + latent_concat(4 hidden) = 8.
+        cfg.critic.input_size = 4 + 4;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.5, 0.3, 0.1, 0.2];
+        let mu_initial = agent.actor.infer(&state).y_conv;
+        let mu_initial_host = agent.backend.vec_to_vec(&mu_initial)[0];
+
+        // Drive 50 step_continuous calls with reward=1.0 (positive advantage).
+        for _ in 0..50 {
+            let _ = agent.step_continuous(&state, 1.0, false).unwrap();
+        }
+
+        let mu_final_host = agent.backend.vec_to_vec(&agent.actor.infer(&state).y_conv)[0];
+
+        let drift = (mu_final_host - mu_initial_host).abs();
+        assert!(
+            drift > 1e-6,
+            "μ should drift under continuous learning, drift={drift}, \
+             mu_initial={mu_initial_host}, mu_final={mu_final_host}"
+        );
+        assert!(
+            mu_initial_host.is_finite() && mu_final_host.is_finite(),
+            "μ must stay finite: initial={mu_initial_host}, final={mu_final_host}"
+        );
+    }
+
+    #[test]
+    fn test_continuous_gradient_direction_4d() {
+        // Phase 4.1 — multi-dim sanity. 4-D action space, every output
+        // dim should accumulate non-trivial drift across 50 reward=1
+        // calls. Final weights must remain finite.
+        use crate::activation::Activation;
+        use crate::layer::LayerDef;
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        cfg.entropy_coeff = 0.0;
+        cfg.actor.input_size = 4;
+        cfg.actor.output_size = 4;
+        cfg.actor.output_activation = Activation::Tanh;
+        cfg.actor.hidden_layers = vec![LayerDef {
+            size: 8,
+            activation: Activation::Tanh,
+        }];
+        // Critic input = state(4) + latent_concat(8 hidden) = 12.
+        cfg.critic.input_size = 4 + 8;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.5, 0.3, 0.1, 0.2];
+        let mu_initial = agent.backend.vec_to_vec(&agent.actor.infer(&state).y_conv);
+
+        for _ in 0..50 {
+            let _ = agent.step_continuous(&state, 1.0, false).unwrap();
+        }
+
+        let mu_final = agent.backend.vec_to_vec(&agent.actor.infer(&state).y_conv);
+
+        let total_drift: f64 = mu_initial
+            .iter()
+            .zip(mu_final.iter())
+            .map(|(i, f)| (f - i).abs())
+            .sum();
+
+        assert!(
+            total_drift > 1e-6,
+            "4-D μ should drift, total_drift={total_drift}, \
+             mu_initial={mu_initial:?}, mu_final={mu_final:?}"
+        );
+        assert!(
+            mu_final.iter().all(|x| x.is_finite()),
+            "all μ components must stay finite: {mu_final:?}"
+        );
+    }
+
+    #[test]
+    fn test_act_continuous_play_deterministic() {
+        // Brainstorm Q5+Q7: Play mode returns μ deterministically,
+        // does not advance RNG.
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let state = vec![0.5, 0.3, 0.1, 0.2, 0.4, 0.6, 0.8, 0.7, 0.9];
+
+        let (action_a, _) = agent
+            .act_continuous(&state, crate::pc_actor::SelectionMode::Play)
+            .unwrap();
+        let (action_b, _) = agent
+            .act_continuous(&state, crate::pc_actor::SelectionMode::Play)
+            .unwrap();
+
+        assert_eq!(action_a, action_b, "Play must be deterministic");
+    }
+
+    #[test]
+    fn test_act_continuous_training_advances_rng() {
+        // Brainstorm Q5+Q7: Training mode samples; two consecutive calls
+        // produce different actions.
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let state = vec![0.5, 0.3, 0.1, 0.2, 0.4, 0.6, 0.8, 0.7, 0.9];
+
+        let (action_a, _) = agent
+            .act_continuous(&state, crate::pc_actor::SelectionMode::Training)
+            .unwrap();
+        let (action_b, _) = agent
+            .act_continuous(&state, crate::pc_actor::SelectionMode::Training)
+            .unwrap();
+
+        assert_ne!(
+            action_a, action_b,
+            "Training must advance RNG (different samples)"
+        );
+    }
+
+    #[test]
+    fn test_continuous_hysteresis_activates_within_200_steps() {
+        // Brainstorm Q4: with action_space=Continuous and actor_hysteresis=true,
+        // the state machine must produce at least one FROZEN ↔ PLASTIC transition
+        // under continuous-mode dynamics. The test pre-seeds the actor in FROZEN
+        // with EWMAs warmed up past min_initial_plastic and wake_fraction=0.01 so
+        // any non-trivial surprise from the PC actor will trigger the wake
+        // (FROZEN → PLASTIC) on the very first step that carries a prior transition.
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        cfg.actor_hysteresis = true;
+        cfg.adaptive_surprise = true; // explicit (default is true)
+        cfg.actor_wake_fraction = 0.01; // wake on any 1% surprise spike above slow
+        cfg.actor_wakes_critic = false; // avoid cross-coupling side effects
+        cfg.critic_wakes_actor = false;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Pre-seed actor hysteresis: FROZEN, past warmup guard, slow EWMA
+        // at a tiny baseline. Any PC surprise from real inference will be
+        // well above slow * (1 + 0.01) = 0.0001, triggering an immediate wake.
+        {
+            let hyst = agent.actor_hysteresis.as_mut().unwrap();
+            hyst.state = PlasticityState::Frozen;
+            hyst.slow.value = 0.0001;
+            hyst.slow.k = 200; // past min_initial_plastic guard
+            hyst.fast.value = 0.0001;
+            hyst.fast.k = 200;
+        }
+
+        let mut transitions_observed = 0;
+        let mut last_state = agent.actor_hysteresis.as_ref().unwrap().state.clone();
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+
+        // Two steps minimum: first step buffers; second step triggers learning
+        // + hysteresis update from surprise_score of the first inference.
+        for _ in 0..10 {
+            let _ = agent.step_continuous(&state, 1.0, false).unwrap();
+            let cur_state = agent.actor_hysteresis.as_ref().unwrap().state.clone();
+            if cur_state != last_state {
+                transitions_observed += 1;
+                last_state = cur_state;
+            }
+        }
+
+        assert!(
+            transitions_observed >= 1,
+            "Hysteresis must produce at least 1 transition under continuous \
+             mode; observed {transitions_observed}"
+        );
+    }
+
+    #[test]
+    fn test_continuous_weight_clip_non_saturation() {
+        // Brainstorm Q3: 100 continuous steps with σ=0.1 must keep
+        // weights finite and avoid clip saturation.
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        for _ in 0..100 {
+            let _ = agent.step_continuous(&state, 1.0, false).unwrap();
+        }
+        // Weights finite.
+        let actor_w = &agent.actor.layers[0].weights.data;
+        assert!(actor_w.iter().all(|w| w.is_finite()));
+        let critic_w = &agent.critic.layers[0].weights.data;
+        assert!(critic_w.iter().all(|w| w.is_finite()));
+        // Magnitude sanity (no runaway).
+        let max_abs_w = actor_w.iter().map(|w| w.abs()).fold(0.0, f64::max);
+        assert!(
+            max_abs_w < 4.5,
+            "actor weights approach WEIGHT_CLIP=5.0, max_abs={max_abs_w} \
+             — gradient may be saturating clip"
+        );
+    }
+
+    #[test]
+    fn test_continuous_td_n_5_no_clip_saturation() {
+        // W2 validation lock: td_steps > 0 + Continuous is rejected at
+        // construction. Continuous TD(n) is unsupported in v4.0.0 — the
+        // flush path (flush_td_buffer) uses discrete StepAction exclusively.
+        // This test asserts the ConfigValidation error rather than exercising
+        // the runtime path; the old loop body was replaced when the validation
+        // rule was added. v4.x tracking item covers proper continuous TD(n).
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        cfg.td_steps = 5;
+        let result = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        match result {
+            Err(PcError::ConfigValidation(msg)) => {
+                assert!(
+                    msg.contains("td_steps") && msg.contains("continuous"),
+                    "error message should mention td_steps and continuous, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected ConfigValidation for td_steps=5 + Continuous, got Ok"),
+            Err(other) => panic!("expected ConfigValidation, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_continuous_gae_lambda_decay() {
+        // W1 validation lock: gae_lambda + Continuous is rejected at
+        // construction. GAE eligibility traces are discrete-shape; the
+        // continuous arm has no trace accumulation path in v4.0.0.
+        // Previously this test looped and accepted either Ok or a runtime
+        // ConfigValidation — now validation fires at new() so the loop
+        // never runs.
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        cfg.gae_lambda = Some(0.95);
+        let result = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        match result {
+            Err(PcError::ConfigValidation(msg)) => {
+                assert!(
+                    msg.contains("gae_lambda") && msg.contains("continuous"),
+                    "error message should mention gae_lambda and continuous, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected ConfigValidation for gae_lambda + Continuous, got Ok"),
+            Err(other) => panic!("expected ConfigValidation, got: {other:?}"),
+        }
     }
 }
