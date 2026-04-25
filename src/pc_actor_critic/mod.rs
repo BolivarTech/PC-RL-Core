@@ -657,6 +657,37 @@ impl<L: LinAlg> PcActorCritic<L> {
             ));
         }
 
+        // v4.0.0 — continuous-mode rules. Brainstorm Q1, spec §5.5, §6.
+        if config.action_space == ActionSpace::Continuous {
+            // policy_sigma must be > 0 and finite when continuous.
+            if !config.policy_sigma.is_finite() || config.policy_sigma <= 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "policy_sigma ({}) must be > 0 and finite when \
+                     action_space == Continuous. Got {}.",
+                    config.policy_sigma, config.policy_sigma
+                )));
+            }
+            // KL distillation is undefined for raw continuous output.
+            if config.distillation_lambda_polyak > 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "distillation_lambda_polyak ({}) is not supported in \
+                     continuous action space (KL is undefined for raw \
+                     output). Set to 0.0 or use ActionSpace::Discrete.",
+                    config.distillation_lambda_polyak
+                )));
+            }
+            if config.distillation_lambda_frozen > 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "distillation_lambda_frozen ({}) is not supported in \
+                     continuous action space — same reason as Polyak.",
+                    config.distillation_lambda_frozen
+                )));
+            }
+            // entropy_coeff > 0 is silently inert in continuous (fixed-σ
+            // Gaussian → entropy gradient is constant). Brainstorm Q3 /
+            // spec §4.3: NO rejection here.
+        }
+
         // Tolerance-based sentinel check + NaN/Infinity rejection + upper bound
         // per MAGI Melchior + Caspar Checkpoint 2 iter 2 hardening requirement.
         // The actor and critic replay-floor fields share the same tri-state
@@ -12290,7 +12321,6 @@ mod tests {
     // ── v4.0.0 continuous-mode validation rules ───────────────────────
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 1.3 validation rule"]
     fn test_continuous_with_invalid_sigma_rejected() {
         // Brainstorm Q1/spec §6: continuous mode requires policy_sigma > 0
         // and finite. NaN/Inf/<=0 must be rejected at construction.
@@ -12322,7 +12352,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 1.3 validation rule"]
     fn test_continuous_with_polyak_distillation_rejected() {
         // Brainstorm/spec §5.5: KL is undefined for raw continuous output.
         // distillation_lambda_polyak > 0 in Continuous mode → reject.
@@ -12342,7 +12371,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 1.3 validation rule"]
     fn test_continuous_with_frozen_distillation_rejected() {
         let mut cfg = default_config();
         cfg.action_space = ActionSpace::Continuous;
@@ -12360,7 +12388,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 1.3 validation rule"]
     fn test_continuous_with_valid_config_accepted() {
         // Smoke: continuous + sigma=0.1 + distillation off + entropy=0
         // must construct without error.
