@@ -157,13 +157,42 @@ impl ReplayBuffer {
     /// `false` → `recent_memories`. Applies the `positive_only` filter and
     /// evicts the oldest entry when the target compartment is at capacity.
     ///
-    /// Phase 2.2 will add cross-mode contamination validation here.
-    /// For now the method always returns `Ok(())`.
+    /// # Validation (Phase 2.2)
+    ///
+    /// Two invariants are enforced before any routing logic:
+    ///
+    /// 1. **Cross-mode contamination** (Brainstorm Q2): the `action` variant
+    ///    must match the buffer's `action_space`. A `Continuous` action pushed
+    ///    into a `Discrete` buffer (and vice-versa) is rejected.
+    /// 2. **valid_actions ↔ Action variant** (Brainstorm Q8):
+    ///    `valid_actions` must be `Some(_)` for `Action::Discrete` and
+    ///    `None` for `Action::Continuous`.
     ///
     /// # Errors
     ///
-    /// Returns `Err` when cross-mode contamination is detected (Phase 2.2).
+    /// Returns [`crate::error::PcError::ConfigValidation`] when either
+    /// invariant is violated.
     pub fn push(&mut self, transition: ReplayTransition) -> Result<(), crate::error::PcError> {
+        // Brainstorm Q2: cross-mode contamination check.
+        if !transition.action.matches_space(self.action_space) {
+            return Err(crate::error::PcError::ConfigValidation(format!(
+                "transition action variant does not match buffer's \
+                 action_space {:?}. Cross-mode buffer contamination is rejected.",
+                self.action_space
+            )));
+        }
+        // valid_actions ↔ Action variant invariant (Brainstorm Q8).
+        let consistency_ok = matches!(
+            (&transition.action, &transition.valid_actions),
+            (Action::Discrete(_), Some(_)) | (Action::Continuous(_), None)
+        );
+        if !consistency_ok {
+            return Err(crate::error::PcError::ConfigValidation(
+                "valid_actions must be Some(_) for Action::Discrete and None \
+                 for Action::Continuous"
+                    .into(),
+            ));
+        }
         // positive_only filter: silently drop non-positive rewards.
         if self.positive_only && transition.reward <= 0.0 {
             return Ok(());
@@ -485,7 +514,6 @@ mod tests {
     // ── v4.0.0 Action enum + cross-mode validation tests ────────────────
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 2.2 push validation"]
     fn test_push_rejects_cross_mode_continuous_into_discrete_buffer() {
         use crate::pc_actor_critic::ActionSpace;
         let mut buffer = ReplayBuffer::new(10, 0, false, ActionSpace::Discrete);
@@ -505,7 +533,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 2.2 push validation"]
     fn test_push_rejects_discrete_into_continuous_buffer() {
         use crate::pc_actor_critic::ActionSpace;
         let mut buffer = ReplayBuffer::new(10, 0, false, ActionSpace::Continuous);
@@ -522,7 +549,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 2.2 push validation"]
     fn test_push_rejects_valid_actions_mismatch() {
         // Discrete transition with valid_actions = None must reject.
         use crate::pc_actor_critic::ActionSpace;
@@ -540,7 +566,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 2.2 push validation"]
     fn test_push_accepts_consistent_discrete() {
         use crate::pc_actor_critic::ActionSpace;
         let mut buffer = ReplayBuffer::new(10, 0, false, ActionSpace::Discrete);
@@ -556,7 +581,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v4.0.0 Phase 2.2 push validation"]
     fn test_push_accepts_consistent_continuous() {
         use crate::pc_actor_critic::ActionSpace;
         let mut buffer = ReplayBuffer::new(10, 0, false, ActionSpace::Continuous);
