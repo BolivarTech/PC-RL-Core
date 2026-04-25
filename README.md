@@ -207,7 +207,7 @@ also enables Polyak and Frozen KL anchor gradients in the replay
 update. This is a consumer decision — trading hysteresis
 protection for replay efficacy.
 
-> ⚠ **Forward-compatibility notice for v3.0.0 migration.** The
+> **NOTE — Forward-compatibility for v3.0.0 migration.** The
 > next major release will introduce `critic_floor_replay` as a
 > parallel knob for the critic side (currently not gated by
 > hysteresis). If you set `scale_floor_replay > 0` in v2.2.1,
