@@ -275,20 +275,41 @@ The discrete and continuous flows are surfaced as **separate methods**
 on `PcActorCritic`. No runtime dispatch on a generic `step()`. Type
 safety: the consumer's call site reflects the action space.
 
+**Brainstorm decision (Q5+Q7):** `act_continuous` mirrors the discrete
+`act` API exactly, taking a `SelectionMode` parameter. `Play` returns
+deterministic μ (no RNG advance); `Training` returns sampled
+`μ + σ·ε` (RNG advances).
+
+**Brainstorm decision (Q6):** every entry-point method does a
+runtime hard-error precondition check on `config.action_space`. Cost
+is ~1ns (one enum comparison) per call — strictly trivial vs the PC
+inference loop. Aligns with the CLAUDE.md global "no silent failures"
+rule. Symmetric across `step_masked`, `step_continuous`, `act`, and
+`act_continuous`.
+
 Discrete (compatible with v3.x — only the precondition changes):
 
 ```rust
 impl<L: LinAlg> PcActorCritic<L> {
     /// Discrete-mode step. Same shape as v3.x `step_masked`.
     /// **Precondition:** `config.action_space == ActionSpace::Discrete`.
-    /// Violation returns `PcError::ConfigValidation`.
+    /// Returns `PcError::ConfigValidation` on mismatch (loud, not silent).
     pub fn step_masked(
         &mut self,
         state: &[f64],
         valid_actions: &[usize],
         reward: f64,
         done: bool,
-    ) -> Result<usize, PcError> { /* unchanged behavior */ }
+    ) -> Result<usize, PcError> { /* unchanged behavior + precondition guard */ }
+
+    /// Discrete-mode inference. Same shape as v3.x `act`.
+    /// **Precondition:** `config.action_space == ActionSpace::Discrete`.
+    pub fn act(
+        &mut self,
+        state: &[f64],
+        valid_actions: &[usize],
+        mode: SelectionMode,
+    ) -> Result<(usize, InferResult<L>), PcError>;
 }
 ```
 
@@ -299,7 +320,8 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// Continuous-mode step. Returns the sampled action vector
     /// `a = μ(s) + σ·ε` of length `actor.output_size`.
     /// **Precondition:** `config.action_space == ActionSpace::Continuous`.
-    /// Violation returns `PcError::ConfigValidation`.
+    /// Always samples (Training mode is implicit — `step_*` paths are
+    /// learning paths, never deterministic).
     pub fn step_continuous(
         &mut self,
         state: &[f64],
@@ -308,9 +330,10 @@ impl<L: LinAlg> PcActorCritic<L> {
     ) -> Result<Vec<f64>, PcError>;
 
     /// Same as `step_continuous` but returns the device-native vector
-    /// without host transfer. Zero-copy on backends where the actor
-    /// computes natively in device memory (GpuLinAlg). Identical
-    /// behavior to `step_continuous` on CpuLinAlg.
+    /// without host transfer. Forward-compat hook for GpuLinAlg
+    /// (Phase 2). On `CpuLinAlg`, `L::Vector = Vec<f64>` so this is
+    /// bit-equivalent to `step_continuous`. May be deferred to v4.x
+    /// minor if it complicates the CPU-only path during implementation.
     pub fn step_continuous_raw_device(
         &mut self,
         state: &[f64],
@@ -318,10 +341,16 @@ impl<L: LinAlg> PcActorCritic<L> {
         done: bool,
     ) -> Result<L::Vector, PcError>;
 
-    /// Inference-only continuous output (no gradient, no learning).
-    /// Returns the policy mean μ(s); sampling is the consumer's choice
-    /// when bypassing `step_continuous`.
-    pub fn act_continuous(&mut self, state: &[f64]) -> Vec<f64>;
+    /// Inference-only continuous output. Mirrors discrete `act` ergonomics.
+    /// `Play` mode returns the policy mean μ(s) deterministically (no
+    /// RNG advance). `Training` mode returns `μ + σ·ε` (RNG advances).
+    /// Returns `(action_vec, InferResult<L>)` paralleling discrete `act`.
+    /// **Precondition:** `config.action_space == ActionSpace::Continuous`.
+    pub fn act_continuous(
+        &mut self,
+        state: &[f64],
+        mode: SelectionMode,
+    ) -> Result<(Vec<f64>, InferResult<L>), PcError>;
 }
 ```
 
@@ -329,6 +358,15 @@ The deprecated `step` (without mask) is removed in v4.0.0 — its
 discrete-only semantics conflict with the multi-mode design. Migration
 path: replace `step` with `step_masked` (already available since
 v2.0.0).
+
+The deprecated `learn(trajectory)` is **kept** in v4.0.0 with a
+Discrete-only validation guard (per brainstorm Q7 / item 7). Continuous
+trajectory learning is not supported in v4.0.0; consumers using
+continuous mode must use `step_continuous` in a loop. `learn()` and
+`TrajectoryStep` are scheduled for proper audit-and-removal in v5.0.0.
+Note that `learn()` return type bumps to `Result<f64, PcError>` (was
+`f64`) to surface the new precondition error — a sub-breaking change
+already absorbed by v4.0.0 BREAKING.
 
 ### 5.3 Policy gradient — the only gradient-path change
 
@@ -399,11 +437,34 @@ pub(crate) struct LearnStep<'a, L: LinAlg> {
 
 ### 5.4 Replay buffer schema migration
 
+**Brainstorm decisions (Q1, Q2, Q8):**
+
+- **Q1 — `Action` enum is `#[serde(untagged)]`.** JSON token-type
+  unambiguously discriminates: integer → `Discrete(usize)`, array →
+  `Continuous(Vec<f64>)`. v3.x JSON `"action": 5` deserializes to
+  `Action::Discrete(5)` automatically without any custom impl.
+- **Q2 — Cross-mode contamination is rejected at `push` time.** Buffer
+  stores its `action_space` (or derives from config); pushing an
+  `Action::Continuous(_)` into a `Discrete`-configured buffer (or vice
+  versa) returns `PcError::ConfigValidation`. `load_agent` extends the
+  same validation — buffer schema must match the loaded config's
+  `action_space`, else load fails loudly.
+- **Q8 — `valid_actions: Option<Vec<usize>>` uses plain
+  `#[serde(default)]`.** No custom `deserialize_with` needed; serde
+  automatically wraps v3.x bare `[0, 1, 2]` into `Some([0, 1, 2])` via
+  Some-elision. Validation enforces the `is_some() iff Discrete`
+  invariant in `push`.
+
 ```rust
 /// v4.0.0 — generic action variant. Replaces `action: usize`.
+/// `#[serde(untagged)]` is binding per brainstorm Q1; do not change
+/// without a fresh ABI migration plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum Action {
+    /// JSON form: bare integer (e.g. `5`). Compatible with v3.x.
     Discrete(usize),
+    /// JSON form: bare array of f64 (e.g. `[0.1, 0.7, -0.3]`).
     Continuous(Vec<f64>),
 }
 
@@ -414,14 +475,37 @@ pub struct ReplayTransition {
     pub reward: f64,
     pub next_state: Vec<f64>,
     pub done: bool,
-    pub valid_actions: Option<Vec<usize>>,   // <-- Some(...) only for Action::Discrete
+    /// Some(mask) iff Discrete; None for Continuous (mask concept N/A).
+    /// `#[serde(default)]` covers all three v3.x → v4 migration cases:
+    ///   * legacy bare `[0,1,2]` → `Some([0,1,2])` via serde Some-elision
+    ///   * v4 explicit `null`     → `None`
+    ///   * v4 absent (continuous) → `None` via default
+    /// **Brainstorm Q8:** no custom `deserialize_with` is needed — empirically
+    /// verified that serde's Some-elision handles the legacy form natively.
+    #[serde(default)]
+    pub valid_actions: Option<Vec<usize>>,
 }
 ```
 
-The `valid_actions` field becomes `Option<Vec<usize>>` because it
-genuinely doesn't apply in the continuous case. Validation rule:
-`action == Action::Discrete(_) <=> valid_actions.is_some()`. Mismatch
-rejected at `replay_buffer.push` time with `PcError::ConfigValidation`.
+Validation rule (enforced at `replay_buffer.push`):
+
+```rust
+match (&transition.action, &transition.valid_actions) {
+    (Action::Discrete(_),   Some(_)) => Ok(()),
+    (Action::Continuous(_), None)    => Ok(()),
+    _ => Err(PcError::ConfigValidation(
+        "valid_actions must be Some for Discrete and None for Continuous".into(),
+    )),
+}
+```
+
+Cross-mode buffer protection (per brainstorm Q2): `replay_buffer.push`
+also validates `transition.action` matches the buffer's
+`action_space`, derived from the agent's `config.action_space` at
+construction. `load_agent` validates `loaded_buffer.action_space ==
+loaded_config.action_space`; mismatch returns
+`PcError::ConfigValidation` with explicit guidance to either restore
+matching config or clear the buffer before reload.
 
 ### 5.5 Distillation interaction (Polyak / Frozen anchors)
 
@@ -489,9 +573,41 @@ state.
 
 ### 5.8 Hysteresis & cross-wake
 
-Unchanged. Hysteresis is driven by PC surprise (RMS prediction error
-across layers) — independent of how `y_conv` is interpreted
-downstream.
+Hysteresis state-machine **mechanism** is unchanged. Both signals are
+action-space agnostic:
+- **Actor signal:** PC surprise score (RMS prediction error across PC
+  layers) — depends only on inference convergence dynamics, not on
+  output interpretation.
+- **Critic signal:** `|td_error|` magnitude — reward-space, not
+  action-space.
+
+**Brainstorm Q4 — continuous-mode operational note:** The empirical
+distribution of `td_error` may shift in continuous mode because the
+Gaussian-policy gradient form changes weight-update dynamics. The
+`adaptive_surprise = true` default (introduced in v2.1.0) recalibrates
+the FROZEN/PLASTIC thresholds dynamically from the observed
+`td_error_buffer` (mean ± std), absorbing this distribution shift
+without consumer intervention.
+
+If hysteresis behaves unexpectedly under continuous (frequent
+oscillation, never freezing, never thawing):
+
+1. Verify `adaptive_surprise = true` (v3.x default; check that you
+   haven't disabled it).
+2. If still problematic, manually tune `surprise_low` /
+   `surprise_high` against observed `td_error` magnitudes.
+3. As a last resort, disable hysteresis (`actor_hysteresis = false` /
+   `critic_hysteresis = false`) — recall this also disables the v3.0.0
+   self-recovery toolkit.
+
+A smoke test in Phase 4 verifies that under
+`action_space = Continuous` + `adaptive_surprise = true` +
+`actor_hysteresis = true`, at least one FROZEN ↔ PLASTIC transition is
+observed within 200 step calls (confirms the state machine activates
+under continuous-mode dynamics).
+
+Cross-wake coupling thresholds and force-transition logic are
+unchanged.
 
 ### 5.9 What does NOT change
 
@@ -504,6 +620,37 @@ downstream.
 - GAE eligibility traces
 - Cross-wake coupling thresholds & state-machine transitions
 - Replay buffer dual-compartment FIFO + positive-reward filter
+
+### 5.10 Continuous-mode operational tuning (mitigation matrix)
+
+Per brainstorm Q3, GAE / TD(n) machinery works unchanged in continuous
+mode. The Gaussian-policy gradient `(a − μ) / σ²` has magnitude
+~`1/σ²` per output dim relative to the discrete REINFORCE form;
+WEIGHT_CLIP=5.0 and GRAD_CLIP=5.0 envelope the typical operating
+range for `σ ∈ [0.05, 1.0]`.
+
+If consumers observe pathological behavior in continuous mode, the
+following mitigations are recommended in priority order:
+
+| Symptom | Primary mitigation | Secondary | Tertiary |
+|---|---|---|---|
+| WEIGHT_CLIP saturation observed | ↑ `policy_sigma` (smaller gradient magnitude) | ↓ `lr_weights` | ↓ `td_steps` or ↓ GAE `λ` (faster trace decay) |
+| Slow learning / weights barely moving | ↓ `policy_sigma` (larger gradient signal) | ↑ `lr_weights` | Verify rewards are in `[-1, 1]` range |
+| Hysteresis oscillating (frequent FROZEN ↔ PLASTIC) | Confirm `adaptive_surprise = true` | Manually retune `surprise_low` / `surprise_high` | Disable hysteresis if exploring |
+| Hysteresis never freezing | Confirm `adaptive_surprise = true`; check `surprise_low` not too low | ↑ `actor_sleep_fraction` / `critic_sleep_fraction` | — |
+| Polyak/Frozen distillation rejected at construction | Set `distillation_lambda_polyak = 0.0` and `distillation_lambda_frozen = 0.0` (continuous mode requirement, §5.5) | — | — |
+
+Telemetry for empirical diagnosis (already exposed in v3.x):
+- `replay_clamp_count` — increments when the critic's td_error clamp
+  fires; sustained increase signals magnitude problems.
+- `actor_frozen_steps` / `critic_frozen_steps` — visibility into
+  hysteresis duty cycle.
+- `td_error_buffer` — adaptive surprise reads this; a scripted dump
+  reveals the magnitude distribution.
+
+The CHANGELOG `[4.0.0]` entry must include this mitigation matrix
+verbatim — consumers adopting continuous mode need it as a first-line
+reference.
 
 ---
 
@@ -556,13 +703,17 @@ pub fn step_continuous(&mut self, state: &[f64], reward: f64, done: bool)
 pub fn step_continuous_raw_device(&mut self, state: &[f64], reward: f64, done: bool)
     -> Result<L::Vector, PcError>;
 
-pub fn act_continuous(&mut self, state: &[f64]) -> Vec<f64>;
+// Per brainstorm Q5+Q7: mirrors discrete `act` with SelectionMode.
+// Play  → returns μ(s) deterministically (no RNG advance).
+// Train → returns μ + σ·ε (RNG advances).
+pub fn act_continuous(&mut self, state: &[f64], mode: SelectionMode)
+    -> Result<(Vec<f64>, InferResult<L>), PcError>;
 ```
 
 ### 7.2 Modified methods (discrete mode — existing API)
 
 ```rust
-// Precondition tightened: action_space must be Discrete.
+// Precondition tightened (Q6): runtime hard-error if action_space != Discrete.
 // Bit-equivalent behavior to v3.x when precondition holds.
 pub fn step_masked(&mut self, state, valid, reward, done)
     -> Result<usize, PcError>;
@@ -584,6 +735,12 @@ pub fn step(&mut self, state, reward, terminal) -> usize;
 ```rust
 pub fn replay_learn(&mut self, batch_size: usize) -> Result<(), PcError>;
 // Unchanged signature; internal dispatch on transition variant.
+// Buffer push validates Action variant matches buffer's action_space (Q2).
+
+// Per brainstorm Q7 / item 7: kept as deprecated, Discrete-only.
+// Return type bumps to Result<f64, PcError> for the precondition error.
+#[deprecated(since = "2.1.0", note = "use step_masked in a loop")]
+pub fn learn(&mut self, trajectory: &[TrajectoryStep<L>]) -> Result<f64, PcError>;
 ```
 
 ---
@@ -640,21 +797,28 @@ loop {
 ### 8.4 Replay save-file compatibility
 
 v3.x saves with `replay_buffer` populated use the legacy
-`action: usize` schema. v4.0.0 deserialization auto-converts to
-`Action::Discrete(usize)` via custom serde implementation:
+`action: usize` schema. v4.0.0 auto-converts via the `#[serde(untagged)]`
+discriminator on `Action` (Q1 brainstorm decision):
 
 ```rust
-impl<'de> Deserialize<'de> for Action {
-    fn deserialize<D>(de: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
-        // Try untagged v4 form first (Discrete | Continuous variant).
-        // Fall back to bare usize for v3.x compatibility.
-        // ... custom impl ...
-    }
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Action {
+    Discrete(usize),       // matches JSON integer (v3.x bare form)
+    Continuous(Vec<f64>),  // matches JSON array of floats (v4 only)
 }
 ```
 
-A serializer round-trip test locks this on a frozen v3.x JSON fixture.
+No custom `Deserialize` impl is needed — JSON token-type
+(`Number` vs `Array`) discriminates unambiguously between the two
+variants. A serializer round-trip test in Phase 2 locks this against
+a frozen v3.x JSON fixture (mirroring the v3.0.0 precedent
+`test_pre_v3_json_loads_with_default_critic_floor_replay`).
+
+The `valid_actions` field (now `Option<Vec<usize>>`) uses plain
+`#[serde(default)]` (Q8 brainstorm decision); serde's Some-elision
+wraps the legacy bare `[0, 1, 2]` form into `Some([0, 1, 2])`
+automatically — no custom `deserialize_with` needed.
 
 ---
 
@@ -663,25 +827,42 @@ A serializer round-trip test locks this on a frozen v3.x JSON fixture.
 This section is the input for `/deep-plan`. Five phases, lockstep
 RED → GREEN → REFACTOR cycles per CLAUDE.local.md §1.
 
-### Phase 1 — `ActionSpace` enum + config validation
+### Phase 1 — `ActionSpace` enum + config validation + symmetric preconditions
 
-**Scope:** Add the enum and `policy_sigma` to `PcActorCriticConfig`.
-Add validation rules (continuous + sigma, continuous + distillation,
-continuous + entropy-warn). No behavior change yet — `action_space`
-isn't consulted by any production path.
+**Scope:** Add `ActionSpace` enum and `policy_sigma` to
+`PcActorCriticConfig`. Validation rules:
+- continuous + `policy_sigma <= 0.0` or NaN/Inf → reject
+- continuous + `distillation_lambda_polyak > 0.0` → reject
+- continuous + `distillation_lambda_frozen > 0.0` → reject
+- continuous + `entropy_coeff > 0.0` → warn-only (no rejection)
 
-**Tests:** ~6 RED tests covering all validation rules + sentinel
-defaults + serde backward compat.
+Add the symmetric runtime precondition guard in the four entry points
+(per Q6): `step_masked`, `step_continuous`, `act`, `act_continuous`.
+The guards return `PcError::ConfigValidation` if `action_space`
+doesn't match the called method. `step_continuous` and
+`act_continuous` are stubs that return the error in this phase
+(real implementation lands Phase 4).
+
+**Tests:** ~8 RED tests covering all validation rules + sentinel
+defaults + serde backward compat + the four precondition guards.
 
 ### Phase 2 — `Action` enum + `ReplayTransition` schema migration
 
 **Scope:** Replace `ReplayTransition::action: usize` with
-`Action::Discrete | Continuous`. Custom serde Deserialize for legacy
-support. `valid_actions` becomes `Option<Vec<usize>>`.
+`#[serde(untagged)] Action::Discrete | Continuous`. Add the
+cross-mode `push` validation (Q2): the buffer rejects transitions
+whose `Action` variant doesn't match the buffer's `action_space`,
+and rejects transitions where `valid_actions.is_some() != is_discrete`.
+`load_agent` validates buffer-config consistency on load. No custom
+`Deserialize` impl needed — untagged + Some-elision suffice.
 
-**Tests:** ~5 RED tests. Includes a frozen v3.x JSON fixture
-deserialization round-trip (parallel to v3.0.0
-`test_pre_v3_json_loads_with_default_critic_floor_replay`).
+**Tests:** ~6 RED tests. Includes:
+- A frozen v3.x JSON fixture deserialization round-trip (parallel to
+  v3.0.0 `test_pre_v3_json_loads_with_default_critic_floor_replay`).
+- Cross-mode `push` rejection (Discrete buffer + Continuous transition
+  → error).
+- `load_agent` rejection on mismatched buffer schema.
+- Validation rule on `valid_actions` is_some() ↔ Discrete.
 
 ### Phase 3 — `LearnStep::action` variant + gradient dispatch
 
@@ -689,23 +870,40 @@ deserialization round-trip (parallel to v3.0.0
 with `StepAction` enum. Add the Gaussian-policy gradient branch in
 `learn_continuous_inner`. Discrete branch preserved bit-for-bit.
 
-**Tests:** ~8 RED tests. Includes a regression-equivalence test:
-v3.x discrete step_masked vs v4.0.0 discrete step_masked must produce
-bit-identical weight trajectories on a fixed seed.
+**Tests:** ~9 RED tests. Includes:
+- A 1-D hand-derivable gradient-direction test (R1 mitigation):
+  perturb `a` away from `μ`, check gradient direction is `(a − μ)/σ²`
+  and weight update direction multiplies advantage correctly.
+- Multi-dim (4-D) gradient direction sanity.
+- Discrete bit-equivalence: v3.x seeded run vs v4.0.0 Discrete seeded
+  run produces identical weight trajectories after N=100 steps.
+- TD(n=5) + Continuous + σ=0.1: weights remain finite, no clip
+  saturation > 5% over 100 steps (Q3 sanity).
+- GAE(λ=0.95) + Continuous: trace decay observed, weights remain
+  finite.
 
 ### Phase 4 — `step_continuous` / `step_continuous_raw_device` /
-`act_continuous` public API
+`act_continuous` public API + hysteresis smoke
 
-**Scope:** Wire the new public methods. Sample `a = μ + σ·ε` using the
-agent's RNG (deterministic under seed). Pre-condition checks
-(`action_space` must match the called API).
+**Scope:** Wire the public continuous methods. `step_continuous`
+samples `a = μ + σ·ε` using the agent's RNG (deterministic under
+seed). `act_continuous(state, mode)` returns `(action, InferResult)`:
+Play=μ, Training=μ+σ·ε. The precondition guards from Phase 1 graduate
+from stub-error to functional dispatch.
 
-**Tests:** ~7 RED tests. Includes:
+**Tests:** ~9 RED tests. Includes:
 - Continuous step on a 4-D action space sanity test.
-- Determinism under fixed seed.
-- Gradient direction correctness (perturb action away from μ, check
-  gradient pulls back proportional to advantage).
-- Pre-condition violation: `step_continuous` on Discrete agent rejected.
+- Determinism under fixed seed (two identical runs → identical action
+  sequences).
+- `act_continuous(_, Play)` reproducibility (no RNG advance, two
+  consecutive calls return identical μ).
+- `act_continuous(_, Training)` divergence (two consecutive calls
+  return different sampled actions).
+- Hysteresis smoke (Q4): `action_space=Continuous` +
+  `actor_hysteresis=true` + `adaptive_surprise=true` → at least one
+  FROZEN ↔ PLASTIC transition observed within 200 step calls.
+- WEIGHT_CLIP non-saturation (Q3): 100 continuous steps with σ=0.1,
+  clip-binding count remains under 5% of total updates.
 
 ### Phase 5 — Documentation & migration guide
 
@@ -721,14 +919,17 @@ doctests for `step_continuous` / `act_continuous` / `policy_sigma`.
 
 | # | Risk | Severity | Likelihood | Mitigation |
 |---|------|---------|------------|------------|
-| R1 | Continuous gradient direction wrong (sign, scale) | **High** | Medium | Phase 3 gradient-direction test on a hand-derivable 1-D example before any 2+ D test |
-| R2 | Replay schema migration breaks legacy save files | High | Low | Frozen v3.x fixture round-trip test in Phase 2; custom Deserialize fallback |
-| R3 | Distillation rejection breaks v3.x consumers who set `lambda_polyak > 0` and later flip to Continuous | Medium | Low | Validation error message points to the workaround (set lambda to 0); migration guide explicit |
+| R1 | Continuous gradient direction wrong (sign, scale) | **High** | Medium | Phase 3 hand-derivable 1-D gradient test before any multi-dim test |
+| R2 | Replay schema migration breaks legacy save files | High | Low | Frozen v3.x fixture round-trip in Phase 2. Untagged enum (Q1) + Some-elision (Q8) — no custom impl needed; failure surface is minimal |
+| R3 | Distillation rejection breaks v3.x consumers who set `lambda_polyak > 0` and later flip to Continuous | Medium | Low | Validation error message points to workaround (set lambda to 0); migration guide explicit. Self-recovery toolkit availability is documented as Discrete-only in v4.0.0 |
 | R4 | RNG sampling cost dominates step latency in continuous mode | Low | Medium | `policy_sigma * randn` is O(output_dim) per step — negligible for typical 4-32 output sizes; revisit if benchmarks show >5% overhead |
 | R5 | Fisher diagonal in continuous shows different convergence vs discrete (different `g_raw²` distribution) | Low | High (expected) | Document that continuous Fisher numbers are not directly comparable to discrete; existing Fisher tests cover the lifecycle, not absolute values |
 | R6 | `policy_sigma` is a fixed scalar; multi-dim actions with different scales (e.g. wheel torque + steering angle) get the same exploration noise | Medium | Medium | Document; recommend output normalization in the consumer's network. Per-dim sigma deferred to v5.0.0 (same scope as learned σ) |
-| R7 | GpuLinAlg interaction with `step_continuous_raw_device` adds host-device coupling | Medium | Low | Q1 decision (§4.1) carves the escape hatch deliberately; re-validate after GpuLinAlg lands |
+| R7 | GpuLinAlg interaction with `step_continuous_raw_device` adds host-device coupling | Low | Low | Q1 decision (§4.1) carves the escape hatch deliberately; CPU-first sequencing means GpuLinAlg arrives later and can validate against v4.0.0 contract |
 | R8 | Removal of `step()` (deprecated since v2.0.0) catches consumers who never migrated | Low | Low | CHANGELOG migration table shows the trivial replacement; deprecation warning has been on for 2+ major versions |
+| R9 | Hysteresis thresholds (`surprise_low`/`high`) tuned empirically for discrete may misbehave in continuous | Low | Medium | Brainstorm Q4 mitigation: `adaptive_surprise=true` (default) recalibrates thresholds dynamically. Phase 4 smoke test verifies state machine activates within 200 steps. Static-threshold consumers (`adaptive_surprise=false`) get a doc warning |
+| R10 | Cross-mode buffer contamination silently corrupts gradients | High | Low | Brainstorm Q2: strict reject in `replay_buffer.push` + `load_agent` validation. Phase 2 tests cover both rejection paths |
+| R11 | Consumer calls wrong entry-point method for their mode (e.g. `step_masked` on Continuous agent) | Medium | Medium | Brainstorm Q6: runtime hard-error on every call. ~1ns overhead. Loud failure with workaround in error message. Phase 1 tests cover all four guards |
 
 ---
 
@@ -763,9 +964,12 @@ v4.0.0 is a major bump per SemVer 2.0.0 because:
 2. **Changed return type:** `act()` returns `Result<...>` instead of
    `(usize, InferResult<L>)`. Pattern-match call sites must add `?`.
 3. **Changed replay schema:** `ReplayTransition::action: usize` becomes
-   `action: Action`. Save files are deserialization-compatible (custom
-   Deserialize handles the fallback), but any consumer that
-   pattern-matches on the field type breaks.
+   `action: Action` (`#[serde(untagged)]` enum, Q1 brainstorm decision).
+   v3.x save files deserialize automatically via JSON token-type
+   discrimination — no custom impl needed — but any consumer that
+   pattern-matches on the field type at compile time breaks.
+   `valid_actions` becomes `Option<Vec<usize>>`; v3.x's bare
+   `[0,1,2]` form auto-wraps to `Some([0,1,2])` via Some-elision (Q8).
 4. **Tightened preconditions:** existing `step_masked` now returns an
    error if `action_space != Discrete`. Behavior change in unchanged
    code if a v3.x consumer flips `action_space` to `Continuous` without
@@ -883,13 +1087,14 @@ Caspar (Critic) will likely emphasize:
 
 | Metric | Value |
 |--------|-------|
-| Total LOC code estimate | ~250 (config + ActionSpace + Action enum + dispatch + new public methods) |
-| Total LOC tests estimate | ~600 (5 phases × ~6 tests average + serde fixtures) |
-| Total LOC docs estimate | ~150 (CHANGELOG + README + rustdoc) |
-| Phases | 5 (config → replay → gradient → public API → docs) |
-| Open architectural questions | 0 (all 5 from v1 spec resolved in §4) |
+| Total LOC code estimate | ~280 (config + ActionSpace + Action enum + dispatch + 4 entry-point preconditions + new public methods) |
+| Total LOC tests estimate | ~700 (Phase 1: 8 + Phase 2: 6 + Phase 3: 9 + Phase 4: 9 + serde fixtures) |
+| Total LOC docs estimate | ~180 (CHANGELOG + README + rustdoc + mitigation matrix) |
+| Phases | 5 (config+preconditions → replay → gradient → public API+smoke → docs) |
+| Open architectural questions | 0 (all 5 from v1 spec resolved in §4 + 9 brainstorm items in §5/§9/§10) |
 | Backend dependency | **CpuLinAlg only** — no GPU required for spec, plan, implementation, or release |
 | Coordination dependencies | None blocking. GpuLinAlg Phase 2 (separate workstream) lands later as a backend enhancement; v4.0.0 surface is forward-compatible with it via §13.1 |
 | Release | v4.0.0 BREAKING per SemVer 2.0.0 |
 | Migration cost (typical discrete consumer) | 1-2 line changes (`act()` `?`, swap `step()` → `step_masked()`) |
 | Migration cost (continuous adopter) | new code path; no removal needed |
+| Brainstorm decisions locked | 9 items (§4 + §5.2/5.4/5.8/5.10 + §7 + §9 + §10) |
