@@ -13394,4 +13394,45 @@ mod tests {
             "drift sanity: {sum}"
         );
     }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 4.1 step_continuous body"]
+    fn test_continuous_gradient_direction_1d() {
+        // Hand-derivable test: 1-D action space, σ=0.1, advantage > 0.
+        // If we force `a > μ`, gradient pulls μ up. If `a < μ`, pulls down.
+        //
+        // Body lands in Phase 4.1 task that unignores this test.
+        let _ = "see Phase 4.1 implementation";
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 4.1 step_continuous body"]
+    fn test_continuous_gradient_direction_4d() {
+        // Multi-dim sanity. 4-D action space, force one dim above μ,
+        // others at μ. The above-μ dim should drift up; others stay put.
+        //
+        // Body lands in Phase 4.1 task that unignores this test.
+        let _ = "see Phase 4.1 implementation";
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 4.3 smoke test"]
+    fn test_continuous_td_n_5_no_clip_saturation() {
+        // Brainstorm Q3 sanity: with td_steps=5, σ=0.1, 100 steps
+        // continuous, observe weights remain finite and clip-binding
+        // count stays under 5% of total updates.
+        //
+        // Body lands in Phase 4.3 task that unignores this test.
+        let _ = "see Phase 4.3 implementation";
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 4.3 smoke test"]
+    fn test_continuous_gae_lambda_decay() {
+        // Brainstorm Q3 sanity: GAE λ=0.95 + Continuous, weights remain
+        // finite, trace decay observed.
+        //
+        // Body lands in Phase 4.3 task that unignores this test.
+        let _ = "see Phase 4.3 implementation";
+    }
 }
