@@ -463,6 +463,7 @@ mod tests {
     use crate::layer::LayerDef;
     use crate::mlp_critic::MlpCriticConfig;
     use crate::pc_actor::PcActorConfig;
+    use crate::pc_actor_critic::ActionSpace;
     use std::fs;
 
     fn default_config() -> PcActorCriticConfig {
@@ -538,6 +539,8 @@ mod tests {
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
             critic_floor_replay: -1.0,
+            action_space: ActionSpace::Discrete,
+            policy_sigma: 0.1,
         }
     }
 

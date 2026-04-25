@@ -20,6 +20,29 @@ use crate::pc_actor::PcActorConfig;
 /// noise.
 pub(crate) const SENTINEL_EPSILON: f64 = 1e-9;
 
+/// Action space discriminator (v4.0.0). Determines the policy gradient
+/// form, the public step API, and the replay buffer transition schema.
+///
+/// Brainstorm Q1: this enum is **not** directly serialized in
+/// `ReplayTransition::action` — that is a separate `Action` enum with
+/// `#[serde(untagged)]` representation. `ActionSpace` lives in config
+/// only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ActionSpace {
+    /// Discrete: actor logits → softmax → sample/argmax over a finite set.
+    /// REINFORCE policy gradient. v3.x default; preserved bit-for-bit.
+    #[default]
+    Discrete,
+    /// Continuous: actor output is the mean μ(s) of a fixed-σ Gaussian
+    /// policy. Sampled action `a = μ + σ·ε`, gradient `(a − μ) / σ²`.
+    Continuous,
+}
+
+/// Default `policy_sigma` for continuous Gaussian policy.
+fn default_policy_sigma() -> f64 {
+    0.1
+}
+
 /// Returns true when `value` matches the `-1.0` "opt-in not provided"
 /// sentinel within `SENTINEL_EPSILON` tolerance.
 ///
@@ -248,6 +271,7 @@ fn default_critic_floor_replay() -> f64 {
 /// use pc_rl_core::mlp_critic::MlpCriticConfig;
 /// use pc_rl_core::pc_actor::PcActorConfig;
 /// use pc_rl_core::pc_actor_critic::PcActorCriticConfig;
+/// use pc_rl_core::ActionSpace;
 ///
 /// let config = PcActorCriticConfig {
 ///     actor: PcActorConfig {
@@ -310,6 +334,8 @@ fn default_critic_floor_replay() -> f64 {
 ///     replay_batch_size: 64,
 ///     scale_floor_replay: -1.0,
 ///     critic_floor_replay: -1.0,
+///     action_space: ActionSpace::Discrete,
+///     policy_sigma: 0.1,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,6 +604,17 @@ pub struct PcActorCriticConfig {
     /// `apply_config` paths.
     #[serde(default = "default_critic_floor_replay")]
     pub critic_floor_replay: f64,
+    /// v4.0.0 — action space discriminator. Default `Discrete` preserves
+    /// v3.x behavior for save files written before this field existed.
+    /// Brainstorm Q1: see `Action` enum in replay.rs for the per-transition
+    /// representation.
+    #[serde(default)]
+    pub action_space: ActionSpace,
+    /// v4.0.0 — Gaussian policy std-dev for continuous mode. Ignored when
+    /// `action_space == Discrete`. Must be `> 0.0 && finite` when continuous.
+    /// Default 0.1.
+    #[serde(default = "default_policy_sigma")]
+    pub policy_sigma: f64,
 }
 
 #[cfg(test)]
@@ -665,6 +702,8 @@ mod tests {
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
             critic_floor_replay: -1.0,
+            action_space: ActionSpace::Discrete,
+            policy_sigma: 0.1,
         }
     }
 
@@ -706,6 +745,29 @@ mod tests {
         assert!(
             is_replay_floor_sentinel(default_critic_floor_replay()),
             "default_critic_floor_replay() must return -1.0 sentinel"
+        );
+    }
+
+    #[test]
+    fn test_action_space_default_is_discrete() {
+        // Brainstorm Q1: default Discrete preserves v3.x behavior bit-for-bit
+        // when consumers don't set the field explicitly.
+        let cfg = base_config();
+        assert_eq!(cfg.action_space, ActionSpace::Discrete);
+        assert_eq!(ActionSpace::default(), ActionSpace::Discrete);
+    }
+
+    #[test]
+    fn test_policy_sigma_default_is_0_1() {
+        let cfg = base_config();
+        assert!(
+            (cfg.policy_sigma - 0.1).abs() < 1e-12,
+            "default policy_sigma must be 0.1, got {}",
+            cfg.policy_sigma
+        );
+        assert!(
+            (default_policy_sigma() - 0.1).abs() < 1e-12,
+            "default_policy_sigma() helper must return 0.1"
         );
     }
 

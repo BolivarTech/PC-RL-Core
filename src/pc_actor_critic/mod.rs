@@ -3753,6 +3753,8 @@ mod tests {
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
             critic_floor_replay: -1.0,
+            action_space: ActionSpace::Discrete,
+            policy_sigma: 0.1,
         }
     }
 
@@ -4251,6 +4253,8 @@ mod tests {
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
             critic_floor_replay: -1.0,
+            action_space: ActionSpace::Discrete,
+            policy_sigma: 0.1,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -5455,6 +5459,8 @@ mod tests {
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
             critic_floor_replay: -1.0,
+            action_space: ActionSpace::Discrete,
+            policy_sigma: 0.1,
         }
     }
 
