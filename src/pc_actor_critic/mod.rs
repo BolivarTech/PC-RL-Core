@@ -1865,22 +1865,6 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// commit does not break the internal call sites. Callers that
     /// don't care about the loss can bind via `let _ = inner(&step)?;`.
     fn learn_continuous_inner(&mut self, step: &LearnStep<'_, L>) -> Result<f64, PcError> {
-        // Dispatch on action variant. Continuous gradient implementation
-        // lands in Phase 3.3; return a stub error for now so the Discrete
-        // path compiles and is locked by the bit-equivalence regression test.
-        let (action_idx, valid_actions) = match step.action {
-            StepAction::Discrete {
-                action,
-                valid_actions,
-            } => (action, valid_actions),
-            StepAction::Continuous { .. } => {
-                return Err(PcError::ConfigValidation(
-                    "Continuous gradient dispatch lands in v4.0.0 Phase 3.3 (currently a stub)"
-                        .into(),
-                ));
-            }
-        };
-
         // Replay mode skips online-state side effects because replay batches
         // are off-policy and must not contaminate GAE traces, the cooldown
         // counter, the td_error buffer, or the Fisher diagonal estimate
@@ -1961,103 +1945,204 @@ impl<L: LinAlg> PcActorCritic<L> {
             &self.critic_decay_factors,
         );
 
-        // Policy gradient (same formula as learn, but scaled by td_error)
+        // Policy gradient — dispatch on action space (v4.0.0 Phase 3.3).
+        //
+        // Sign convention: `update_weights` performs descent
+        // `θ ← θ − lr · ∂loss/∂θ`, so `delta` MUST be the descent
+        // direction (the gradient of `−advantage · log π`).
+        //
+        // Discrete path: REINFORCE with masked softmax.
+        //   ∂(−log π_a)/∂logit = π − one_hot(a)
+        //   delta = td_error · (π − one_hot(a)), plus entropy reg.
+        //   GAE eligibility trace lives here.
+        //
+        // Continuous path: Gaussian-policy log-likelihood gradient.
+        //   ∂(−log π)/∂μ = (μ − a) / σ²
+        //   delta_j = td_error · (μ_j − a_taken_j) / σ²
+        //   Per brainstorm Q3 / spec §4.3, fixed-σ Gaussian entropy is
+        //   constant w.r.t. policy parameters → entropy gradient = 0;
+        //   skip the entropy term entirely.
         let y_conv_vec = self.backend.vec_to_vec(&step.infer.y_conv);
-        let scaled: Vec<f64> = y_conv_vec
-            .iter()
-            .map(|&v| v / self.actor.config.temperature)
-            .collect();
-        let scaled_l = self.backend.vec_from_slice(&scaled);
-        let pi_l = self.backend.softmax_masked(&scaled_l, valid_actions);
-        let pi = self.backend.vec_to_vec(&pi_l);
-
-        // --- GAE(λ) eligibility trace path ---
-        if let Some(lambda) = self.config.gae_lambda {
-            // GAE and td_steps are mutually exclusive (validated at construction).
-            debug_assert!(
-                self.td_buffer.is_empty(),
-                "GAE and td_steps are mutually exclusive"
-            );
-            // Gradient direction WITHOUT td_error scaling
-            let mut grad_direction = vec![0.0; pi.len()];
-            for &i in valid_actions {
-                grad_direction[i] = pi[i];
-            }
-            grad_direction[action_idx] -= 1.0;
-
-            // Trace update: online-only. Replay batches must not pollute
-            // the on-policy eligibility trace.
-            if is_online {
-                let gamma_lambda = self.config.gamma * lambda;
-                for v in &mut self.actor_trace {
-                    *v *= gamma_lambda;
-                }
-                for (i, &g) in grad_direction.iter().enumerate() {
-                    self.actor_trace[i] += g;
-                }
-                for v in &mut self.actor_trace {
-                    *v = v.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
-                }
-            }
-
-            // Effective delta. For Online we scale the (just-updated) trace
-            // by td_error (standard GAE). For Replay we fall back to the
-            // plain policy-gradient direction so the off-policy update still
-            // improves the policy without touching the on-policy trace.
-            let mut delta: Vec<f64> = if is_online {
-                self.actor_trace.iter().map(|&t| td_error * t).collect()
-            } else {
-                grad_direction.iter().map(|&g| td_error * g).collect()
-            };
-
-            // Entropy regularization per-step (not accumulated in trace)
-            for &i in valid_actions {
-                let log_pi = (pi[i].max(1e-10)).ln();
-                delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
-            }
-
-            // Use shared bookkeeping
-            return Ok(self.apply_actor_update_and_bookkeeping(
-                &delta,
-                step.infer,
-                step.state,
-                &y_conv_vec,
+        match step.action {
+            StepAction::Discrete {
+                action: action_idx,
                 valid_actions,
-                action_idx,
-                td_error,
-                loss,
-                step.mode,
-            ));
-        }
+            } => {
+                let scaled: Vec<f64> = y_conv_vec
+                    .iter()
+                    .map(|&v| v / self.actor.config.temperature)
+                    .collect();
+                let scaled_l = self.backend.vec_from_slice(&scaled);
+                let pi_l = self.backend.softmax_masked(&scaled_l, valid_actions);
+                let pi = self.backend.vec_to_vec(&pi_l);
 
-        // --- Standard TD(0)/TD(n) path continues below ---
-        let mut delta = vec![0.0; pi.len()];
-        for &i in valid_actions {
-            delta[i] = pi[i];
-        }
-        delta[action_idx] -= 1.0;
+                // --- GAE(λ) eligibility trace path ---
+                if let Some(lambda) = self.config.gae_lambda {
+                    // GAE and td_steps are mutually exclusive (validated at construction).
+                    debug_assert!(
+                        self.td_buffer.is_empty(),
+                        "GAE and td_steps are mutually exclusive"
+                    );
+                    // Gradient direction WITHOUT td_error scaling
+                    let mut grad_direction = vec![0.0; pi.len()];
+                    for &i in valid_actions {
+                        grad_direction[i] = pi[i];
+                    }
+                    grad_direction[action_idx] -= 1.0;
 
-        for &i in valid_actions {
-            delta[i] *= td_error;
-        }
+                    // Trace update: online-only. Replay batches must not pollute
+                    // the on-policy eligibility trace.
+                    if is_online {
+                        let gamma_lambda = self.config.gamma * lambda;
+                        for v in &mut self.actor_trace {
+                            *v *= gamma_lambda;
+                        }
+                        for (i, &g) in grad_direction.iter().enumerate() {
+                            self.actor_trace[i] += g;
+                        }
+                        for v in &mut self.actor_trace {
+                            *v = v.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
+                        }
+                    }
 
-        // Entropy regularization
-        for &i in valid_actions {
-            let log_pi = (pi[i].max(1e-10)).ln();
-            delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
-        }
+                    // Effective delta. For Online we scale the (just-updated) trace
+                    // by td_error (standard GAE). For Replay we fall back to the
+                    // plain policy-gradient direction so the off-policy update still
+                    // improves the policy without touching the on-policy trace.
+                    let mut delta: Vec<f64> = if is_online {
+                        self.actor_trace.iter().map(|&t| td_error * t).collect()
+                    } else {
+                        grad_direction.iter().map(|&g| td_error * g).collect()
+                    };
 
-        Ok(self.apply_actor_update_and_bookkeeping(
-            &delta,
-            step.infer,
-            step.state,
-            &y_conv_vec,
-            valid_actions,
-            action_idx,
-            td_error,
-            loss,
-            step.mode,
-        ))
+                    // Entropy regularization per-step (not accumulated in trace)
+                    for &i in valid_actions {
+                        let log_pi = (pi[i].max(1e-10)).ln();
+                        delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
+                    }
+
+                    // Use shared bookkeeping
+                    return Ok(self.apply_actor_update_and_bookkeeping(
+                        &delta,
+                        step.infer,
+                        step.state,
+                        &y_conv_vec,
+                        valid_actions,
+                        action_idx,
+                        td_error,
+                        loss,
+                        step.mode,
+                    ));
+                }
+
+                // --- Standard TD(0)/TD(n) path continues below ---
+                let mut delta = vec![0.0; pi.len()];
+                for &i in valid_actions {
+                    delta[i] = pi[i];
+                }
+                delta[action_idx] -= 1.0;
+
+                for &i in valid_actions {
+                    delta[i] *= td_error;
+                }
+
+                // Entropy regularization
+                for &i in valid_actions {
+                    let log_pi = (pi[i].max(1e-10)).ln();
+                    delta[i] -= self.config.entropy_coeff * (log_pi + 1.0);
+                }
+
+                Ok(self.apply_actor_update_and_bookkeeping(
+                    &delta,
+                    step.infer,
+                    step.state,
+                    &y_conv_vec,
+                    valid_actions,
+                    action_idx,
+                    td_error,
+                    loss,
+                    step.mode,
+                ))
+            }
+            StepAction::Continuous { action: a_taken } => {
+                // Gaussian-policy gradient (brainstorm Q3 / spec §5.3).
+                //
+                //   π(a|s) = N(μ(s), σ² I)             — isotropic Gaussian
+                //   log π(a|s) = −‖a − μ‖² / (2σ²) + const
+                //   ∇_θ log π = ((a − μ) / σ²) · ∇_θ μ
+                //
+                // The output-level delta (post-activation) is therefore
+                //   delta_j = (a_taken_j − μ_j) / σ²
+                // multiplied by td_error (advantage). The existing
+                // `update_with_decay` machinery in `apply_actor_update_and_
+                // bookkeeping` propagates this through the network using the
+                // standard activation derivatives; the Gaussian-vs-softmax
+                // distinction is fully captured by the delta vector built
+                // here.
+                //
+                // GAE eligibility traces are intentionally NOT applied in
+                // the Continuous path: the trace formulation `actor_trace`
+                // is sized and seeded for the discrete one-hot gradient,
+                // and the public continuous API (Phase 4) does not yet
+                // expose GAE for continuous control. If gae_lambda is set
+                // alongside ActionSpace::Continuous, we fall through to
+                // the standard TD path; config validation forbids the
+                // Continuous + GAE combination at construction time when
+                // it is unsupported.
+                let mu = &y_conv_vec; // y_conv is the post-activation μ(s).
+                let sigma = self.config.policy_sigma;
+                let sigma_sq = sigma * sigma;
+                debug_assert!(
+                    sigma_sq.is_finite() && sigma_sq > 0.0,
+                    "policy_sigma must produce finite positive sigma_sq, got {sigma_sq} \
+                     (sigma = {sigma})"
+                );
+                debug_assert_eq!(
+                    a_taken.len(),
+                    mu.len(),
+                    "continuous action length {} must match μ length {}",
+                    a_taken.len(),
+                    mu.len()
+                );
+
+                // Descent-direction delta:
+                //   delta_j = td_error · (μ_j − a_taken_j) / σ²
+                //
+                // Sanity: with td_error > 0 and a_taken > μ, delta < 0,
+                // so the bias update b_j ← b_j − lr·δ pushes μ_j UP —
+                // pulling the mean toward the rewarded action, which
+                // matches the Phase 4.1 gradient-direction test contract
+                // ("if a > μ and advantage > 0, μ moves up").
+                let mut delta = vec![0.0; mu.len()];
+                for j in 0..mu.len() {
+                    delta[j] = td_error * (mu[j] - a_taken[j]) / sigma_sq;
+                }
+
+                // Entropy regularization: SKIPPED for fixed-σ Gaussian.
+                // H(N(μ,σ²I)) = 0.5·k·(1 + ln(2πσ²)) is independent of θ
+                // (μ is the only learnable output and entropy depends only
+                // on σ, which is fixed). ∇_θ H = 0.
+
+                // Use shared bookkeeping. Pass an empty mask and action=0
+                // so KL distillation (gated on `valid_actions.len() > 1`)
+                // and EWC logits-reversal (gated on `!valid_actions.
+                // is_empty()`) are skipped. These regularizers are
+                // discrete-specific and conceptually undefined for
+                // Gaussian policies; the continuous path keeps the
+                // canonical scale/decay/Fisher-on-delta machinery only.
+                Ok(self.apply_actor_update_and_bookkeeping(
+                    &delta,
+                    step.infer,
+                    step.state,
+                    &y_conv_vec,
+                    &[],
+                    0,
+                    td_error,
+                    loss,
+                    step.mode,
+                ))
+            }
+        }
     }
 
     /// Shared post-delta bookkeeping: scale/decay, EWC/Fisher, weight update,
@@ -2144,8 +2229,16 @@ impl<L: LinAlg> PcActorCritic<L> {
         // estimate (MAGI R6 W1). Replay mode falls through to the plain
         // weight update with neither Fisher accumulation nor EWC correction.
         if is_online && self.config.ewc_lambda > 0.0 && !self.actor_fisher.is_empty() {
-            // Step 2: Extract per-layer gradients for Fisher EMA (read-only)
-            let fisher_delta = if self.config.logits_reversal {
+            // Step 2: Extract per-layer gradients for Fisher EMA (read-only).
+            //
+            // Logits-reversal Fisher (`delta_fisher = softmax(−y/T) −
+            // one_hot(action)`) is a discrete-policy formulation. For
+            // continuous (Gaussian) policies the caller passes an empty
+            // `valid_actions` slice, in which case `softmax_masked`
+            // returns all zeros and the construction is undefined; fall
+            // back to `delta` so Fisher accumulates the actual gradient
+            // direction (still a valid Fisher proxy for Gaussian).
+            let fisher_delta = if self.config.logits_reversal && !valid_actions.is_empty() {
                 // Logits reversal: delta_fisher = softmax(-y_conv/T, valid) - one_hot(action)
                 let y_conv_rev: Vec<f64> = y_conv_vec
                     .iter()
