@@ -105,6 +105,10 @@ pub struct ReplayBuffer {
     /// Action space discriminator. Set at construction from the agent's
     /// config; immutable afterward. Used by `push` to reject cross-mode
     /// contamination (Brainstorm Q2).
+    ///
+    /// **Brainstorm Q8 / v3.x compat:** `#[serde(default)]` allows pre-v4
+    /// JSON that lacks this field to deserialize as `ActionSpace::Discrete`.
+    #[serde(default)]
     pub(crate) action_space: crate::pc_actor_critic::ActionSpace,
     /// Sealed successful trajectories collected during the training phase.
     pub training_memories: VecDeque<ReplayTransition>,
