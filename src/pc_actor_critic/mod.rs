@@ -2604,6 +2604,29 @@ impl<L: LinAlg> PcActorCritic<L> {
         Ok(action)
     }
 
+    /// v4.0.0 — same as [`step_continuous`](Self::step_continuous) but returns
+    /// the device-native action vector. Forward-compat hook for future
+    /// `GpuLinAlg` backends. On `CpuLinAlg` (where `Vector = Vec<f64>`), this
+    /// is bit-equivalent to `step_continuous` plus a `vec_from_slice`
+    /// round-trip; future `GpuLinAlg` can override to be zero-copy
+    /// device-side.
+    ///
+    /// **Precondition:** `config.action_space == ActionSpace::Continuous`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcError::ConfigValidation`] if
+    /// `config.action_space != Continuous` — propagated from `step_continuous`.
+    pub fn step_continuous_raw_device(
+        &mut self,
+        state: &[f64],
+        reward: f64,
+        done: bool,
+    ) -> Result<L::Vector, PcError> {
+        let action = self.step_continuous(state, reward, done)?;
+        Ok(self.backend.vec_from_slice(&action))
+    }
+
     /// v4.0.0 — Continuous-mode inference. Mirrors discrete `act` with
     /// SelectionMode. Phase 4 implements the body; Phase 1 scaffolds the
     /// precondition guard.
@@ -2624,10 +2647,31 @@ impl<L: LinAlg> PcActorCritic<L> {
                 self.config.action_space
             )));
         }
-        let _ = (state, mode);
-        Err(PcError::ConfigValidation(
-            "act_continuous body lands in v4.0.0 Phase 4 (currently a stub).".into(),
-        ))
+
+        let infer = self.actor.infer(state);
+        let mu = self.backend.vec_to_vec(&infer.y_conv);
+
+        let action = match mode {
+            crate::pc_actor::SelectionMode::Play => {
+                // Play: deterministic μ, no RNG advance.
+                mu
+            }
+            crate::pc_actor::SelectionMode::Training => {
+                // Training: μ + σ·ε, RNG advances. Box-Muller per dim.
+                use rand::Rng;
+                let sigma = self.config.policy_sigma;
+                mu.iter()
+                    .map(|m| {
+                        let u1: f64 = self.rng.gen_range(f64::EPSILON..=1.0);
+                        let u2: f64 = self.rng.gen_range(0.0..1.0);
+                        let eps = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                        m + sigma * eps
+                    })
+                    .collect::<Vec<f64>>()
+            }
+        };
+
+        Ok((action, infer))
     }
 
     /// Shared implementation for `step()` and `step_masked()`.
@@ -13716,6 +13760,53 @@ mod tests {
         assert!(
             mu_final.iter().all(|x| x.is_finite()),
             "all μ components must stay finite: {mu_final:?}"
+        );
+    }
+
+    #[test]
+    fn test_act_continuous_play_deterministic() {
+        // Brainstorm Q5+Q7: Play mode returns μ deterministically,
+        // does not advance RNG.
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let state = vec![0.5, 0.3, 0.1, 0.2, 0.4, 0.6, 0.8, 0.7, 0.9];
+
+        let (action_a, _) = agent
+            .act_continuous(&state, crate::pc_actor::SelectionMode::Play)
+            .unwrap();
+        let (action_b, _) = agent
+            .act_continuous(&state, crate::pc_actor::SelectionMode::Play)
+            .unwrap();
+
+        assert_eq!(action_a, action_b, "Play must be deterministic");
+    }
+
+    #[test]
+    fn test_act_continuous_training_advances_rng() {
+        // Brainstorm Q5+Q7: Training mode samples; two consecutive calls
+        // produce different actions.
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let state = vec![0.5, 0.3, 0.1, 0.2, 0.4, 0.6, 0.8, 0.7, 0.9];
+
+        let (action_a, _) = agent
+            .act_continuous(&state, crate::pc_actor::SelectionMode::Training)
+            .unwrap();
+        let (action_b, _) = agent
+            .act_continuous(&state, crate::pc_actor::SelectionMode::Training)
+            .unwrap();
+
+        assert_ne!(
+            action_a, action_b,
+            "Training must advance RNG (different samples)"
         );
     }
 
