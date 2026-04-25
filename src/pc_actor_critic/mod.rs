@@ -734,6 +734,37 @@ impl<L: LinAlg> PcActorCritic<L> {
             // entropy_coeff > 0 is silently inert in continuous (fixed-σ
             // Gaussian → entropy gradient is constant). Brainstorm Q3 /
             // spec §4.3: NO rejection here.
+
+            // GAE eligibility traces are discrete-shape; no continuous arm.
+            if config.gae_lambda.is_some() {
+                return Err(PcError::ConfigValidation(format!(
+                    "gae_lambda ({:?}) is not supported in continuous action space \
+                     (eligibility trace is discrete-shape). Set to None or use \
+                     ActionSpace::Discrete.",
+                    config.gae_lambda
+                )));
+            }
+            // TD(n) flush is not yet implemented for continuous mode in v4.0.0.
+            if config.td_steps != 0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "td_steps ({}) > 0 is not supported in continuous action space \
+                     in v4.0.0. Set to 0 or use ActionSpace::Discrete. Continuous \
+                     TD(n) is tracked for v4.x.",
+                    config.td_steps
+                )));
+            }
+            // replay_learn hard-rejects Continuous transitions; buffer would be
+            // write-only. Reject at construction instead of silently accumulating
+            // transitions that can never be trained on.
+            if config.replay_training_capacity > 0 || config.replay_recent_capacity > 0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "replay_training_capacity ({}) and replay_recent_capacity ({}) \
+                     must be 0 in continuous action space in v4.0.0 — replay_learn \
+                     does not yet support Continuous transitions. Tracked for v4.x. \
+                     Set both to 0 or use ActionSpace::Discrete.",
+                    config.replay_training_capacity, config.replay_recent_capacity
+                )));
+            }
         }
 
         // Tolerance-based sentinel check + NaN/Infinity rejection + upper bound
@@ -2551,11 +2582,10 @@ impl<L: LinAlg> PcActorCritic<L> {
                 done,
                 self.config.gamma,
             );
-            // `learn_continuous_inner` only returns `Err` on paths reserved
-            // for future self-recovery validation; today it is effectively
-            // infallible. Ignore the loss value here (the public API
-            // returns the action, not the loss).
-            let _ = self.learn_continuous_inner(&step).unwrap_or(0.0);
+            // Propagate any error from learn_continuous_inner. The loss value
+            // is not returned by step_continuous (caller gets the action),
+            // but errors must not be silently swallowed.
+            let _ = self.learn_continuous_inner(&step)?;
 
             if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
                 self.process_hysteresis(surprise_score, self.last_td_error.abs());
@@ -13668,19 +13698,21 @@ mod tests {
         );
     }
 
-    // ── Phase 3.1 regression: Discrete path bit-equivalence ─────────────
+    // ── Phase 3.1 regression: Discrete path finite + non-trivial movement ──
 
     #[test]
-    fn test_discrete_path_bit_equivalent_to_v3_baseline() {
-        // Brainstorm: bit-equivalence regression. With identical seed
-        // and identical config (Discrete default), v4.0.0 must produce
-        // weight trajectories indistinguishable from v3.x at machine
-        // precision over N=100 step_masked calls.
+    fn test_discrete_path_remains_finite_and_moves_after_refactor() {
+        // Regression guard: with action_space=Discrete (default) and
+        // a fixed seed, weights must move measurably and remain finite
+        // across 100 step_masked calls. Catches accidental semantic
+        // changes to the discrete path during the StepAction refactor
+        // (Phase 3.1) or future continuous-mode work.
         //
-        // We can't compare against v3.x runtime (it's not installed in
-        // CI), but we lock the v4.0.0-Discrete trajectory now: any
-        // future Phase 3.3 gradient refactor that breaks this test
-        // means we accidentally changed the discrete path.
+        // NOTE: this is NOT a bit-equivalence test against v3.x runtime
+        // (no v3.x binary available in CI). For true bit-equivalence,
+        // a checksum lock-in would require running v3.x once and
+        // hard-coding the resulting weights — fragile across compiler
+        // versions.
         let mut cfg = default_config();
         cfg.action_space = ActionSpace::Discrete;
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
@@ -13943,46 +13975,55 @@ mod tests {
 
     #[test]
     fn test_continuous_td_n_5_no_clip_saturation() {
-        // Brainstorm Q3 sanity for n-step returns + continuous gradient.
+        // W2 validation lock: td_steps > 0 + Continuous is rejected at
+        // construction. Continuous TD(n) is unsupported in v4.0.0 — the
+        // flush path (flush_td_buffer) uses discrete StepAction exclusively.
+        // This test asserts the ConfigValidation error rather than exercising
+        // the runtime path; the old loop body was replaced when the validation
+        // rule was added. v4.x tracking item covers proper continuous TD(n).
         let mut cfg = default_config();
         cfg.action_space = ActionSpace::Continuous;
         cfg.policy_sigma = 0.1;
         cfg.distillation_lambda_polyak = 0.0;
         cfg.distillation_lambda_frozen = 0.0;
         cfg.td_steps = 5;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
-        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
-        for _ in 0..100 {
-            let _ = agent.step_continuous(&state, 1.0, false).unwrap();
+        let result = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        match result {
+            Err(PcError::ConfigValidation(msg)) => {
+                assert!(
+                    msg.contains("td_steps") && msg.contains("continuous"),
+                    "error message should mention td_steps and continuous, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected ConfigValidation for td_steps=5 + Continuous, got Ok"),
+            Err(other) => panic!("expected ConfigValidation, got: {other:?}"),
         }
-        let actor_w = &agent.actor.layers[0].weights.data;
-        assert!(actor_w.iter().all(|w| w.is_finite()));
-        let max_abs = actor_w.iter().map(|w| w.abs()).fold(0.0, f64::max);
-        assert!(max_abs < 4.5, "td_steps=5 + continuous: max_abs_w={max_abs}");
     }
 
     #[test]
     fn test_continuous_gae_lambda_decay() {
+        // W1 validation lock: gae_lambda + Continuous is rejected at
+        // construction. GAE eligibility traces are discrete-shape; the
+        // continuous arm has no trace accumulation path in v4.0.0.
+        // Previously this test looped and accepted either Ok or a runtime
+        // ConfigValidation — now validation fires at new() so the loop
+        // never runs.
         let mut cfg = default_config();
         cfg.action_space = ActionSpace::Continuous;
         cfg.policy_sigma = 0.1;
         cfg.distillation_lambda_polyak = 0.0;
         cfg.distillation_lambda_frozen = 0.0;
         cfg.gae_lambda = Some(0.95);
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
-        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
-        for _ in 0..100 {
-            let result = agent.step_continuous(&state, 1.0, false);
-            // Accept either Ok or a clear ConfigValidation error;
-            // GAE+Continuous combo behavior is implementation choice
-            // — what matters is no panic, no NaN.
-            match result {
-                Ok(_) => {}
-                Err(PcError::ConfigValidation(_)) => break, // graceful reject
-                Err(other) => panic!("unexpected error: {other:?}"),
+        let result = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
+        match result {
+            Err(PcError::ConfigValidation(msg)) => {
+                assert!(
+                    msg.contains("gae_lambda") && msg.contains("continuous"),
+                    "error message should mention gae_lambda and continuous, got: {msg}"
+                );
             }
+            Ok(_) => panic!("expected ConfigValidation for gae_lambda + Continuous, got Ok"),
+            Err(other) => panic!("expected ConfigValidation, got: {other:?}"),
         }
-        let actor_w = &agent.actor.layers[0].weights.data;
-        assert!(actor_w.iter().all(|w| w.is_finite()));
     }
 }
