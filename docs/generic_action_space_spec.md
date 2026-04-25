@@ -441,15 +441,14 @@ fn validate_config(config: &PcActorCriticConfig) -> Result<(), PcError> {
             return Err(PcError::ConfigValidation(
                 "distillation_lambda_polyak is not supported in continuous \
                  action space (KL is undefined for raw output). Set to 0.0 \
-                 or use ActionSpace::Discrete. L2-anchored continuous \
-                 distillation is tracked for v5.0.0."
+                 or use ActionSpace::Discrete."
                     .into(),
             ));
         }
         if config.distillation_lambda_frozen > 0.0 {
             return Err(PcError::ConfigValidation(
                 "distillation_lambda_frozen is not supported in continuous \
-                 action space — same reason as Polyak. Tracked for v5.0.0."
+                 action space — same reason as Polyak."
                     .into(),
             ));
         }
@@ -459,9 +458,16 @@ fn validate_config(config: &PcActorCriticConfig) -> Result<(), PcError> {
 ```
 
 This is a strict-validation gate: continuous + nonzero distillation is
-rejected at construction, not silently zeroed. Future work (v5.0.0+):
-L2-anchored continuous distillation (replace KL with
-`||μ_live - μ_anchor||²`).
+rejected at construction, not silently zeroed.
+
+**On L2-anchored continuous distillation:** an alternative formulation
+replacing KL with `||μ_live − μ_anchor||²` is conceptually plausible but
+**experimental**. There is no settled theory for how an L2 anchor on
+the actor's mean interacts with PC inference convergence, hysteresis
+state-machine signals, or the self-recovery toolkit semantics. It is
+**not on the v5.0.0 roadmap**. If/when explored, the work belongs on
+an experimental branch (e.g. `experimental/continuous-l2-distillation`)
+with its own empirical validation cycle before any release commitment.
 
 ### 5.6 EWC / Fisher diagonal in continuous mode
 
@@ -734,7 +740,11 @@ doctests for `step_continuous` / `act_continuous` / `policy_sigma`.
   variance head. Tracked.
 - **Per-dim σ vector**: anisotropic exploration. Tracked.
 - **L2-anchored continuous distillation**: KL replacement for
-  Polyak/Frozen anchors. Tracked.
+  Polyak/Frozen anchors. **Experimental — no release commitment.**
+  If pursued, lives on an experimental branch with its own validation
+  cycle. Self-recovery toolkit (`rollback_soft` / `rollback_hard` /
+  `champion_update`) remains effectively unavailable in Continuous
+  mode until and unless this experiment validates.
 - **Multi-discrete grouping** (Q4 partial): output partitioned into
   argmax groups with shared backbone. Tracked.
 - **Action-conditional critic** (Q(s,a) instead of V(s)): enables true
