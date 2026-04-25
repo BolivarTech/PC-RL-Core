@@ -659,40 +659,45 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         // Tolerance-based sentinel check + NaN/Infinity rejection + upper bound
         // per MAGI Melchior + Caspar Checkpoint 2 iter 2 hardening requirement.
+        // The actor and critic replay-floor fields share the same tri-state
+        // sentinel semantics; the helper dedupes the rule (v3.0.0 refactor).
         let upper_bound = 10.0 * config.scale_ceil;
-        let is_sentinel = (config.scale_floor_replay - (-1.0)).abs()
-            < crate::pc_actor_critic::config::SENTINEL_EPSILON;
-        let is_valid_positive = config.scale_floor_replay.is_finite()
-            && config.scale_floor_replay >= 0.0
-            && config.scale_floor_replay <= upper_bound;
+        Self::validate_replay_floor("scale_floor_replay", config.scale_floor_replay, upper_bound)?;
+        Self::validate_replay_floor(
+            "critic_floor_replay",
+            config.critic_floor_replay,
+            upper_bound,
+        )?;
+
+        Ok(())
+    }
+
+    /// Validates a replay-floor opt-in field per the shared tri-state
+    /// sentinel contract.
+    ///
+    /// Accepts: `~-1.0` (sentinel for "opt-in not provided") OR any
+    /// finite value in `[0.0, upper_bound]`. Rejects: values in
+    /// `(-1.0, 0.0)`, NaN, ±Infinity, and values above `upper_bound`.
+    ///
+    /// Used by both `scale_floor_replay` (v2.2.1) and
+    /// `critic_floor_replay` (v3.0.0) — extracted in v3.0.0 to dedupe
+    /// the validation rule across the two symmetric fields.
+    fn validate_replay_floor(
+        field_name: &str,
+        value: f64,
+        upper_bound: f64,
+    ) -> Result<(), PcError> {
+        let is_sentinel = crate::pc_actor_critic::config::is_replay_floor_sentinel(value);
+        let is_valid_positive = value.is_finite() && value >= 0.0 && value <= upper_bound;
         if !is_sentinel && !is_valid_positive {
             return Err(PcError::ConfigValidation(format!(
-                "scale_floor_replay ({}) must be either ~-1.0 (sentinel for \
-                 'use scale_floor') or a finite non-negative value <= {} \
-                 (10× scale_ceil). NaN, ±Infinity, and values in (-1.0, 0.0) \
-                 are rejected as ambiguous or likely configuration errors.",
-                config.scale_floor_replay, upper_bound
+                "{field_name} ({value}) must be either ~-1.0 (sentinel for \
+                 'use scale_floor') or a finite non-negative value <= \
+                 {upper_bound} (10× scale_ceil). NaN, ±Infinity, and values \
+                 in (-1.0, 0.0) are rejected as ambiguous or likely \
+                 configuration errors."
             )));
         }
-
-        // v3.0.0 — symmetric rule for the critic-side opt-in. Same tri-state
-        // sentinel semantics: -1.0 (sentinel) OR [0.0, 10*scale_ceil] finite.
-        // See `critic_floor_replay` rustdoc for the breaking-change context.
-        let is_critic_sentinel = (config.critic_floor_replay - (-1.0)).abs()
-            < crate::pc_actor_critic::config::SENTINEL_EPSILON;
-        let is_critic_valid_positive = config.critic_floor_replay.is_finite()
-            && config.critic_floor_replay >= 0.0
-            && config.critic_floor_replay <= upper_bound;
-        if !is_critic_sentinel && !is_critic_valid_positive {
-            return Err(PcError::ConfigValidation(format!(
-                "critic_floor_replay ({}) must be either ~-1.0 (sentinel for \
-                 'use scale_floor') or a finite non-negative value <= {} \
-                 (10× scale_ceil). NaN, ±Infinity, and values in (-1.0, 0.0) \
-                 are rejected as ambiguous or likely configuration errors.",
-                config.critic_floor_replay, upper_bound
-            )));
-        }
-
         Ok(())
     }
 
@@ -2572,8 +2577,9 @@ impl<L: LinAlg> PcActorCritic<L> {
             "scale_floor_replay became non-finite post-construction: {}",
             self.config.scale_floor_replay
         );
-        let is_sentinel = (self.config.scale_floor_replay - (-1.0)).abs()
-            < crate::pc_actor_critic::config::SENTINEL_EPSILON;
+        let is_sentinel = crate::pc_actor_critic::config::is_replay_floor_sentinel(
+            self.config.scale_floor_replay,
+        );
         let clamp_to = match mode {
             LearnMode::Online => self.config.scale_floor,
             LearnMode::Replay => {
@@ -2644,8 +2650,9 @@ impl<L: LinAlg> PcActorCritic<L> {
         if !is_frozen {
             return self.critic_surprise_scale(td_error_abs);
         }
-        let is_sentinel = (self.config.critic_floor_replay - (-1.0)).abs()
-            < crate::pc_actor_critic::config::SENTINEL_EPSILON;
+        let is_sentinel = crate::pc_actor_critic::config::is_replay_floor_sentinel(
+            self.config.critic_floor_replay,
+        );
         match mode {
             LearnMode::Online => self.config.scale_floor,
             LearnMode::Replay => {

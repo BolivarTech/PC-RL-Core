@@ -12,12 +12,25 @@ use serde::{Deserialize, Serialize};
 use crate::mlp_critic::MlpCriticConfig;
 use crate::pc_actor::PcActorConfig;
 
-/// Tolerance for detecting the `-1.0` sentinel value in
-/// `scale_floor_replay` after JSON round-trip. Exactly `-1.0` is
-/// representable in f64 and should round-trip bit-perfectly, but
-/// defensive tolerance prevents misdetection if a future serde
-/// backend introduces any ULP-level noise.
+/// Tolerance for detecting the `-1.0` sentinel value in the replay
+/// floor fields (`scale_floor_replay`, `critic_floor_replay`) after
+/// JSON round-trip. Exactly `-1.0` is representable in f64 and should
+/// round-trip bit-perfectly, but defensive tolerance prevents
+/// misdetection if a future serde backend introduces any ULP-level
+/// noise.
 pub(crate) const SENTINEL_EPSILON: f64 = 1e-9;
+
+/// Returns true when `value` matches the `-1.0` "opt-in not provided"
+/// sentinel within `SENTINEL_EPSILON` tolerance.
+///
+/// Shared between `scale_floor_replay` (v2.2.1) and
+/// `critic_floor_replay` (v3.0.0) — both use the same tri-state
+/// sentinel semantics. Inlined to keep the hot-path gate branch-free
+/// after monomorphization.
+#[inline]
+pub(crate) fn is_replay_floor_sentinel(value: f64) -> bool {
+    (value - (-1.0)).abs() < SENTINEL_EPSILON
+}
 
 /// Default discount factor.
 fn default_gamma() -> f64 {
@@ -666,13 +679,13 @@ mod tests {
         let cfg = base_config();
         // `base_config` mirrors the user-facing default for this field.
         assert!(
-            (cfg.scale_floor_replay - (-1.0)).abs() < SENTINEL_EPSILON,
+            is_replay_floor_sentinel(cfg.scale_floor_replay),
             "default scale_floor_replay must be -1.0 sentinel, got {}",
             cfg.scale_floor_replay
         );
         // The serde-default helper must agree with the struct literal.
         assert!(
-            (default_scale_floor_replay() - (-1.0)).abs() < SENTINEL_EPSILON,
+            is_replay_floor_sentinel(default_scale_floor_replay()),
             "default_scale_floor_replay() must return -1.0 sentinel"
         );
     }
@@ -686,12 +699,12 @@ mod tests {
         // set to a value in `[0.0, 10 * scale_ceil]`.
         let cfg = base_config();
         assert!(
-            (cfg.critic_floor_replay - (-1.0)).abs() < SENTINEL_EPSILON,
+            is_replay_floor_sentinel(cfg.critic_floor_replay),
             "default critic_floor_replay must be -1.0 sentinel, got {}",
             cfg.critic_floor_replay
         );
         assert!(
-            (default_critic_floor_replay() - (-1.0)).abs() < SENTINEL_EPSILON,
+            is_replay_floor_sentinel(default_critic_floor_replay()),
             "default_critic_floor_replay() must return -1.0 sentinel"
         );
     }
