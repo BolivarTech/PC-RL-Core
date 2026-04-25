@@ -50,6 +50,20 @@
   forward compatibility with future fields is also preserved
   (unknown fields are silently ignored on load). This policy is
   unchanged from v2.0.0+.
+- **Polyak-target dynamics shift under replay opt-in.** Consumers
+  running with `distillation_lambda_polyak > 0` AND the new
+  `scale_floor_replay > 0.0` opt-in should expect a measurable
+  change in Polyak-target behavior. The EMA semantic is "target
+  tracks actor movement, not plasticity label": under the default
+  sentinel, FROZEN actors don't move during replay and the target
+  doesn't advance; under the opt-in, the actor DOES move during
+  replay and the Polyak target tracks those replay-driven changes.
+  This is symmetric with the online `scale_floor > 0` case and
+  intentional — the target becomes partially shaped by the replay
+  compartment, not only by on-policy trajectories. No action
+  required if you keep the `-1.0` default; reconsider your
+  `polyak_tau` if you opt in and observe target lag differently
+  from v2.2.0.
 
 ## [2.2.0] - 2026-04-19
 

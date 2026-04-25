@@ -486,9 +486,30 @@ pub struct PcActorCriticConfig {
     /// values, and values above `10 * scale_ceil` are rejected by
     /// `validate_config`.
     ///
-    /// Detection uses `SENTINEL_EPSILON` (crate-private constant)
-    /// tolerance so future serde backends with ULP-level round-trip
-    /// noise still match the sentinel.
+    /// # Upper-bound rationale (`10 * scale_ceil`)
+    ///
+    /// The validator caps the opt-in at `10 × scale_ceil` rather than at
+    /// `scale_ceil` itself for two reasons:
+    ///
+    /// 1. **Replay is batched**: a single `replay_learn()` call applies
+    ///    gradients from `replay_batch_size` transitions. A replay scale
+    ///    equal to the online `scale_ceil` would under-correct for the
+    ///    higher information content in a curated positive-reward batch,
+    ///    so mild super-unity (2×–5×) is a legitimate tuning regime.
+    ///
+    /// 2. **Typo safety net**: users occasionally set `scale_floor_replay`
+    ///    to raw learning-rate numbers (e.g. `0.5`, `1.0`) rather than the
+    ///    scale-of-scale semantics. `10 × scale_ceil` gives wide latitude
+    ///    for legitimate tuning while still rejecting an obvious order-of-
+    ///    magnitude typo (e.g. `100.0` where `1.0` was meant).
+    ///
+    /// Users who need a cap tighter than `10 × scale_ceil` should simply
+    /// choose their `scale_floor_replay` value accordingly — the validator
+    /// enforces the outer bound, not the recommended operating point.
+    ///
+    /// Detection of the `-1.0` sentinel uses `SENTINEL_EPSILON`
+    /// (crate-private constant) tolerance so future serde backends with
+    /// ULP-level round-trip noise still match the sentinel.
     #[serde(default = "default_scale_floor_replay")]
     pub scale_floor_replay: f64,
 }
@@ -585,9 +606,9 @@ mod tests {
         // The default sentinel `-1.0` signals "opt-in not provided".
         // Replay-under-FROZEN preserves the conservative no-op semantics
         // unless the user explicitly opts in by setting this field to a
-        // value in `[0.0, 10 * scale_ceil]`. The struct exists at this
-        // point (commit 3 scaffold), but `validate_config` and the gate
-        // logic in `effective_actor_scale_for_mode` arrive in commit 4.
+        // value in `[0.0, 10 * scale_ceil]`. Validation and gate logic
+        // live in `validate_config` and `effective_actor_scale_for_mode`
+        // respectively.
         let cfg = base_config();
         // `base_config` mirrors the user-facing default for this field.
         assert!(
