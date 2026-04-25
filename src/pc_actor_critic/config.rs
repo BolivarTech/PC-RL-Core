@@ -12,12 +12,25 @@ use serde::{Deserialize, Serialize};
 use crate::mlp_critic::MlpCriticConfig;
 use crate::pc_actor::PcActorConfig;
 
-/// Tolerance for detecting the `-1.0` sentinel value in
-/// `scale_floor_replay` after JSON round-trip. Exactly `-1.0` is
-/// representable in f64 and should round-trip bit-perfectly, but
-/// defensive tolerance prevents misdetection if a future serde
-/// backend introduces any ULP-level noise.
+/// Tolerance for detecting the `-1.0` sentinel value in the replay
+/// floor fields (`scale_floor_replay`, `critic_floor_replay`) after
+/// JSON round-trip. Exactly `-1.0` is representable in f64 and should
+/// round-trip bit-perfectly, but defensive tolerance prevents
+/// misdetection if a future serde backend introduces any ULP-level
+/// noise.
 pub(crate) const SENTINEL_EPSILON: f64 = 1e-9;
+
+/// Returns true when `value` matches the `-1.0` "opt-in not provided"
+/// sentinel within `SENTINEL_EPSILON` tolerance.
+///
+/// Shared between `scale_floor_replay` (v2.2.1) and
+/// `critic_floor_replay` (v3.0.0) — both use the same tri-state
+/// sentinel semantics. Inlined to keep the hot-path gate branch-free
+/// after monomorphization.
+#[inline]
+pub(crate) fn is_replay_floor_sentinel(value: f64) -> bool {
+    (value - (-1.0)).abs() < SENTINEL_EPSILON
+}
 
 /// Default discount factor.
 fn default_gamma() -> f64 {
@@ -216,6 +229,15 @@ fn default_scale_floor_replay() -> f64 {
     -1.0
 }
 
+/// Default `critic_floor_replay` sentinel (v3.0.0).
+///
+/// Returns `-1.0` to signal "opt-in not provided". Mirror of
+/// `default_scale_floor_replay()` for the critic-side knob added in
+/// v3.0.0 alongside the new `critic_hysteresis` weight-update gate.
+fn default_critic_floor_replay() -> f64 {
+    -1.0
+}
+
 /// Configuration for the integrated PC Actor-Critic agent.
 ///
 /// # Examples
@@ -287,6 +309,7 @@ fn default_scale_floor_replay() -> f64 {
 ///     replay_positive_only: true,
 ///     replay_batch_size: 64,
 ///     scale_floor_replay: -1.0,
+///     critic_floor_replay: -1.0,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -512,6 +535,49 @@ pub struct PcActorCriticConfig {
     /// ULP-level round-trip noise still match the sentinel.
     #[serde(default = "default_scale_floor_replay")]
     pub scale_floor_replay: f64,
+    /// Replay-only scale floor for the **critic** under FROZEN
+    /// hysteresis (v3.0.0).
+    ///
+    /// Mirror of [`scale_floor_replay`](Self::scale_floor_replay) for
+    /// the critic side. As of v3.0.0, `critic_hysteresis = true` now
+    /// enforces the FROZEN state on critic weight updates (this was
+    /// tracked but unenforced in v2.x — see CHANGELOG breaking notes).
+    /// This field provides the symmetric replay opt-in.
+    ///
+    /// `-1.0` (default) acts as the "opt-in not provided" sentinel —
+    /// replay-under-FROZEN-critic clamps to `scale_floor` (no critic
+    /// update under defaults). Any value in `[0.0, 10 * scale_ceil]`
+    /// opts in: that value becomes the effective critic scale during
+    /// `replay_learn()` regardless of `critic_hysteresis.state`.
+    /// Strict-positive (`> 0.0`) constitutes a real opt-in.
+    ///
+    /// # Recommended pairing with `scale_floor_replay`
+    ///
+    /// For coherent actor-critic dynamics under FROZEN-replay, set
+    /// this field IN LOCKSTEP with
+    /// [`scale_floor_replay`](Self::scale_floor_replay). Partial
+    /// opt-in (one knob active, the other at sentinel) produces
+    /// actor-critic desynchronization — the moving side learns from
+    /// storage while the gated side stays still, drifting the two
+    /// networks apart. Recommended symmetric pairs:
+    ///
+    /// - `(-1.0, -1.0)` — full stress protection (default).
+    /// - `(0.3, 0.3)` — mild symmetric recovery.
+    /// - `(1.0, 1.0)` — aggressive symmetric recovery.
+    ///
+    /// Asymmetric opt-in is syntactically allowed but not recommended
+    /// (see CHANGELOG v3.0.0 §"Note on pairing").
+    ///
+    /// # Sentinel detection and validation
+    ///
+    /// Detection of the `-1.0` sentinel uses `SENTINEL_EPSILON`
+    /// (crate-private constant) tolerance, identical to
+    /// `scale_floor_replay`. Validation rejects values in
+    /// `(-1.0, 0.0)`, non-finite values, and values above
+    /// `10 * scale_ceil` at both `PcActorCritic::new` and
+    /// `apply_config` paths.
+    #[serde(default = "default_critic_floor_replay")]
+    pub critic_floor_replay: f64,
 }
 
 #[cfg(test)]
@@ -598,6 +664,7 @@ mod tests {
             replay_positive_only: true,
             replay_batch_size: 64,
             scale_floor_replay: -1.0,
+            critic_floor_replay: -1.0,
         }
     }
 
@@ -612,14 +679,33 @@ mod tests {
         let cfg = base_config();
         // `base_config` mirrors the user-facing default for this field.
         assert!(
-            (cfg.scale_floor_replay - (-1.0)).abs() < SENTINEL_EPSILON,
+            is_replay_floor_sentinel(cfg.scale_floor_replay),
             "default scale_floor_replay must be -1.0 sentinel, got {}",
             cfg.scale_floor_replay
         );
         // The serde-default helper must agree with the struct literal.
         assert!(
-            (default_scale_floor_replay() - (-1.0)).abs() < SENTINEL_EPSILON,
+            is_replay_floor_sentinel(default_scale_floor_replay()),
             "default_scale_floor_replay() must return -1.0 sentinel"
+        );
+    }
+
+    #[test]
+    fn test_critic_floor_replay_default_is_minus_one_sentinel() {
+        // v3.0.0 — critic-side mirror of the scale_floor_replay sentinel.
+        // The default `-1.0` signals "opt-in not provided" — the new
+        // critic-hysteresis-FROZEN gate (also v3.0.0) clamps the critic
+        // to `scale_floor` during replay unless this field is explicitly
+        // set to a value in `[0.0, 10 * scale_ceil]`.
+        let cfg = base_config();
+        assert!(
+            is_replay_floor_sentinel(cfg.critic_floor_replay),
+            "default critic_floor_replay must be -1.0 sentinel, got {}",
+            cfg.critic_floor_replay
+        );
+        assert!(
+            is_replay_floor_sentinel(default_critic_floor_replay()),
+            "default_critic_floor_replay() must return -1.0 sentinel"
         );
     }
 

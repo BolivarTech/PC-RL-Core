@@ -1,5 +1,96 @@
 # Changelog
 
+## [3.0.0] - 2026-04-25
+
+### Breaking changes
+
+- **`critic_hysteresis` is now actually enforced on critic weight
+  updates.** Prior to v3.0.0, setting `critic_hysteresis = true`
+  caused the framework to track a state machine for the critic but
+  the tracked state was NEVER consulted at the weight-update site —
+  the critic kept learning based on `|td_error|` magnitude alone,
+  regardless of FROZEN/PLASTIC label. This was an architectural
+  asymmetry with the actor (whose hysteresis HAS been enforced since
+  v2.0.0). From v3.0.0 onward, `critic_hysteresis.state` IS enforced:
+  when FROZEN, the critic's effective learning rate is clamped to
+  `scale_floor` on the online path, and to `critic_floor_replay`
+  (with the same tri-state sentinel semantics as the v2.2.1
+  `scale_floor_replay`) on the replay path.
+
+  **Affected consumers:** anyone running with
+  `critic_hysteresis = true` who implicitly relied on the critic
+  continuing to learn during FROZEN windows. The "critic stops
+  learning" window is bounded by cross-wake coupling
+  (`actor_wakes_critic`, default `true`, threshold `1000`), so under
+  default coupling the maximum FROZEN-critic window is ~1000 steps
+  per cycle. Workloads where the critic is FROZEN for a small
+  fraction of training time will see negligible regression; workloads
+  with high FROZEN-duty-cycle on the critic should expect a
+  measurable slowdown in critic convergence unless they apply the
+  migration below.
+
+  **Migration table:**
+
+  | Pre-v3.0.0 setting | v3.0.0 equivalent (preserve behavior) |
+  |---|---|
+  | `critic_hysteresis = false` | `critic_hysteresis = false` (no change, no regression) |
+  | `critic_hysteresis = true`, replay active, want **closest approximation** to v2.2.x replay learning | add `critic_floor_replay = scale_ceil` (typically `2.0` — matches v2.2.x's td-magnitude-driven upper-band scale) |
+  | `critic_hysteresis = true`, replay active, want **mild recovery** (less aggressive than v2.2.x) | add `critic_floor_replay = 0.3` (rule-of-thumb operating point; smaller values clamp tighter) |
+  | `critic_hysteresis = true`, want TRUE stress protection (new behavior) | no change needed — v3.0.0 default delivers the symmetric protection that the field always intended |
+  | `critic_hysteresis = true`, cross-wake disabled, critic stuck FROZEN | enable cross-wake OR set `critic_floor_replay` high (≥ `scale_ceil`) |
+
+  See README "Migration from v2.2.x to v3.0.0" subsection for a
+  ready-to-copy config snippet showing the recommended paired
+  `(scale_floor_replay, critic_floor_replay)` opt-in.
+
+### Added
+
+- `PcActorCriticConfig::critic_floor_replay: f64` — opt-in override
+  for replay-path **critic** learning-rate floor under FROZEN
+  `critic_hysteresis`. Mirror of v2.2.1 `scale_floor_replay` for the
+  critic side. Default `-1.0` (sentinel) honours the new gate (no
+  critic update under FROZEN-replay); strict-positive values opt
+  the critic into replay-driven learning even during FROZEN. Same
+  tri-state sentinel semantics, same validation rule
+  (`[0.0, 10 × scale_ceil]` finite or `~-1.0`), same upper-bound
+  rationale documented on the field.
+- `PcActorCritic::effective_critic_scale_for_mode` (`pub(crate)`) —
+  mode-aware critic scale resolution. Honours
+  `critic_hysteresis.state == Frozen` per the new gate; falls
+  through to `critic_surprise_scale` for PLASTIC and disabled-
+  hysteresis paths (no behavior change vs v2.2.x for those cases).
+
+### Notes
+
+- **Pairing recommendation:** for coherent actor-critic dynamics
+  under FROZEN-replay, set `scale_floor_replay` and
+  `critic_floor_replay` IN LOCKSTEP. Recommended symmetric pairs:
+
+  - `(-1.0, -1.0)` (default): full stress protection — neither
+    network updates during FROZEN windows.
+  - `(0.3, 0.3)`: mild symmetric recovery — both networks learn
+    from stored transitions under FROZEN.
+  - `(1.0, 1.0)`: aggressive symmetric recovery — both networks
+    learn at full magnitude.
+
+  Asymmetric opt-in such as `(0.3, -1.0)` is allowed for tuning
+  flexibility but produces actor-critic desynchronization (one
+  network moves based on stored transitions while the other stays
+  FROZEN-gated). Use only if you have a specific reason to update
+  one network and not the other; lock the asymmetric semantic in
+  with regression tests if you do.
+
+- **SemVer rationale:** because `critic_hysteresis = true` consumers
+  observe a behavioural change in unchanged code, this release is
+  major per SemVer 2.0.0. Cargo respects the major boundary —
+  downstream `pc-rl-core = "2"` users will NOT receive v3.0.0
+  automatically; they must update `Cargo.toml` to `pc-rl-core = "3"`
+  explicitly to adopt the breaking change.
+
+- **Internal refactor:** `is_replay_floor_sentinel` and
+  `validate_replay_floor` helpers added to dedupe the floor-field
+  logic shared between actor and critic. No public API impact.
+
 ## [2.2.1] - 2026-04-24
 
 ### Added

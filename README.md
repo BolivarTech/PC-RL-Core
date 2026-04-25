@@ -193,31 +193,78 @@ See the `# When to use` sections on `rollback_soft` / `rollback_hard`
 and the "Stale V(s) batch semantics" rustdoc on `replay_learn` for the
 full design rationale and parameter-tuning guidance.
 
-### Replay under actor hysteresis
+### Replay under actor and critic hysteresis
 
-By default, when actor hysteresis is enabled and the actor is in
-FROZEN state, `replay_learn` updates ONLY the critic — the actor
-is protected from off-policy gradients during stress. This is
-safe but means the replay signal does not reach the actor during
-~70% of a typical stress-heavy run.
+By default, when actor or critic hysteresis is enabled and the
+corresponding network is in FROZEN state, `replay_learn` updates
+the gated network at the `scale_floor` clamp (default 0.0 → no
+update). The protected network is shielded from off-policy
+gradients during stress; the un-gated network continues learning.
 
-To let replay reinforce the actor even under FROZEN stress, set
-`scale_floor_replay = 0.1` (or higher) in the config. The opt-in
-also enables Polyak and Frozen KL anchor gradients in the replay
-update. This is a consumer decision — trading hysteresis
-protection for replay efficacy.
+To let replay reinforce a FROZEN network anyway, set the
+corresponding opt-in floor to a strict-positive value:
 
-> **NOTE — Forward-compatibility for v3.0.0 migration.** The
-> next major release will introduce `critic_floor_replay` as a
-> parallel knob for the critic side (currently not gated by
-> hysteresis). If you set `scale_floor_replay > 0` in v2.2.1,
-> when upgrading to v3.0.0 you will need to ALSO set
-> `critic_floor_replay` to a matching value to preserve
-> symmetric actor-critic dynamics. Without the pair, actor
-> would recover via replay while the critic stays hysteresis-
-> gated — producing measurable desynchronization between the two
-> networks. See `CHANGELOG.md` `[2.2.1]` Notes for the SemVer and
-> migration rationale; plan your adoption accordingly.
+- **Actor:** `scale_floor_replay = 0.3` (or higher; up to `10 ×
+  scale_ceil`). Actor opt-in also enables Polyak and Frozen KL
+  anchor gradients in the replay update.
+- **Critic (v3.0.0+):** `critic_floor_replay = 0.3` — parallel
+  knob for the critic. Same tri-state sentinel semantics, same
+  validation rule.
+
+Recommended pairs (set both fields together to keep
+actor-critic dynamics symmetric):
+
+- `(-1.0, -1.0)` (default) — both networks protected during
+  FROZEN-replay.
+- `(0.3, 0.3)` — mild symmetric recovery.
+- `(1.0, 1.0)` — aggressive symmetric recovery.
+
+Asymmetric pairs (one strict-positive, the other at sentinel)
+are allowed but produce desynchronization — the moving network
+learns from storage while the gated network stays frozen.
+
+### Migration from v2.2.x to v3.0.0 — critic hysteresis enforcement
+
+In v3.0.0 the critic's `critic_hysteresis.state` is enforced on
+weight updates for the first time. Consumers running with
+`critic_hysteresis = true` who relied on the v2.2.x implicit
+"critic always updates" behavior will see changed dynamics. See
+`CHANGELOG.md` `[3.0.0] - Breaking changes` for the full
+migration table.
+
+**Recommended migration — paired opt-in.** Start from your existing
+v2.2.x `PcActorCriticConfig` literal (or your serde-loaded config)
+and override the four self-recovery fields below:
+
+```rust,ignore
+use pc_rl_core::PcActorCriticConfig;
+
+// `existing_v2_2_x_config` is your current full PcActorCriticConfig
+// literal (PcActorCriticConfig does NOT implement Default — replicate
+// your existing field-by-field literal here, or reload via serde).
+let mut config: PcActorCriticConfig = existing_v2_2_x_config;
+
+// Paired opt-in: both actor and critic learn during FROZEN-replay,
+// preserving the v2.2.x effective behaviour of "critic always
+// learning during stress" while also activating the actor side.
+// The two fields should be set TOGETHER to avoid actor-critic
+// desynchronization.
+config.actor_hysteresis = true;
+config.critic_hysteresis = true;
+
+// 0.3 is "mild recovery". For behavioural equivalence to the
+// v2.2.x dynamic surprise→scale band, use `config.scale_ceil`
+// (typically 2.0); see CHANGELOG [3.0.0] migration table.
+config.scale_floor_replay = 0.3;
+config.critic_floor_replay = 0.3;
+```
+
+Leaving both at their default `-1.0` sentinel is also valid and
+corresponds to "full stress protection" — neither network updates
+during FROZEN windows, and cross-wake coupling eventually
+re-activates learning. Partial opt-in (one field positive, the
+other `-1.0`) is allowed but produces asymmetric dynamics and is
+not recommended for most workloads.
 
 ## Architecture
 
