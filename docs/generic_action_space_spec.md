@@ -6,7 +6,11 @@
 **Crate:** `pc-rl-core`
 **Status:** Spec-ready for SBTDD `/deep-plan`. Target release: **v4.0.0 (BREAKING)**.
 **Predecessor spec:** v1.0 (2026-XX), preserved at git tag `pre-v4-spec` for context.
-**Coordination:** Q1 (return type) intersects with GpuLinAlg Phase 2 — see §13.
+**Coordination:** v4.0.0 is **CPU-first** — must function correctly on
+`CpuLinAlg` with no GPU dependencies. GpuLinAlg Phase 2 is a separate
+enhancement workstream that lands **after** v4.0.0 and broadens the
+backend, not the action-space contract. See §13 for the (small) interaction
+surface.
 
 ---
 
@@ -145,21 +149,28 @@ binding architectural decisions. They feed `/deep-plan` directly.
 ### 4.1 Q1 — Return type: `Vec<f64>` (host) or `L::Vector` (backend-native)?
 
 **DECISION: `Vec<f64>` for the public surface. Add a `_raw_device` escape
-hatch returning `L::Vector` for performance-critical GPU consumers.**
+hatch returning `L::Vector` for forward-compatibility with future GPU
+backends.**
 
 Rationale:
+- v4.0.0 is **CPU-first**. The decision must work cleanly on
+  `CpuLinAlg` with zero forward-references to backends that don't
+  exist yet.
 - 99% of downstream consumers want host data (write to file, send over
-  network, multiply by Python tensor, log to console).
-- A blanket `L::Vector` return would force every consumer to call
-  `vec_to_vec` regardless of backend — a no-op on CpuLinAlg, a host
-  transfer on GpuLinAlg either way.
-- The `_raw_device` variant gives GPU consumers a zero-copy path when
-  the action is fed back into another GPU kernel without ever touching
-  the host.
+  network, multiply by Python tensor, log to console). `Vec<f64>` is
+  the right ergonomic default.
+- The `_raw_device` variant exists in the v4.0.0 API surface so that
+  when GpuLinAlg eventually lands, no API surgery is needed — just an
+  efficient implementation. On `CpuLinAlg`, `L::Vector = Vec<f64>`,
+  so `_raw_device` is bit-equivalent to the regular variant. **No GPU
+  is required for v4.0.0 implementation, testing, or release.**
+- A blanket `L::Vector` return would force every CPU consumer to call
+  `vec_to_vec` for a no-op clone — over-engineering for the dominant
+  use case.
 
-This decision **must be re-validated** when GpuLinAlg Phase 2 lands —
-specifically that `vec_to_vec` cost is acceptable per-step on Quadro P1000
-target hardware (§13).
+The escape hatch is forward-looking, not blocking. It can also be
+**deferred to a v4.x minor release** if Phase 4 of the implementation
+plan finds it adds non-trivial complexity to the CPU-only path.
 
 ### 4.2 Q2 — Temperature in continuous mode
 
@@ -757,50 +768,64 @@ do **not** auto-receive v4. They must update their `Cargo.toml` to
 
 ---
 
-## 13. Coordination with GpuLinAlg Phase 2
+## 13. Forward compatibility with GpuLinAlg
 
-The two next-major-version workstreams interact at exactly two points:
+v4.0.0 lands **before** GpuLinAlg Phase 2. The generic-action-space
+contract is fully implementable, testable, and shippable on
+`CpuLinAlg` alone — no GPU required at any stage of the v4.0.0 SBTDD
+cycle (spec, plan, RED, GREEN, REFACTOR, MAGI gates, merge,
+crates.io publish).
 
-### 13.1 `step_continuous_raw_device` return type
+This section documents the (small) forward-compatibility surface so
+GpuLinAlg can later slot in without API churn.
 
-**Decision (binding):** the method exists on the public API regardless
-of which workstream lands first. Body:
+### 13.1 `step_continuous_raw_device` is a forward-compat hook
 
-- If GpuLinAlg lands first (most likely path per project memory):
-  `step_continuous_raw_device` returns the actor's native
-  `L::Vector` directly. CpuLinAlg's `Vector = Vec<f64>` makes the
-  method bit-equivalent to `step_continuous`. GpuLinAlg's
-  `Vector = CudaSlice<f64>` makes it zero-copy device-side.
-- If v4.0.0 lands first: the method returns `L::Vector` against the
-  current CpuLinAlg trait — no behavior change for existing
-  consumers, just a new escape hatch that's bit-equivalent to
-  `step_continuous` on CpuLinAlg until GpuLinAlg implements `Vector`
-  natively.
+The method exists in the v4.0.0 public API for the explicit purpose of
+**not having to break compatibility later**. On `CpuLinAlg` it is
+bit-equivalent to `step_continuous` (because `CpuLinAlg::Vector = Vec<f64>`).
+When GpuLinAlg eventually implements `Vector = CudaSlice<f64>`, the
+same method offers a zero-copy device-side action vector — no public
+API change, no rev bump.
+
+If Phase 4 of the implementation plan finds that adding this hook adds
+non-trivial complexity to the CPU-only path, it can be **deferred to
+v4.x** (a future minor release) and added when GpuLinAlg actually lands.
+The decision is a Phase 4 implementation question, not a v4.0.0 spec
+requirement.
 
 ### 13.2 Sampling RNG locality
 
-`a = μ + σ·ε` requires generating `ε ~ N(0, I)`. The RNG is host-side
-(`rand::StdRng` per the existing actor). On GpuLinAlg, the noise is
-generated on the host and uploaded to device for the addition.
-Acceptable for typical output sizes (4-64 dims); a future optimization
-could use a device-side RNG kernel (cuRAND) — out of scope for v4.0.0.
+`a = μ + σ·ε` requires `ε ~ N(0, I)`. The RNG is host-side
+(`rand::StdRng`, the existing actor RNG). This is a **CPU-only
+implementation** in v4.0.0 — no GPU consideration enters the
+sampling logic.
 
-### 13.3 Recommended sequencing
+When GpuLinAlg lands, the host-generated noise will be uploaded to
+device alongside `μ` for the addition. Acceptable for typical output
+sizes (4-64 dims). Device-side RNG (cuRAND or equivalent) is a
+GpuLinAlg-internal optimization, not a v4.0.0 concern.
 
-**GpuLinAlg Phase 2 first**, then v4.0.0 generic action space:
+### 13.3 What v4.0.0 contains for GpuLinAlg's later benefit
 
-- GpuLinAlg crystallizes the `L::Vector` semantics (size, alignment,
-  device locality) before v4.0.0 commits to `step_continuous_raw_device`.
-- v4.0.0's continuous-mode test suite gets to exercise both backends
-  on day one — discovers backend-specific gradient bugs early.
-- Conversely if v4.0.0 lands first, GpuLinAlg Phase 2 needs to add the
-  continuous-mode kernels alongside the existing CPU port — wider
-  scope per single SBTDD plan.
+| Item | Required in v4.0.0? | Notes |
+|------|---------------------|-------|
+| `ActionSpace` enum + serde | **YES** — core feature | Independent of backend |
+| `Action` enum (replay schema) | **YES** — core feature | Independent of backend |
+| `step_continuous` returning `Vec<f64>` | **YES** — core feature | Independent of backend |
+| `step_continuous_raw_device` returning `L::Vector` | **Optional** — forward-compat hook | Can defer to v4.x if it complicates the CPU-only path |
+| Gaussian-policy gradient | **YES** — core feature | Implemented and tested on CpuLinAlg |
+| Distillation rejection in continuous | **YES** — validation rule | Independent of backend |
+| Per-dim policy_sigma | **NO** — v5+ | Whether deferred to v5 or to a v4.x minor is independent of GPU work |
 
-The user's stated goal — *generic action space is the next implementation
-priority* — is honored by adopting this spec as the v4.0.0 SBTDD input
-**now**, while explicitly sequencing the implementation order
-GpuLinAlg → v4.0.0.
+### 13.4 Out of scope: any GPU implementation work
+
+This spec **does not** describe, depend on, or block any GPU
+implementation. v4.0.0 ships on CpuLinAlg. A separate spec
+(`sbtdd/spec-behavior-gpu.md`, per project memory) will drive the
+GpuLinAlg Phase 2 workstream when it begins. That spec must port
+both the v3.0.0 baseline AND the v4.0.0 continuous-mode kernels —
+but that's its problem, not v4.0.0's.
 
 ---
 
@@ -853,7 +878,8 @@ Caspar (Critic) will likely emphasize:
 | Total LOC docs estimate | ~150 (CHANGELOG + README + rustdoc) |
 | Phases | 5 (config → replay → gradient → public API → docs) |
 | Open architectural questions | 0 (all 5 from v1 spec resolved in §4) |
-| Coordination dependencies | GpuLinAlg Phase 2 (recommended to land first) |
+| Backend dependency | **CpuLinAlg only** — no GPU required for spec, plan, implementation, or release |
+| Coordination dependencies | None blocking. GpuLinAlg Phase 2 (separate workstream) lands later as a backend enhancement; v4.0.0 surface is forward-compatible with it via §13.1 |
 | Release | v4.0.0 BREAKING per SemVer 2.0.0 |
 | Migration cost (typical discrete consumer) | 1-2 line changes (`act()` `?`, swap `step()` → `step_masked()`) |
 | Migration cost (continuous adopter) | new code path; no removal needed |
