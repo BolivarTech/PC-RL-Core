@@ -2471,8 +2471,8 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///    the agent's deterministic [`StdRng`] (so a fixed seed yields
     ///    a fixed action sequence). `σ = config.policy_sigma`.
     /// 3. If a previous transition is stored from the prior call, runs
-    ///    a TD(0) update via [`learn_continuous_inner`] with
-    ///    [`StepAction::Continuous`] — exercising the Gaussian-policy
+    ///    a TD(0) update via the internal continuous learning path with
+    ///    `StepAction::Continuous` — exercising the Gaussian-policy
     ///    gradient `δ_j = td_error · (μ_j − a_j)/σ²` (Phase 3.3).
     /// 4. Records `(state, action, reward, next_state, done)` in the
     ///    replay buffer when configured.
@@ -2493,11 +2493,23 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// The sampled action vector `a = μ(s) + σ·ε` of length
     /// `config.actor.output_size`.
     ///
+    /// # Determinism
+    ///
+    /// Sampling uses the agent's internal `StdRng`. Same seed at
+    /// construction → identical action sequence under identical inputs.
+    ///
     /// # Errors
     ///
     /// Returns [`PcError::ConfigValidation`] if
     /// `config.action_space != Continuous` — discrete callers must use
     /// [`step`](Self::step) or [`step_masked`](Self::step_masked).
+    ///
+    /// # See also
+    ///
+    /// - [`step_continuous_raw_device`](Self::step_continuous_raw_device)
+    ///   — same flow, returns `L::Vector` (forward-compat for GPU).
+    /// - [`act_continuous`](Self::act_continuous) — inference-only with
+    ///   Play/Training mode selector.
     pub fn step_continuous(
         &mut self,
         state: &[f64],
@@ -2627,14 +2639,51 @@ impl<L: LinAlg> PcActorCritic<L> {
         Ok(self.backend.vec_from_slice(&action))
     }
 
-    /// v4.0.0 — Continuous-mode inference. Mirrors discrete `act` with
-    /// SelectionMode. Phase 4 implements the body; Phase 1 scaffolds the
-    /// precondition guard.
+    /// v4.0.0 — Continuous-mode inference with `SelectionMode` control.
+    ///
+    /// Runs actor inference to obtain the mean `μ(s)` for the current
+    /// state, then produces an action according to the caller's mode:
+    ///
+    /// | `mode` | Action returned | Side-effect on RNG |
+    /// |---|---|---|
+    /// | `SelectionMode::Play` | Deterministic `μ(s)` — no noise | None (RNG not advanced) |
+    /// | `SelectionMode::Training` | `μ(s) + σ·ε`, `ε ~ N(0, I)` via Box-Muller | One draw per output dimension |
+    ///
+    /// `σ = config.policy_sigma`.
+    ///
+    /// This is the inference-only counterpart of
+    /// [`step_continuous`](Self::step_continuous): it does not perform a
+    /// learning update or modify any stored state. Use it for evaluation
+    /// rollouts or action collection inside a REINFORCE loop.
+    ///
+    /// **Determinism:** Under `Training` mode, the Box-Muller samples come
+    /// from the agent's internal `StdRng`. The same seed at construction
+    /// combined with the same sequence of calls yields identical actions.
+    ///
+    /// **Precondition:** `config.action_space == ActionSpace::Continuous`.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` — current observation vector of length `actor.input_size`.
+    /// * `mode` — `Play` for deterministic μ; `Training` for stochastic sample.
+    ///
+    /// # Returns
+    ///
+    /// A `(action, infer_result)` pair where `action` is a `Vec<f64>` of
+    /// length `actor.output_size` and `infer_result` carries the full PC
+    /// inference state (surprise score, activations, etc.).
     ///
     /// # Errors
     ///
-    /// Returns [`PcError::ConfigValidation`] if `action_space != Continuous`, or
-    /// while the body is still a stub (Phase 4 wires the implementation).
+    /// Returns [`PcError::ConfigValidation`] if
+    /// `config.action_space != Continuous` — discrete callers must use
+    /// [`act`](Self::act).
+    ///
+    /// # See also
+    ///
+    /// - [`step_continuous`](Self::step_continuous) — learning step that
+    ///   also samples an action and performs a TD(0) update.
+    /// - [`act`](Self::act) — equivalent for `ActionSpace::Discrete`.
     pub fn act_continuous(
         &mut self,
         state: &[f64],
