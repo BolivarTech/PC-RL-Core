@@ -657,6 +657,25 @@ impl<L: LinAlg> PcActorCritic<L> {
             ));
         }
 
+        // Tolerance-based sentinel check + NaN/Infinity rejection + upper bound
+        // per MAGI Melchior + Caspar Checkpoint 2 iter 2 hardening requirement.
+        let upper_bound = 10.0 * config.scale_ceil;
+        let is_sentinel = (config.scale_floor_replay - (-1.0)).abs()
+            < crate::pc_actor_critic::config::SENTINEL_EPSILON;
+        let is_valid_positive = config.scale_floor_replay.is_finite()
+            && config.scale_floor_replay >= 0.0
+            && config.scale_floor_replay <= upper_bound;
+        if !is_sentinel && !is_valid_positive {
+            return Err(PcError::ConfigValidation(format!(
+                "scale_floor_replay ({}) must be either ~-1.0 (sentinel for \
+                 'use scale_floor') or a finite non-negative value <= {} \
+                 (10× scale_ceil). NaN, ±Infinity, negative zero, and values \
+                 in (-1.0, 0.0) are rejected as ambiguous or likely \
+                 configuration errors.",
+                config.scale_floor_replay, upper_bound
+            )));
+        }
+
         Ok(())
     }
 
@@ -1945,13 +1964,17 @@ impl<L: LinAlg> PcActorCritic<L> {
         mode: LearnMode,
     ) -> f64 {
         let is_online = mode == LearnMode::Online;
-        let s_scale = self.effective_actor_scale(infer.surprise_score);
+        let s_scale = self.effective_actor_scale_for_mode(infer.surprise_score, mode);
         let actor_decay = self.effective_actor_decay();
 
         // KL distillation gradients: inject both Polyak and frozen signals
         // into delta before weight update. Both are additive.
         // Shared skip conditions: actor not frozen, >1 valid action.
-        let skip_kl = self.is_actor_frozen() || valid_actions.len() <= 1;
+        // Replay mode with `scale_floor_replay > 0.0` opts in via
+        // `replay_bypasses_hysteresis`, lifting the FROZEN clamp on KL
+        // distillation so Polyak/Frozen anchors can contribute.
+        let replay_opt_in = !is_online && self.replay_bypasses_hysteresis();
+        let skip_kl = valid_actions.len() <= 1 || (self.is_actor_frozen() && !replay_opt_in);
 
         // KL_polyak gradient
         let mut effective_delta: Vec<f64> = if !skip_kl
@@ -2489,13 +2512,55 @@ impl<L: LinAlg> PcActorCritic<L> {
 
     /// Computes the effective actor learning rate scale considering hysteresis.
     ///
-    /// When actor hysteresis is enabled and the actor is FROZEN, returns
-    /// `scale_floor`. Otherwise delegates to [`surprise_scale()`](Self::surprise_scale).
+    /// Thin wrapper around
+    /// [`effective_actor_scale_for_mode`](Self::effective_actor_scale_for_mode)
+    /// with `LearnMode::Online`. Preserves v2.2.0 call-site semantics:
+    /// hysteresis clamps to `scale_floor` when FROZEN, otherwise delegates
+    /// to [`surprise_scale()`](Self::surprise_scale).
+    #[cfg(test)]
     pub(crate) fn effective_actor_scale(&self, surprise: f64) -> f64 {
+        self.effective_actor_scale_for_mode(surprise, LearnMode::Online)
+    }
+
+    /// Effective actor learning-rate scale for a given `LearnMode`.
+    ///
+    /// - In `Online` mode: identical to `effective_actor_scale` — hysteresis
+    ///   clamps to `scale_floor` when FROZEN.
+    /// - In `Replay` mode: when `scale_floor_replay >= 0.0`, the FROZEN
+    ///   clamp uses that custom floor instead of `scale_floor`. Only a
+    ///   value strictly greater than zero (`> 0.0`) also activates the
+    ///   `skip_kl` bypass so Polyak/Frozen KL anchors contribute. A value
+    ///   of exactly `0.0` uses that floor literally (same effective
+    ///   behavior as the `-1.0` sentinel, but consumer has explicitly
+    ///   acknowledged the knob). The default sentinel `-1.0` preserves
+    ///   v2.2.0 behavior (clamp to `scale_floor`).
+    pub(crate) fn effective_actor_scale_for_mode(&self, surprise: f64, mode: LearnMode) -> f64 {
+        let is_sentinel = (self.config.scale_floor_replay - (-1.0)).abs()
+            < crate::pc_actor_critic::config::SENTINEL_EPSILON;
+        let clamp_to = match mode {
+            LearnMode::Online => self.config.scale_floor,
+            LearnMode::Replay => {
+                if is_sentinel {
+                    self.config.scale_floor
+                } else {
+                    self.config.scale_floor_replay
+                }
+            }
+        };
         match &self.actor_hysteresis {
-            Some(h) if h.state == PlasticityState::Frozen => self.config.scale_floor,
+            Some(h) if h.state == PlasticityState::Frozen => clamp_to,
             _ => self.surprise_scale(surprise),
         }
+    }
+
+    /// Whether `LearnMode::Replay` should bypass the hysteresis-driven
+    /// `skip_kl` gate. True iff `scale_floor_replay > 0.0` — strict
+    /// positive trigger to avoid the `0.0` anti-pattern where KL would be
+    /// computed but then zeroed by `s_scale=0` (wasted compute, no
+    /// behavior change vs default).
+    #[inline]
+    fn replay_bypasses_hysteresis(&self) -> bool {
+        self.config.scale_floor_replay > 0.0
     }
 
     /// Computes per-hidden-layer decay factors for the actor.
@@ -11933,7 +11998,6 @@ mod tests {
     // ── Test 2 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires v2.2.1 commit 4"]
     fn test_scale_floor_replay_validation_rejects_invalid_values() {
         // Commit 4's validation rule (per plan §3.5) must reject:
         //   * values in (-1.0, 0.0) — these are NOT the sentinel and
@@ -11976,7 +12040,6 @@ mod tests {
     // ── Test 3 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires v2.2.1 commit 4"]
     fn test_scale_floor_replay_validation_accepts_valid_values() {
         // Commit 4's validation rule must ACCEPT:
         //   * `-1.0` exactly — the sentinel meaning "opt-in not provided".
@@ -11999,7 +12062,6 @@ mod tests {
     // ── Test 4 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires v2.2.1 commit 4"]
     fn test_replay_learn_no_op_under_frozen_with_default_sentinel() {
         // Two parameterized scenarios, each must produce identical
         // behaviour:
@@ -12044,7 +12106,6 @@ mod tests {
     // ── Test 5 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires v2.2.1 commit 4"]
     fn test_replay_learn_updates_actor_under_frozen_with_opt_in() {
         // Under a FROZEN actor, opting in via `scale_floor_replay = 0.5`
         // must let the actor learn from positive-reward memories. The
@@ -12081,7 +12142,6 @@ mod tests {
     // ── Test 6 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires v2.2.1 commit 4"]
     fn test_replay_learn_applies_kl_gradient_under_frozen_with_opt_in() {
         // Two parallel agents with identical seeds and identical
         // configs EXCEPT `distillation_lambda_frozen`:
@@ -12146,7 +12206,6 @@ mod tests {
     // ── Test 7 ──────────────────────────────────────────────────────────
 
     #[test]
-    #[ignore = "Red: requires v2.2.1 commit 4"]
     fn test_combined_regularizers_under_frozen_replay_opt_in() {
         // Saturation test. Configure the FULL regularizer stack:
         //   * EWC               (ewc_lambda = 0.1)

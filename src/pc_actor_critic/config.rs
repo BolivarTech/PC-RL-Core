@@ -17,11 +17,6 @@ use crate::pc_actor::PcActorConfig;
 /// representable in f64 and should round-trip bit-perfectly, but
 /// defensive tolerance prevents misdetection if a future serde
 /// backend introduces any ULP-level noise.
-//
-// Production consumers arrive in commit 4 (`effective_actor_scale_for_mode`).
-// `#[allow(dead_code)]` is scoped to bridge the commit-3 scaffold to the
-// commit-4 implementation without disabling the lint repo-wide.
-#[allow(dead_code)]
 pub(crate) const SENTINEL_EPSILON: f64 = 1e-9;
 
 /// Default discount factor.
@@ -586,7 +581,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Red: requires v2.2.1 commit 4"]
     fn test_scale_floor_replay_default_is_minus_one_sentinel() {
         // The default sentinel `-1.0` signals "opt-in not provided".
         // Replay-under-FROZEN preserves the conservative no-op semantics
