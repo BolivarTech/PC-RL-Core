@@ -386,6 +386,7 @@ pub fn load_agent_generic<L: LinAlg>(
             save_file.config.replay_training_capacity,
             save_file.config.replay_recent_capacity,
             save_file.config.replay_positive_only,
+            save_file.config.action_space,
         ))
     } else {
         None
@@ -1477,11 +1478,11 @@ mod tests {
             next_state[1] = marker;
             ReplayTransition {
                 state,
-                action: (marker as usize) % 9,
+                action: crate::pc_actor_critic::replay::Action::Discrete((marker as usize) % 9),
                 reward,
                 next_state,
                 done: false,
-                valid_actions: (0..9).collect(),
+                valid_actions: Some((0..9).collect()),
             }
         };
 
@@ -1491,7 +1492,7 @@ mod tests {
             for i in 0..30 {
                 let tx = make_tx(i as f64, 1.0);
                 training_originals.push(tx.clone());
-                buf.push(tx);
+                buf.push(tx).unwrap();
             }
         }
         assert_eq!(
@@ -1514,7 +1515,7 @@ mod tests {
             for i in 0..20 {
                 let tx = make_tx(100.0 + i as f64, 0.5);
                 recent_originals.push(tx.clone());
-                buf.push(tx);
+                buf.push(tx).unwrap();
             }
         }
         assert_eq!(

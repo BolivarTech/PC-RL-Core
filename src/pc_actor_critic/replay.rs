@@ -20,25 +20,68 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
-/// Single transition stored in a [`ReplayBuffer`].
+/// v4.0.0 — generic action variant. Replaces the v3.x `action: usize`
+/// field of `ReplayTransition`.
 ///
-/// Captures the canonical MDP tuple `(s, a, r, s', done)` plus the mask of
-/// valid actions in `state` required to recompute masked log-probabilities
-/// and critic targets during off-policy replay.
+/// **Brainstorm Q1:** `#[serde(untagged)]` is the binding representation.
+/// JSON token-type discriminates: integer → `Discrete`, array → `Continuous`.
+/// v3.x bare integer `"action": 5` deserializes automatically as
+/// `Action::Discrete(5)` — no custom Deserialize needed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Action {
+    /// Discrete action index. JSON form: bare integer, e.g. `5`.
+    Discrete(usize),
+    /// Continuous action vector of length = `actor.output_size`.
+    /// JSON form: bare array of f64, e.g. `[0.1, 0.7, -0.3]`.
+    Continuous(Vec<f64>),
+}
+
+impl Action {
+    /// Returns `true` if this variant matches the supplied `ActionSpace`.
+    ///
+    /// Used by `ReplayBuffer::push` for cross-mode contamination check.
+    ///
+    /// # Parameters
+    ///
+    /// * `space` — The `ActionSpace` to match against.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the action variant is consistent with the given space.
+    pub fn matches_space(&self, space: crate::pc_actor_critic::ActionSpace) -> bool {
+        use crate::pc_actor_critic::ActionSpace;
+        matches!(
+            (self, space),
+            (Action::Discrete(_), ActionSpace::Discrete)
+                | (Action::Continuous(_), ActionSpace::Continuous)
+        )
+    }
+}
+
+/// v4.0.0 schema. Captures the canonical MDP tuple `(s, a, r, s', done)`
+/// plus the optional mask of valid actions in `state` (Discrete only).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplayTransition {
     /// State vector at the moment the action was chosen.
     pub state: Vec<f64>,
-    /// Action index selected by the policy.
-    pub action: usize,
+    /// Action variant (Discrete or Continuous). Brainstorm Q1.
+    pub action: Action,
     /// Scalar reward observed after executing `action`.
     pub reward: f64,
     /// Successor state vector.
     pub next_state: Vec<f64>,
     /// `true` if the transition terminated the episode.
     pub done: bool,
-    /// Valid action indices available from `state` (action mask).
-    pub valid_actions: Vec<usize>,
+    /// Valid action indices available from `state`. `Some(mask)` for
+    /// Discrete; `None` for Continuous (mask concept N/A).
+    ///
+    /// **Brainstorm Q8:** `#[serde(default)]` covers all v3→v4 forms:
+    /// legacy bare `[0,1,2]` → `Some([0,1,2])` via Some-elision;
+    /// explicit null → `None`; absent → `None` via default.
+    /// No custom `deserialize_with` needed.
+    #[serde(default)]
+    pub valid_actions: Option<Vec<usize>>,
 }
 
 /// Dual-compartment FIFO replay buffer with optional positive-reward filter.
@@ -59,6 +102,10 @@ pub struct ReplayTransition {
 /// silently dropped at push time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayBuffer {
+    /// Action space discriminator. Set at construction from the agent's
+    /// config; immutable afterward. Used by `push` to reject cross-mode
+    /// contamination (Brainstorm Q2).
+    pub(crate) action_space: crate::pc_actor_critic::ActionSpace,
     /// Sealed successful trajectories collected during the training phase.
     pub training_memories: VecDeque<ReplayTransition>,
     /// Maximum size of `training_memories`.
@@ -81,12 +128,20 @@ impl ReplayBuffer {
     /// * `training_capacity` — maximum entries kept in `training_memories`.
     /// * `recent_capacity` — maximum entries kept in `recent_memories`.
     /// * `positive_only` — if `true`, pushes with `reward <= 0` are dropped.
+    /// * `action_space` — action space discriminator stored for cross-mode
+    ///   contamination checks in `push` (Phase 2.2).
     ///
     /// # Returns
     ///
     /// A buffer with `training_phase = true` and both compartments empty.
-    pub fn new(training_capacity: usize, recent_capacity: usize, positive_only: bool) -> Self {
+    pub fn new(
+        training_capacity: usize,
+        recent_capacity: usize,
+        positive_only: bool,
+        action_space: crate::pc_actor_critic::ActionSpace,
+    ) -> Self {
         Self {
+            action_space,
             training_memories: VecDeque::with_capacity(training_capacity),
             training_capacity,
             recent_memories: VecDeque::with_capacity(recent_capacity),
@@ -101,28 +156,36 @@ impl ReplayBuffer {
     /// Routing depends on `training_phase`: `true` → `training_memories`,
     /// `false` → `recent_memories`. Applies the `positive_only` filter and
     /// evicts the oldest entry when the target compartment is at capacity.
-    pub fn push(&mut self, transition: ReplayTransition) {
+    ///
+    /// Phase 2.2 will add cross-mode contamination validation here.
+    /// For now the method always returns `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when cross-mode contamination is detected (Phase 2.2).
+    pub fn push(&mut self, transition: ReplayTransition) -> Result<(), crate::error::PcError> {
         // positive_only filter: silently drop non-positive rewards.
         if self.positive_only && transition.reward <= 0.0 {
-            return;
+            return Ok(());
         }
         if self.training_phase {
             // Training compartment (A): accept up to capacity, then drop.
             // Training memories are immutable once accumulated — no eviction.
             if self.training_memories.len() >= self.training_capacity {
-                return;
+                return Ok(());
             }
             self.training_memories.push_back(transition);
         } else {
             // Recent compartment (B): FIFO eviction when at capacity.
             if self.recent_capacity == 0 {
-                return;
+                return Ok(());
             }
             if self.recent_memories.len() >= self.recent_capacity {
                 self.recent_memories.pop_front();
             }
             self.recent_memories.push_back(transition);
         }
+        Ok(())
     }
 
     /// Transition from the training phase to the recent-memory phase.
@@ -203,17 +266,17 @@ mod tests {
     fn make_transition(reward: f64, marker: f64) -> ReplayTransition {
         ReplayTransition {
             state: vec![marker, 0.0, 0.0],
-            action: 0,
+            action: Action::Discrete(0),
             reward,
             next_state: vec![0.0, 0.0, 0.0],
             done: false,
-            valid_actions: vec![0, 1, 2],
+            valid_actions: Some(vec![0, 1, 2]),
         }
     }
 
     #[test]
     fn test_replay_buffer_empty_sample_returns_empty() {
-        let buf = ReplayBuffer::new(100, 50, true);
+        let buf = ReplayBuffer::new(100, 50, true, crate::pc_actor_critic::ActionSpace::Discrete);
         let mut rng = StdRng::seed_from_u64(42);
         let batch = buf.sample(10, &mut rng);
         assert!(batch.is_empty());
@@ -221,15 +284,20 @@ mod tests {
 
     #[test]
     fn test_replay_buffer_push_respects_training_phase() {
-        let mut buf = ReplayBuffer::new(100, 50, false);
+        let mut buf = ReplayBuffer::new(
+            100,
+            50,
+            false,
+            crate::pc_actor_critic::ActionSpace::Discrete,
+        );
         assert!(buf.training_phase);
 
-        buf.push(make_transition(1.0, 0.0));
+        buf.push(make_transition(1.0, 0.0)).unwrap();
         assert_eq!(buf.training_memories.len(), 1);
         assert!(buf.recent_memories.is_empty());
 
         buf.seal_training_memories();
-        buf.push(make_transition(1.0, 1.0));
+        buf.push(make_transition(1.0, 1.0)).unwrap();
         assert_eq!(
             buf.training_memories.len(),
             1,
@@ -240,24 +308,26 @@ mod tests {
 
     #[test]
     fn test_replay_buffer_positive_only_filter() {
-        let mut buf = ReplayBuffer::new(100, 50, true);
+        let mut buf =
+            ReplayBuffer::new(100, 50, true, crate::pc_actor_critic::ActionSpace::Discrete);
 
-        buf.push(make_transition(-0.5, 0.0));
+        buf.push(make_transition(-0.5, 0.0)).unwrap();
         assert_eq!(buf.total_len(), 0, "negative reward dropped by filter");
 
-        buf.push(make_transition(0.5, 0.0));
+        buf.push(make_transition(0.5, 0.0)).unwrap();
         assert_eq!(buf.total_len(), 1, "positive reward retained");
     }
 
     #[test]
     fn test_replay_buffer_fifo_eviction_recent_compartment() {
-        let mut buf = ReplayBuffer::new(100, 3, false);
+        let mut buf =
+            ReplayBuffer::new(100, 3, false, crate::pc_actor_critic::ActionSpace::Discrete);
         buf.seal_training_memories();
 
-        buf.push(make_transition(1.0, 0.0));
-        buf.push(make_transition(1.0, 1.0));
-        buf.push(make_transition(1.0, 2.0));
-        buf.push(make_transition(1.0, 3.0));
+        buf.push(make_transition(1.0, 0.0)).unwrap();
+        buf.push(make_transition(1.0, 1.0)).unwrap();
+        buf.push(make_transition(1.0, 2.0)).unwrap();
+        buf.push(make_transition(1.0, 3.0)).unwrap();
 
         assert_eq!(buf.recent_memories.len(), 3);
         let front = buf
@@ -272,30 +342,40 @@ mod tests {
 
     #[test]
     fn test_replay_buffer_seal_routes_new_pushes_to_recent() {
-        let mut buf = ReplayBuffer::new(100, 50, false);
+        let mut buf = ReplayBuffer::new(
+            100,
+            50,
+            false,
+            crate::pc_actor_critic::ActionSpace::Discrete,
+        );
 
-        buf.push(make_transition(1.0, 0.0));
+        buf.push(make_transition(1.0, 0.0)).unwrap();
         assert_eq!(buf.training_memories.len(), 1);
         assert!(buf.recent_memories.is_empty());
 
         buf.seal_training_memories();
         assert!(!buf.training_phase, "training_phase flipped by seal");
 
-        buf.push(make_transition(1.0, 1.0));
+        buf.push(make_transition(1.0, 1.0)).unwrap();
         assert_eq!(buf.training_memories.len(), 1);
         assert_eq!(buf.recent_memories.len(), 1);
     }
 
     #[test]
     fn test_replay_buffer_sample_50_50_split() {
-        let mut buf = ReplayBuffer::new(100, 100, false);
+        let mut buf = ReplayBuffer::new(
+            100,
+            100,
+            false,
+            crate::pc_actor_critic::ActionSpace::Discrete,
+        );
 
         for _ in 0..100 {
-            buf.push(make_transition(1.0, -1.0));
+            buf.push(make_transition(1.0, -1.0)).unwrap();
         }
         buf.seal_training_memories();
         for _ in 0..100 {
-            buf.push(make_transition(1.0, 1.0));
+            buf.push(make_transition(1.0, 1.0)).unwrap();
         }
 
         let mut rng = StdRng::seed_from_u64(42);
@@ -320,9 +400,14 @@ mod tests {
     #[test]
     fn test_replay_buffer_sample_fallback_when_one_empty() {
         // A-only: training compartment populated, recent empty.
-        let mut buf_a = ReplayBuffer::new(200, 200, false);
+        let mut buf_a = ReplayBuffer::new(
+            200,
+            200,
+            false,
+            crate::pc_actor_critic::ActionSpace::Discrete,
+        );
         for _ in 0..100 {
-            buf_a.push(make_transition(1.0, -1.0));
+            buf_a.push(make_transition(1.0, -1.0)).unwrap();
         }
         let mut rng = StdRng::seed_from_u64(42);
         let batch_a = buf_a.sample(50, &mut rng);
@@ -333,10 +418,15 @@ mod tests {
         );
 
         // B-only: training sealed empty, recent populated.
-        let mut buf_b = ReplayBuffer::new(200, 200, false);
+        let mut buf_b = ReplayBuffer::new(
+            200,
+            200,
+            false,
+            crate::pc_actor_critic::ActionSpace::Discrete,
+        );
         buf_b.seal_training_memories();
         for _ in 0..100 {
-            buf_b.push(make_transition(1.0, 1.0));
+            buf_b.push(make_transition(1.0, 1.0)).unwrap();
         }
         let mut rng_b = StdRng::seed_from_u64(42);
         let batch_b = buf_b.sample(50, &mut rng_b);
@@ -349,18 +439,18 @@ mod tests {
 
     #[test]
     fn test_replay_buffer_serialization_round_trip() {
-        let mut buf = ReplayBuffer::new(10, 5, true);
+        let mut buf = ReplayBuffer::new(10, 5, true, crate::pc_actor_critic::ActionSpace::Discrete);
 
         // Populate training compartment with three distinct transitions.
-        buf.push(make_transition(1.0, -1.0));
-        buf.push(make_transition(2.0, -2.0));
-        buf.push(make_transition(3.0, -3.0));
+        buf.push(make_transition(1.0, -1.0)).unwrap();
+        buf.push(make_transition(2.0, -2.0)).unwrap();
+        buf.push(make_transition(3.0, -3.0)).unwrap();
 
         buf.seal_training_memories();
 
         // Populate recent compartment with two distinct transitions.
-        buf.push(make_transition(0.5, 1.0));
-        buf.push(make_transition(0.75, 2.0));
+        buf.push(make_transition(0.5, 1.0)).unwrap();
+        buf.push(make_transition(0.75, 2.0)).unwrap();
 
         let json = serde_json::to_string(&buf).expect("serialize ReplayBuffer");
         let restored: ReplayBuffer = serde_json::from_str(&json).expect("deserialize ReplayBuffer");
@@ -390,5 +480,94 @@ mod tests {
         {
             assert_eq!(expected, actual);
         }
+    }
+
+    // ── v4.0.0 Action enum + cross-mode validation tests ────────────────
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 2.2 push validation"]
+    fn test_push_rejects_cross_mode_continuous_into_discrete_buffer() {
+        use crate::pc_actor_critic::ActionSpace;
+        let mut buffer = ReplayBuffer::new(10, 0, false, ActionSpace::Discrete);
+        let transition = ReplayTransition {
+            state: vec![0.0; 4],
+            action: Action::Continuous(vec![0.5, 0.3]),
+            reward: 1.0,
+            next_state: vec![0.0; 4],
+            done: false,
+            valid_actions: None,
+        };
+        let result = buffer.push(transition);
+        assert!(
+            result.is_err(),
+            "Continuous transition into Discrete buffer must reject"
+        );
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 2.2 push validation"]
+    fn test_push_rejects_discrete_into_continuous_buffer() {
+        use crate::pc_actor_critic::ActionSpace;
+        let mut buffer = ReplayBuffer::new(10, 0, false, ActionSpace::Continuous);
+        let transition = ReplayTransition {
+            state: vec![0.0; 4],
+            action: Action::Discrete(2),
+            reward: 1.0,
+            next_state: vec![0.0; 4],
+            done: false,
+            valid_actions: Some(vec![0, 1, 2, 3]),
+        };
+        let result = buffer.push(transition);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 2.2 push validation"]
+    fn test_push_rejects_valid_actions_mismatch() {
+        // Discrete transition with valid_actions = None must reject.
+        use crate::pc_actor_critic::ActionSpace;
+        let mut buffer = ReplayBuffer::new(10, 0, false, ActionSpace::Discrete);
+        let transition = ReplayTransition {
+            state: vec![0.0; 4],
+            action: Action::Discrete(0),
+            reward: 1.0,
+            next_state: vec![0.0; 4],
+            done: false,
+            valid_actions: None, // <-- mismatch with Discrete action
+        };
+        let result = buffer.push(transition);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 2.2 push validation"]
+    fn test_push_accepts_consistent_discrete() {
+        use crate::pc_actor_critic::ActionSpace;
+        let mut buffer = ReplayBuffer::new(10, 0, false, ActionSpace::Discrete);
+        let transition = ReplayTransition {
+            state: vec![0.0; 4],
+            action: Action::Discrete(0),
+            reward: 1.0,
+            next_state: vec![0.0; 4],
+            done: false,
+            valid_actions: Some(vec![0, 1, 2]),
+        };
+        assert!(buffer.push(transition).is_ok());
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 2.2 push validation"]
+    fn test_push_accepts_consistent_continuous() {
+        use crate::pc_actor_critic::ActionSpace;
+        let mut buffer = ReplayBuffer::new(10, 0, false, ActionSpace::Continuous);
+        let transition = ReplayTransition {
+            state: vec![0.0; 4],
+            action: Action::Continuous(vec![0.5]),
+            reward: 1.0,
+            next_state: vec![0.0; 4],
+            done: false,
+            valid_actions: None,
+        };
+        assert!(buffer.push(transition).is_ok());
     }
 }

@@ -1098,6 +1098,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                     config.replay_training_capacity,
                     config.replay_recent_capacity,
                     config.replay_positive_only,
+                    config.action_space,
                 ))
             } else if old_training_cap > 0 && new_training_cap == 0 {
                 None
@@ -1110,6 +1111,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                         config.replay_training_capacity,
                         config.replay_recent_capacity,
                         config.replay_positive_only,
+                        config.action_space,
                     ))
                 } else {
                     self.replay_buffer.take()
@@ -1212,6 +1214,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                 config.replay_training_capacity,
                 config.replay_recent_capacity,
                 config.replay_positive_only,
+                config.action_space,
             ))
         } else {
             None
@@ -2462,13 +2465,13 @@ impl<L: LinAlg> PcActorCritic<L> {
             if let Some(ref mut buffer) = self.replay_buffer {
                 let transition = crate::pc_actor_critic::replay::ReplayTransition {
                     state: prev_state_vec,
-                    action: prev_action,
+                    action: crate::pc_actor_critic::replay::Action::Discrete(prev_action),
                     reward,
                     next_state: state.to_vec(),
                     done: terminal,
-                    valid_actions: learn_mask,
+                    valid_actions: Some(learn_mask),
                 };
-                buffer.push(transition);
+                let _ = buffer.push(transition);
             }
         }
 
@@ -3703,11 +3706,28 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
             let clamped_td_error = raw_td_error.clamp(-MAX_REPLAY_TD_ERROR, MAX_REPLAY_TD_ERROR);
 
+            // Phase 2: only Discrete transitions supported. Continuous
+            // gradient dispatch lands in Phase 3.3.
+            let action_idx = match &transition.action {
+                crate::pc_actor_critic::replay::Action::Discrete(idx) => *idx,
+                crate::pc_actor_critic::replay::Action::Continuous(_) => {
+                    return Err(PcError::ConfigValidation(
+                        "replay_learn cannot handle Continuous transitions in Phase 2 \
+                         (gradient dispatch lands Phase 3.3)"
+                            .into(),
+                    ));
+                }
+            };
+            let valid = transition
+                .valid_actions
+                .as_deref()
+                .unwrap_or(&[] as &[usize]);
+
             let step = LearnStep {
                 state: &transition.state,
                 infer: &infer,
-                action: transition.action,
-                valid_actions: &transition.valid_actions,
+                action: action_idx,
+                valid_actions: valid,
                 reward: transition.reward,
                 next_state: &transition.next_state,
                 next_infer: &next_infer,
@@ -11053,7 +11073,7 @@ mod tests {
     // un-ignored in commit 16 once the real method bodies landed.
     // ═══════════════════════════════════════════════════════════════════
 
-    use crate::pc_actor_critic::replay::ReplayTransition;
+    use crate::pc_actor_critic::replay::{Action, ReplayTransition};
 
     /// L2 norm of the element-wise difference between two weight vectors.
     fn l2_delta(a: &[f64], b: &[f64]) -> f64 {
@@ -11087,11 +11107,11 @@ mod tests {
         next_state[1] = marker;
         ReplayTransition {
             state,
-            action: 0,
+            action: Action::Discrete(0),
             reward,
             next_state,
             done: false,
-            valid_actions: (0..9).collect(),
+            valid_actions: Some((0..9).collect()),
         }
     }
 
@@ -11104,7 +11124,7 @@ mod tests {
             .expect("populate_replay_buffer: agent must have replay_buffer configured");
         for i in 0..n {
             let marker = (i as f64) / (n as f64);
-            buf.push(make_replay_transition(marker, 1.0));
+            buf.push(make_replay_transition(marker, 1.0)).unwrap();
         }
     }
 
@@ -11397,7 +11417,8 @@ mod tests {
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
             for i in 0..8 {
-                buf.push(make_replay_transition((i as f64) * 0.1, 100.0));
+                buf.push(make_replay_transition((i as f64) * 0.1, 100.0))
+                    .unwrap();
             }
         }
 
@@ -11441,7 +11462,8 @@ mod tests {
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
             for i in 0..4 {
-                buf.push(make_replay_transition((i as f64) * 0.1, f64::INFINITY));
+                buf.push(make_replay_transition((i as f64) * 0.1, f64::INFINITY))
+                    .unwrap();
             }
         }
 
@@ -11479,7 +11501,7 @@ mod tests {
         // Record a single transition directly.
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
-            buf.push(make_replay_transition(1.0, 1.0));
+            buf.push(make_replay_transition(1.0, 1.0)).unwrap();
         }
 
         // Drift the agent with 100 on-policy updates.
@@ -11803,7 +11825,8 @@ mod tests {
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
             for i in 0..30 {
-                buf.push(make_replay_transition(-(i as f64) * 0.01, 1.0));
+                buf.push(make_replay_transition(-(i as f64) * 0.01, 1.0))
+                    .unwrap();
             }
         }
         agent.seal_replay_training_memories().unwrap();
@@ -11811,7 +11834,8 @@ mod tests {
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
             for i in 0..25 {
-                buf.push(make_replay_transition((i as f64) * 0.02, 1.0));
+                buf.push(make_replay_transition((i as f64) * 0.02, 1.0))
+                    .unwrap();
             }
         }
 
@@ -11904,7 +11928,7 @@ mod tests {
         // |raw_td| >> MAX_REPLAY_TD_ERROR, so the clamp is definitely binding.
         {
             let buf = agent.replay_buffer.as_mut().unwrap();
-            buf.push(make_replay_transition(0.1, 100.0));
+            buf.push(make_replay_transition(0.1, 100.0)).unwrap();
         }
 
         // Capture the raw td_error the critic would see without clamping.
@@ -12265,11 +12289,11 @@ mod tests {
         next_state[1] = 0.5;
         ReplayTransition {
             state,
-            action: 0,
+            action: Action::Discrete(0),
             reward: 1.0,
             next_state,
             done: false,
-            valid_actions: (0..state_dim).collect(),
+            valid_actions: Some((0..state_dim).collect()),
         }
     }
 
@@ -12282,7 +12306,7 @@ mod tests {
             .as_mut()
             .expect("populate_positive_replay_buffer: buffer must be configured");
         for _ in 0..n {
-            buf.push(make_positive_transition(9));
+            buf.push(make_positive_transition(9)).unwrap();
         }
     }
 

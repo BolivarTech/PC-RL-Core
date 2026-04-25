@@ -7,7 +7,8 @@
 //! Gated `#[ignore]` — not invoked by `cargo nextest run`. Invoked
 //! explicitly by the SDD soft-checkpoint gate at the Phase 2 boundary.
 
-use pc_rl_core::pc_actor_critic::replay::{ReplayBuffer, ReplayTransition};
+use pc_rl_core::pc_actor_critic::replay::{Action, ReplayBuffer, ReplayTransition};
+use pc_rl_core::pc_actor_critic::ActionSpace;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -17,11 +18,11 @@ use rand::SeedableRng;
 fn make_transition(reward: f64, marker: f64) -> ReplayTransition {
     ReplayTransition {
         state: vec![marker, 0.0, 0.0],
-        action: 0,
+        action: Action::Discrete(0),
         reward,
         next_state: vec![0.0, 0.0, 0.0],
         done: false,
-        valid_actions: vec![0, 1, 2],
+        valid_actions: Some(vec![0, 1, 2]),
     }
 }
 
@@ -31,7 +32,7 @@ fn replay_buffer_standalone_smoke() {
     let start = std::time::Instant::now();
 
     // --- Construction -----------------------------------------------------
-    let mut buf = ReplayBuffer::new(100, 50, true);
+    let mut buf = ReplayBuffer::new(100, 50, true, ActionSpace::Discrete);
     assert!(buf.training_phase, "new buffer starts in training phase");
     assert!(buf.positive_only, "positive_only flag is propagated");
 
@@ -39,7 +40,7 @@ fn replay_buffer_standalone_smoke() {
     // 80 positive transitions with A-markers (state[0] negative).
     for i in 0..80 {
         let marker = -1.0 - (i as f64);
-        buf.push(make_transition(1.0, marker));
+        buf.push(make_transition(1.0, marker)).unwrap();
     }
     assert_eq!(
         buf.training_memories.len(),
@@ -61,11 +62,11 @@ fn replay_buffer_standalone_smoke() {
     for i in 0..60 {
         if i % 6 == 5 {
             // 10 of the 60 are non-positive and must be dropped.
-            buf.push(make_transition(-1.0, 999.0));
+            buf.push(make_transition(-1.0, 999.0)).unwrap();
         } else {
             positives_pushed += 1;
             let marker = 1.0 + (i as f64);
-            buf.push(make_transition(1.0, marker));
+            buf.push(make_transition(1.0, marker)).unwrap();
         }
     }
     assert_eq!(
