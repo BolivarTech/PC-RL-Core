@@ -215,9 +215,9 @@ protection for replay efficacy.
 > `critic_floor_replay` to a matching value to preserve
 > symmetric actor-critic dynamics. Without the pair, actor
 > would recover via replay while the critic stays hysteresis-
-> gated — producing measurable desphasage between the two
-> networks. The v2.2.1 release notes include the full migration
-> table; plan your adoption accordingly.
+> gated — producing measurable desynchronization between the two
+> networks. See `CHANGELOG.md` `[2.2.1]` Notes for the SemVer and
+> migration rationale; plan your adoption accordingly.
 
 ## Architecture
 
