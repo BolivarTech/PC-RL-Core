@@ -1626,20 +1626,21 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// * `valid_actions` - Indices of legal actions.
     /// * `mode` - Training (stochastic) or Play (deterministic).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if `valid_actions` is empty.
+    /// Returns [`PcError::ConfigValidation`] when called on an agent configured
+    /// for `ActionSpace::Continuous` (wire-in guard lands in Phase 1.5).
     pub fn act(
         &mut self,
         input: &[f64],
         valid_actions: &[usize],
         mode: SelectionMode,
-    ) -> (usize, InferResult<L>) {
+    ) -> Result<(usize, InferResult<L>), PcError> {
         let infer_result = self.actor.infer(input);
         let action =
             self.actor
                 .select_action(&infer_result.y_conv, valid_actions, mode, &mut self.rng);
-        (action, infer_result)
+        Ok((action, infer_result))
     }
 
     /// Learns from a complete episode trajectory using REINFORCE with baseline.
@@ -2276,6 +2277,62 @@ impl<L: LinAlg> PcActorCritic<L> {
             reward,
             terminal,
             Some(valid_actions.to_vec()),
+        ))
+    }
+
+    /// v4.0.0 — Continuous-mode step. Returns sampled action vector
+    /// `a = μ(s) + σ·ε`. Phase 4 implements the body; Phase 1 only
+    /// scaffolds the precondition guard so consumers calling the wrong
+    /// method get a loud error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcError::ConfigValidation`] if `action_space != Continuous`, or
+    /// while the body is still a stub (Phase 4 wires the implementation).
+    pub fn step_continuous(
+        &mut self,
+        state: &[f64],
+        reward: f64,
+        done: bool,
+    ) -> Result<Vec<f64>, PcError> {
+        if self.config.action_space != ActionSpace::Continuous {
+            return Err(PcError::ConfigValidation(format!(
+                "step_continuous is only valid when action_space == Continuous; \
+                 current action_space = {:?}. Use step_masked() for discrete \
+                 action spaces.",
+                self.config.action_space
+            )));
+        }
+        // Suppress unused warnings until Phase 4 implements the body.
+        let _ = (state, reward, done);
+        Err(PcError::ConfigValidation(
+            "step_continuous body lands in v4.0.0 Phase 4 (currently a stub).".into(),
+        ))
+    }
+
+    /// v4.0.0 — Continuous-mode inference. Mirrors discrete `act` with
+    /// SelectionMode. Phase 4 implements the body; Phase 1 scaffolds the
+    /// precondition guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PcError::ConfigValidation`] if `action_space != Continuous`, or
+    /// while the body is still a stub (Phase 4 wires the implementation).
+    pub fn act_continuous(
+        &mut self,
+        state: &[f64],
+        mode: crate::pc_actor::SelectionMode,
+    ) -> Result<(Vec<f64>, InferResult<L>), PcError> {
+        if self.config.action_space != ActionSpace::Continuous {
+            return Err(PcError::ConfigValidation(format!(
+                "act_continuous is only valid when action_space == Continuous; \
+                 current action_space = {:?}. Use act() for discrete action spaces.",
+                self.config.action_space
+            )));
+        }
+        let _ = (state, mode);
+        Err(PcError::ConfigValidation(
+            "act_continuous body lands in v4.0.0 Phase 4 (currently a stub).".into(),
         ))
     }
 
@@ -3819,7 +3876,7 @@ mod tests {
     fn make_trajectory(agent: &mut PcActorCritic) -> Vec<TrajectoryStep> {
         let input = vec![1.0, -1.0, 0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.5];
         let valid = vec![2, 7];
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
         vec![TrajectoryStep {
             input,
             latent_concat: infer.latent_concat,
@@ -3885,7 +3942,7 @@ mod tests {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
         let trajectory = vec![TrajectoryStep {
             input,
             latent_concat: infer.latent_concat,
@@ -3917,7 +3974,7 @@ mod tests {
 
         let mut trajectory = Vec::new();
         for (i, inp) in inputs.iter().enumerate() {
-            let (action, infer) = agent.act(inp, &valid, SelectionMode::Training);
+            let (action, infer) = agent.act(inp, &valid, SelectionMode::Training).unwrap();
             trajectory.push(TrajectoryStep {
                 input: inp.clone(),
                 latent_concat: infer.latent_concat,
@@ -3949,8 +4006,10 @@ mod tests {
         let input = vec![0.5; 9];
         let next_input = vec![-0.5; 9];
         let valid = vec![0, 1, 2];
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
-        let (_, next_infer) = agent.act(&next_input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
+        let (_, next_infer) = agent
+            .act(&next_input, &valid, SelectionMode::Training)
+            .unwrap();
 
         // Non-terminal: should incorporate next value
         let loss = agent.learn_continuous(
@@ -3972,8 +4031,10 @@ mod tests {
         let input = vec![0.5; 9];
         let next_input = vec![0.0; 9];
         let valid = vec![0, 1, 2];
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
-        let (_, next_infer) = agent.act(&next_input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
+        let (_, next_infer) = agent
+            .act(&next_input, &valid, SelectionMode::Training)
+            .unwrap();
 
         // Terminal: target = reward only (no gamma * V(s'))
         let loss = agent.learn_continuous(
@@ -4003,12 +4064,20 @@ mod tests {
         let valid = vec![0, 1, 2];
 
         // Use identical actions and inferences
-        let (action, infer) = agent_term.act(&input, &valid, SelectionMode::Training);
-        let (_, next_infer) = agent_term.act(&next_input, &valid, SelectionMode::Training);
+        let (action, infer) = agent_term
+            .act(&input, &valid, SelectionMode::Training)
+            .unwrap();
+        let (_, next_infer) = agent_term
+            .act(&next_input, &valid, SelectionMode::Training)
+            .unwrap();
 
         // Clone infer for the non-terminal agent (same starting point)
-        let (action2, infer2) = agent_nonterm.act(&input, &valid, SelectionMode::Training);
-        let (_, next_infer2) = agent_nonterm.act(&next_input, &valid, SelectionMode::Training);
+        let (action2, infer2) = agent_nonterm
+            .act(&input, &valid, SelectionMode::Training)
+            .unwrap();
+        let (_, next_infer2) = agent_nonterm
+            .act(&next_input, &valid, SelectionMode::Training)
+            .unwrap();
 
         // Terminal update
         let loss_term = agent_term.learn_continuous(
@@ -4048,8 +4117,10 @@ mod tests {
         let input = vec![0.5; 9];
         let next_input = vec![-0.5; 9];
         let valid = vec![0, 1, 2];
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
-        let (_, next_infer) = agent.act(&next_input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
+        let (_, next_infer) = agent
+            .act(&next_input, &valid, SelectionMode::Training)
+            .unwrap();
         let w_before = agent.actor.layers[0].weights.data.clone();
         let _ = agent.learn_continuous(
             &input,
@@ -4155,7 +4226,7 @@ mod tests {
 
         // Train many times on same trajectory
         for _ in 0..20 {
-            let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             let trajectory = vec![TrajectoryStep {
                 input: input.clone(),
                 latent_concat: infer.latent_concat,
@@ -4175,7 +4246,7 @@ mod tests {
         // Check that policy is not collapsed (multiple actions selected over 50 trials)
         let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
-            let (action, _) = agent.act(&input, &valid, SelectionMode::Training);
+            let (action, _) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             seen.insert(action);
         }
         assert!(
@@ -4193,7 +4264,7 @@ mod tests {
         let input = vec![0.5; 9];
         let valid = vec![1, 3, 5, 7];
         for _ in 0..20 {
-            let (action, _) = agent.act(&input, &valid, SelectionMode::Training);
+            let (action, _) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             assert!(valid.contains(&action), "Action {action} not in valid set");
         }
     }
@@ -4203,7 +4274,7 @@ mod tests {
     fn test_act_empty_valid_panics() {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
-        let _ = agent.act(&input, &[], SelectionMode::Training);
+        let _ = agent.act(&input, &[], SelectionMode::Training).unwrap();
     }
 
     // ── learning diagnostic test ──────────────────────────────
@@ -4295,7 +4366,7 @@ mod tests {
 
         // Repeatedly reward action 4
         for _ in 0..200 {
-            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             let trajectory = vec![TrajectoryStep {
                 input: input.clone(),
                 latent_concat: infer.latent_concat,
@@ -4314,7 +4385,7 @@ mod tests {
 
         // After 200 episodes always rewarding action 4, it should be the
         // preferred action in Play mode (deterministic argmax)
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Play);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Play).unwrap();
 
         // Check that action 4's logit is the highest
         let logit_4 = infer.y_conv[4];
@@ -4402,7 +4473,7 @@ mod tests {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2];
-        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
 
         let num_hidden = infer.hidden_states.len();
         let mut cache: ActivationCache = ActivationCache::new(num_hidden);
@@ -4416,14 +4487,16 @@ mod tests {
         let valid = vec![0, 1, 2];
         let init_input = vec![0.5; 9];
         let num_hidden = {
-            let (_, infer) = agent.act(&init_input, &valid, SelectionMode::Training);
+            let (_, infer) = agent
+                .act(&init_input, &valid, SelectionMode::Training)
+                .unwrap();
             infer.hidden_states.len()
         };
 
         let mut cache: ActivationCache = ActivationCache::new(num_hidden);
         for i in 0..5 {
             let input = vec![i as f64 * 0.1; 9];
-            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             cache.record(&infer.hidden_states);
         }
         assert_eq!(cache.batch_size(), 5);
@@ -4434,7 +4507,7 @@ mod tests {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2];
-        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
 
         let num_hidden = infer.hidden_states.len();
         let mut cache: ActivationCache = ActivationCache::new(num_hidden);
@@ -4455,7 +4528,7 @@ mod tests {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2];
-        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
 
         let num_hidden = infer.hidden_states.len();
         let mut cache: ActivationCache = ActivationCache::new(num_hidden);
@@ -4470,14 +4543,16 @@ mod tests {
         let valid = vec![0, 1, 2];
         let init_input = vec![0.5; 9];
         let num_hidden = {
-            let (_, infer) = agent.act(&init_input, &valid, SelectionMode::Training);
+            let (_, infer) = agent
+                .act(&init_input, &valid, SelectionMode::Training)
+                .unwrap();
             infer.hidden_states.len()
         };
 
         let mut cache: ActivationCache = ActivationCache::new(num_hidden);
         for i in 0..10 {
             let input = vec![i as f64 * 0.1; 9];
-            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             cache.record(&infer.hidden_states);
         }
 
@@ -4505,7 +4580,7 @@ mod tests {
             let input: Vec<f64> = (0..agent.config.actor.input_size)
                 .map(|j| ((i * 9 + j) as f64 * 0.1).sin())
                 .collect();
-            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training);
+            let (_, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
             actor_cache.record(&infer.hidden_states);
             let mut critic_input = input;
             critic_input.extend_from_slice(&infer.latent_concat);
@@ -4609,7 +4684,7 @@ mod tests {
 
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2, 3, 4];
-        let (action, _) = child.act(&input, &valid, SelectionMode::Training);
+        let (action, _) = child.act(&input, &valid, SelectionMode::Training).unwrap();
         assert!(valid.contains(&action), "Action {action} not in valid set");
     }
 
@@ -4791,8 +4866,12 @@ mod tests {
         let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
         let all_actions: Vec<usize> = (0..9).collect();
 
-        let (action1, infer1) = agent_b.act(&s1, &all_actions, SelectionMode::Training);
-        let (_, infer2) = agent_b.act(&s2, &all_actions, SelectionMode::Training);
+        let (action1, infer1) = agent_b
+            .act(&s1, &all_actions, SelectionMode::Training)
+            .unwrap();
+        let (_, infer2) = agent_b
+            .act(&s2, &all_actions, SelectionMode::Training)
+            .unwrap();
 
         let _ = agent_b.learn_continuous(
             &s1,
@@ -4832,8 +4911,12 @@ mod tests {
         let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
         let all_actions: Vec<usize> = (0..9).collect();
 
-        let (action1, infer1) = agent_b.act(&s1, &all_actions, SelectionMode::Training);
-        let (_, infer2) = agent_b.act(&s2, &all_actions, SelectionMode::Training);
+        let (action1, infer1) = agent_b
+            .act(&s1, &all_actions, SelectionMode::Training)
+            .unwrap();
+        let (_, infer2) = agent_b
+            .act(&s2, &all_actions, SelectionMode::Training)
+            .unwrap();
 
         let _ =
             agent_b.learn_continuous(&s1, &infer1, action1, &all_actions, 1.0, &s2, &infer2, true);
@@ -4865,8 +4948,10 @@ mod tests {
         // Agent B: manual path
         let mut agent_b: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
-        let (action1, infer1) = agent_b.act(&s1, &mask, SelectionMode::Training);
-        let (_, infer2) = agent_b.act(&s2, &all_actions, SelectionMode::Training);
+        let (action1, infer1) = agent_b.act(&s1, &mask, SelectionMode::Training).unwrap();
+        let (_, infer2) = agent_b
+            .act(&s2, &all_actions, SelectionMode::Training)
+            .unwrap();
 
         let _ = agent_b.learn_continuous(&s1, &infer1, action1, &mask, 1.0, &s2, &infer2, false);
 
@@ -5005,7 +5090,7 @@ mod tests {
         let mut agent: PcActorCritic = make_agent();
         let input = vec![0.5; 9];
         let valid = vec![0, 1, 2];
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
         assert!(action < 9);
         assert!(infer.surprise_score.is_finite());
     }
@@ -9409,7 +9494,9 @@ mod tests {
         let _ = agent.step(&state, 0.0, false);
         let _ = agent.step(&state, 0.5, true);
 
-        let (action_before, _) = agent.act(&state, &[0, 1, 2, 3], SelectionMode::Play);
+        let (action_before, _) = agent
+            .act(&state, &[0, 1, 2, 3], SelectionMode::Play)
+            .unwrap();
         let w_before = agent.actor.layers[0].weights.data.clone();
 
         let path = format!(
@@ -9456,7 +9543,9 @@ mod tests {
             "critic lr diverged after round-trip"
         );
 
-        let (action_after, _) = loaded.act(&state, &[0, 1, 2, 3], SelectionMode::Play);
+        let (action_after, _) = loaded
+            .act(&state, &[0, 1, 2, 3], SelectionMode::Play)
+            .unwrap();
         assert_eq!(
             action_before, action_after,
             "Behavioral equivalence after round-trip"
@@ -12403,6 +12492,66 @@ mod tests {
             "valid Continuous config must construct, got {:?}",
             result.err()
         );
+    }
+
+    // ── v4.0.0 entry-point precondition guards (Brainstorm Q6) ─────────
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 1.5 precondition guards"]
+    fn test_step_masked_rejects_continuous_config() {
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.0; 9];
+        let valid: Vec<usize> = (0..9).collect();
+        let result = agent.step_masked(&state, &valid, 0.0, false);
+        assert!(result.is_err(), "step_masked on Continuous must reject");
+        match result.unwrap_err() {
+            PcError::ConfigValidation(msg) => {
+                assert!(msg.contains("Discrete") || msg.contains("Continuous"));
+                assert!(msg.contains("step_masked") || msg.contains("step_continuous"));
+            }
+            other => panic!("expected ConfigValidation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 1.5 precondition guards"]
+    fn test_act_rejects_continuous_config() {
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.1;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let state = vec![0.0; 9];
+        let valid: Vec<usize> = (0..9).collect();
+        let result = agent.act(&state, &valid, crate::pc_actor::SelectionMode::Play);
+        assert!(result.is_err(), "act on Continuous must reject");
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 1.5 precondition guards"]
+    fn test_step_continuous_rejects_discrete_config() {
+        let cfg = default_config();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let state = vec![0.0; 9];
+        let result = agent.step_continuous(&state, 0.0, false);
+        assert!(result.is_err(), "step_continuous on Discrete must reject");
+    }
+
+    #[test]
+    #[ignore = "Red: requires v4.0.0 Phase 1.5 precondition guards"]
+    fn test_act_continuous_rejects_discrete_config() {
+        let cfg = default_config();
+        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+        let state = vec![0.0; 9];
+        let result = agent.act_continuous(&state, crate::pc_actor::SelectionMode::Play);
+        assert!(result.is_err(), "act_continuous on Discrete must reject");
     }
 
     // ── Test 4 ──────────────────────────────────────────────────────────

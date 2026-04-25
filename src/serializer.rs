@@ -716,8 +716,12 @@ mod tests {
         let mut actions1 = Vec::new();
         let mut actions2 = Vec::new();
         for _ in 0..20 {
-            let (a1, _) = loaded1.act(&input, &valid, crate::pc_actor::SelectionMode::Training);
-            let (a2, _) = loaded2.act(&input, &valid, crate::pc_actor::SelectionMode::Training);
+            let (a1, _) = loaded1
+                .act(&input, &valid, crate::pc_actor::SelectionMode::Training)
+                .unwrap();
+            let (a2, _) = loaded2
+                .act(&input, &valid, crate::pc_actor::SelectionMode::Training)
+                .unwrap();
             actions1.push(a1);
             actions2.push(a2);
         }
@@ -806,7 +810,7 @@ mod tests {
         // Train one step to modify rezero_alpha
         let input = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
         let trajectory = vec![crate::pc_actor_critic::TrajectoryStep {
             input: input.clone(),
             latent_concat: infer.latent_concat,
@@ -901,7 +905,7 @@ mod tests {
         // Train to modify projection weights
         let input = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
-        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training);
+        let (action, infer) = agent.act(&input, &valid, SelectionMode::Training).unwrap();
         let trajectory = vec![crate::pc_actor_critic::TrajectoryStep {
             input: input.clone(),
             latent_concat: infer.latent_concat,
@@ -948,7 +952,9 @@ mod tests {
         // Verify agent produces valid inference
         let state = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
-        let (action, _) = agent.act(&state, &valid, crate::pc_actor::SelectionMode::Play);
+        let (action, _) = agent
+            .act(&state, &valid, crate::pc_actor::SelectionMode::Play)
+            .unwrap();
         assert!(action < 9, "Action must be in valid range");
     }
 
@@ -1047,7 +1053,7 @@ mod tests {
         // Agent should work normally (no panic from missing CL state)
         let state = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
-        let (action, _) = agent.act(&state, &valid, SelectionMode::Play);
+        let (action, _) = agent.act(&state, &valid, SelectionMode::Play).unwrap();
         assert!(action < 9);
 
         // Step should work (no CL processing since all disabled by defaults)
@@ -1097,7 +1103,7 @@ mod tests {
 
         let state = vec![0.5; 9];
         let valid: Vec<usize> = (0..9).collect();
-        let (action, _) = agent.act(&state, &valid, SelectionMode::Play);
+        let (action, _) = agent.act(&state, &valid, SelectionMode::Play).unwrap();
         assert!(action < 9);
     }
 
