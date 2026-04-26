@@ -401,7 +401,20 @@ Validated through 20 experimental phases (~3,800 training runs) on Tic-Tac-Toe (
 - **Softsign + residual + projection cooperate** -- three mechanisms enable gradient flow in deep networks
 - **Parameter efficiency** -- ~550 actor parameters matching networks 4-330x larger through iterative inference
 
-For the complete experimental methodology and statistical analysis, see [docs/experiment_analysis.md](docs/experiment_analysis.md). For the full architecture description and lessons learned, see [docs/pc_actor_critic_paper.md](docs/pc_actor_critic_paper.md).
+## Documentation
+
+| Document | Audience | Content |
+|---|---|---|
+| [docs/pc_actor_critic_paper.md](docs/pc_actor_critic_paper.md) | Researchers, contributors | Formal architecture spec, mathematical justification (including §1.6 on equilibrium-snapshot backprop strategy), full empirical results, lessons learned |
+| [docs/pc_inference_intuitive_guide.md](docs/pc_inference_intuitive_guide.md) | New users, mental-model builders | Conversational walkthrough of PC inference + backprop with metaphors, numerical examples, FAQ — companion to the formal paper |
+| [docs/experiment_analysis.md](docs/experiment_analysis.md) | Anyone reproducing results | Complete experimental methodology, statistical validation across 35 seeds × 8 configurations |
+| [docs/generic_action_space_spec.md](docs/generic_action_space_spec.md) | v4.0.0 adopters | v4.0.0 generic action space spec — discrete vs continuous design, brainstorm decisions Q1-Q8 |
+| [docs/continuous_learning_spec.md](docs/continuous_learning_spec.md) | CL adopters | Continuous Learning (M1-M4) detailed spec |
+| [docs/td_n_spec.md](docs/td_n_spec.md) | TD(n) users | n-step temporal difference learning spec |
+| [docs/gae_spec.md](docs/gae_spec.md) | GAE users | Generalized Advantage Estimation spec |
+| [docs/crossover_technical_spec.md](docs/crossover_technical_spec.md) | GA evolution users | CCA-based neural network crossover for genetic algorithms |
+| [docs/apply_config_spec.md](docs/apply_config_spec.md) | Runtime config mutation | Hot-reload of config fields without rebuilding the agent |
+| [CHANGELOG.md](CHANGELOG.md) | Migration | Per-release breaking changes, migration tables, mitigation matrices |
 
 ## Dependencies
 
