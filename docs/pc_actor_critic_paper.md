@@ -89,6 +89,91 @@ Default: `lambda = 0.99` (99% backprop, 1% PC error as regularizer).
 - **Curriculum**: Starts at depth 1, advances when non-loss rate (win + draw) > 95% over 1000-game window. Metrics reset on advancement.
 - **Action selection**: Softmax sampling during training, argmax during play
 
+### 1.6 Gradient Computation Strategy
+
+A subtle but consequential implementation choice: the gradient used to update weights is computed on the **converged snapshot** of the inference loop, not by backpropagating through the k iterations of the loop itself. This section documents the choice, its mathematical justification, the alternative considered, and the conditions under which the approximation is valid.
+
+#### 1.6.1 The choice: equilibrium snapshot vs. backprop-through-time
+
+Once the PC inference loop converges (or hits `max_steps`), the network has reached a fixed point `y* = g(y*, state, W)` where `g` is the per-iteration update rule (top-down prediction → error → bottom-up → state update). The actor's output `y_conv` is the value of `y*` at the output layer.
+
+There are two principled ways to compute `∂Loss/∂W`:
+
+**Option A — Backpropagation through time (BPTT):** treat the inference loop as a recurrent computation with `k` iterations. Unroll the graph, apply chain rule through every iteration:
+
+```
+∂Loss/∂W = chain rule across k feedforward+top-down passes
+```
+
+Memory cost: O(k × |activations|). Compute cost: 2×k passes (forward+backward). Gradient stability: degrades through long chains (vanishing/exploding gradients across iterations).
+
+**Option B — Equilibrium snapshot (this codebase):** treat `y*` as a static feedforward output. Apply chain rule on the **last** pass only, using the converged hidden activations as if they were produced by a single feedforward computation:
+
+```
+∂Loss/∂W ≈ chain rule across the final pass, with y* as activation snapshot
+```
+
+Memory cost: O(|activations|). Compute cost: 2 passes. Gradient stability: identical to standard MLP backprop.
+
+PC-RL-Core uses Option B. The structural rationale is documented below; empirical validation that this works is in §2 (training reaches reproducible depth-9 behavior across seeds).
+
+#### 1.6.2 Mathematical justification (implicit function theorem)
+
+If the inference loop converges to a fixed point `y*(state, W)`, the implicit function theorem gives the exact gradient as:
+
+```
+∂y*/∂W = (I − ∂g/∂y)^(-1) · ∂g/∂W
+```
+
+where `∂g/∂y` is the Jacobian of the per-iteration update with respect to the hidden states. Computing `(I − ∂g/∂y)^(-1)` requires inverting a Jacobian whose dimension equals the total number of hidden activations — prohibitive for any non-trivial network.
+
+The equilibrium-snapshot approximation makes the simplification:
+
+```
+∂y*/∂W ≈ ∂g/∂W   (assuming ∂g/∂y ≈ 0 near the fixed point)
+```
+
+This is justified when the fixed point is a **stable attractor** with strong convergence: at the fixed point itself, the per-iteration update rule produces near-zero changes (`y* ≈ g(y*, state, W)` by definition), which means the local sensitivity `∂g/∂y` is small along the converged trajectory. The last pass through `g` is therefore a good local approximation to the fixed-point behavior.
+
+This is a known approximation in equilibrium-network literature (Bai et al. 2019, "Deep Equilibrium Models"). The codebase does not formalize the bound on the approximation error, but the experimental validation in §2 — where reproducible learning across 35 seeds shows no instability attributable to gradient bias — provides empirical confirmation that the bias is acceptable for this regime.
+
+#### 1.6.3 Validity condition: convergence quality
+
+The approximation is valid when the loop **actually converges**. Concretely:
+
+| Condition | Effect on gradient quality |
+|-----------|---------------------------|
+| Loop converges with low RMS error well before `max_steps` | Snapshot is close to true fixed point. Gradient bias minimal. |
+| Loop hits `max_steps` with RMS error still above tolerance | Snapshot is a partially-converged transient. Gradient bias larger. Surprise score high. |
+| Loop oscillates without converging | Snapshot is meaningless. Gradient bias unbounded. |
+
+The default hyperparameters (`tol = 0.01`, `max_steps = 5`, `alpha = 0.03`) are tuned so that the loop converges cleanly for inputs within the training distribution. Out-of-distribution inputs may exhaust `max_steps`, producing the high `surprise` scores that drive M1 scale-range modulation (§2.8): the consumer does not need to detect this manually because the framework attenuates the learning rate when the equilibrium is poorly converged.
+
+#### 1.6.4 Computational cost comparison
+
+For a network with N layers, k inference iterations, and standard cost C per forward/backward pass:
+
+| Strategy | Forward cost | Backward cost | Total per-step | Relative |
+|----------|--------------|---------------|----------------|----------|
+| Standard MLP | C | C | 2C | 1× (baseline) |
+| PC + Equilibrium snapshot | k · C | C | (k+1) · C | 2-3× (k typically 3-5) |
+| PC + BPTT | k · C | k · C | 2k · C | 6-10× |
+
+Equilibrium snapshot pays the 2-3× cost of multiple forward passes during inference but does not amplify the backward cost. BPTT would double the backward cost on top of the forward cost — a 2× additional penalty over snapshot for the same convergence depth, with the additional risk of vanishing/exploding gradients through the unrolled chain.
+
+#### 1.6.5 Output layer always uses backprop
+
+§1.4 documents that the output layer always uses pure backprop regardless of `local_lambda`. In the gradient-computation framing of this section, that is because the **policy gradient signal enters the network at the output layer** (via `delta = π − one_hot(action)` for discrete or `delta = (μ − a)/σ²` for continuous, scaled by advantage). The reward signal must propagate from the output backward through hidden layers — this is the role of backprop. Hidden layers can complement the backward signal with PC prediction errors (the `(1−λ)` term in §1.4), but the output layer has no PC prediction error available (there is no layer above it to predict downward), so it must use the policy-gradient-derived `delta` as its only source of signal.
+
+#### 1.6.6 Interaction with surprise modulation
+
+The connection between gradient quality and the M1 scale-range mechanism (§2.8) becomes precise in this framing:
+
+- Low surprise → equilibrium converged tightly → snapshot approximation is sharp → gradient is reliable → use full learning rate.
+- High surprise → equilibrium poorly converged → snapshot approximation is loose → gradient is noisy → attenuate learning rate.
+
+Surprise is therefore not just a curiosity-style intrinsic reward signal: in this architecture it is also a **gradient-quality estimator**. The rate-modulation rule that scales learning rate by `surprise_to_scale(rms_error)` is mechanically protecting the optimizer from updates derived from poorly-converged equilibria. This dual role (exploration cue + gradient-quality estimator) is one reason adaptive surprise is so effective at preventing catastrophic forgetting during curriculum transitions: out-of-distribution inputs simultaneously raise the exploration signal and lower the gradient confidence.
+
 ---
 
 ## 2. Experiments
