@@ -414,6 +414,8 @@ Validated through 20 experimental phases (~3,800 training runs) on Tic-Tac-Toe (
 | [docs/gae_spec.md](docs/gae_spec.md) | GAE users | Generalized Advantage Estimation spec |
 | [docs/crossover_technical_spec.md](docs/crossover_technical_spec.md) | GA evolution users | CCA-based neural network crossover for genetic algorithms |
 | [docs/apply_config_spec.md](docs/apply_config_spec.md) | Runtime config mutation | Hot-reload of config fields without rebuilding the agent |
+| [docs/experiment_pendulum_v1_spec.md](docs/experiment_pendulum_v1_spec.md) | Validators / contributors | Spec for `PC-Pendulum` standalone project — empirical validation of v4.0.0 continuous on Pendulum-v1 swing-up task |
+| [docs/experiment_cartpole_continuous_spec.md](docs/experiment_cartpole_continuous_spec.md) | Validators / contributors | Spec for `PC-CartPole-Continuous` standalone project — companion validation on cart-pole balance task |
 | [CHANGELOG.md](CHANGELOG.md) | Migration | Per-release breaking changes, migration tables, mitigation matrices |
 
 ## Dependencies
